@@ -1,6 +1,7 @@
-# DEAS-style sequence critic + value (douri repo root).
+# Unified critic training config (DEAS / DQC).
 
 env_name: antmaze-medium-navigate-v0
+critic: deas
 use_wandb: false
 use_tqdm: false
 train_epochs: 10
@@ -8,25 +9,29 @@ log_every_n_epochs: 1
 save_every_n_epochs: 10
 
 agent:
-  agent_name: deas_seq_critic
+  agent_name: critic
   lr: 0.0003
   batch_size: 256
   value_hidden_dims: [256, 256, 256]
   critic_hidden_dims: [256, 256, 256]
   layer_norm: true
   tau: 0.005
+  q_agg: min
+
+  # DEAS defaults
   expectile: 0.7
   num_atoms: 51
   v_min: -200.0
   v_max: 0.0
   sigma: 1.0
-  q_agg: min
   num_critic_ensembles: 2
   gamma1: 0.99
   gamma2: 0.99
-  critic_action_sequence: 4
-  actor_action_sequence: 4
+  full_chunk_horizon: 4
+  action_chunk_horizon: 4
   nstep_options: 1
   dataset_class: DEASActionSeqDataset
+
+  # Shared/default runtime options
   frame_stack: null
   p_aug: 0.0

@@ -2,7 +2,7 @@
 
 Batches expose:
   * ``observations`` ``[B, D]`` — ``s_t``
-  * ``actions`` ``[B, L, A]`` — ``a_{t : t+L-1}`` (inclusive of ``L`` steps; ``L = critic_action_sequence``)
+  * ``actions`` ``[B, L, A]`` — ``a_{t : t+L-1}`` (inclusive of ``L`` steps; ``L = full_chunk_horizon``)
   * ``next_observations`` ``[B, D]`` — ``s_{t + nstep_options * L}``
   * ``chunk_return`` ``[B]`` — two-discount n-step chunk return (see agent docstring)
   * ``bootstrap_discount`` ``[B]`` — ``gamma2 ** (nstep_options * L)`` (broadcast scalar, stored per batch row)
@@ -39,10 +39,10 @@ class DEASActionSeqDataset:
         self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
         assert self.terminal_locs[-1] == self.size - 1
 
-        self.L = int(self.config['critic_action_sequence'])
+        self.L = int(self.config['full_chunk_horizon'])
         self.nopt = int(self.config.get('nstep_options', 1))
         if self.L < 1:
-            raise ValueError('critic_action_sequence (L) must be >= 1.')
+            raise ValueError('full_chunk_horizon (L) must be >= 1.')
         if self.nopt < 1:
             raise ValueError('nstep_options must be >= 1.')
 
@@ -129,7 +129,11 @@ class DEASActionSeqDataset:
         actions = actions_jl[:, 0, :, :]  # [B, L, A]
 
         rew_idx = act_idx  # rewards aligned with transitions at same time index as actions in compact datasets
-        step_rewards = np.asarray(self.dataset['rewards'][rew_idx], dtype=np.float32)  # [B, J, L]
+        if 'rewards' in self.dataset:
+            step_rewards = np.asarray(self.dataset['rewards'][rew_idx], dtype=np.float32)  # [B, J, L]
+        else:
+            # OGBench compact datasets may omit explicit rewards; keep the detached critic path runnable.
+            step_rewards = np.zeros((B, J, L), dtype=np.float32)
 
         gam1 = self.gamma1
         gam2 = self.gamma2

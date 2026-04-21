@@ -1,20 +1,4 @@
-"""GOUB-inspired Phase-1 training (YAML config + timestamped runs).
-
-Layout
-------
-* Default YAML: ``<impl>/config/goub_phase1_antmaze.yaml`` (override with ``--run_config``).
-* Each run: ``<runs_root>/<timestamp>_seed<seed>_<env>/``
-    * ``config_used.yaml`` — copy of the loaded YAML
-    * ``flags.json`` — resolved absl + agent flags
-    * ``train.csv`` — metrics (CsvLogger; default log every **10** epochs)
-    * ``run.log`` — human-readable epoch log (same cadence)
-    * ``checkpoints/params_<epoch>.pkl`` — periodic + final saves (epoch index, not optimizer step); includes inverse-dynamics head.
-
-**Resume:** ``--resume_pkl=.../params_<n>.pkl`` + ``--resume_start_epoch=<n>`` (last completed epoch in that run)
-+ ``--train_epochs=<target>`` trains epochs ``n+1 .. target`` into a **new** timestamped ``run_dir``.
-
-One **epoch** = ``ceil(dataset_size / batch_size)`` gradient updates.
-"""
+"""GOUB dynamics training entrypoint."""
 
 import json
 import logging
@@ -33,10 +17,9 @@ import tqdm
 import wandb
 import yaml
 from absl import app, flags
-from ml_collections import config_flags
 
-from agents.goub_phase1 import GOUBPhase1Agent
-from utils.datasets import HGCDataset
+from agents.goub_dynamics import GOUBDynamicsAgent, get_dynamics_config
+from utils.datasets import PathHGCDataset
 from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import merge_checkpoint_state_dict, save_agent
 from utils.inverse_dynamics_train import parse_hidden_dims
@@ -44,16 +27,13 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
 
 def _impl_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def _default_yaml_path():
-    return os.path.join(_impl_dir(), 'config', 'goub_phase1_antmaze.yaml')
+    return os.path.join(_impl_dir(), 'config', 'goub_dynamics_antmaze.yaml')
 
 
 def _sanitize_token(s: str) -> str:
@@ -61,14 +41,10 @@ def _sanitize_token(s: str) -> str:
     return s[:120] if len(s) > 120 else s
 
 
-# ---------------------------------------------------------------------------
-# absl flags
-# ---------------------------------------------------------------------------
-
 flags.DEFINE_string(
     'run_config',
     '',
-    'YAML training config. Empty → use config/goub_phase1_antmaze.yaml if it exists.',
+    'YAML training config. Empty → config/goub_dynamics_antmaze.yaml if it exists.',
 )
 flags.DEFINE_string(
     'runs_root',
@@ -105,8 +81,6 @@ flags.DEFINE_integer(
 flags.DEFINE_boolean('use_wandb', False, 'Log to Weights & Biases.')
 flags.DEFINE_boolean('use_tqdm', False, 'Show tqdm progress bar over epochs.')
 
-config_flags.DEFINE_config_file('agent', 'agents/goub_phase1.py', lock_config=False)
-
 
 def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
     return max(1, math.ceil(dataset_size / batch_size))
@@ -118,7 +92,6 @@ def _load_yaml(path: str) -> dict:
 
 
 def _argv_sets_flag(flag_name: str) -> bool:
-    """True if ``sys.argv`` explicitly sets this absl flag (YAML must not override)."""
     dashed = flag_name.replace('_', '-')
     for arg in sys.argv[1:]:
         if arg.startswith(f'--{flag_name}=') or arg.startswith(f'--{dashed}='):
@@ -128,12 +101,7 @@ def _argv_sets_flag(flag_name: str) -> bool:
     return False
 
 
-def _apply_yaml_to_flags(data: dict) -> None:
-    """Merge YAML dict into absl FLAGS and agent ConfigDict.
-
-    Top-level keys already set on the command line are skipped so CLI wins
-    over YAML.  (``agent:`` nested keys always come from YAML when loaded.)
-    """
+def _apply_yaml_to_flags(data: dict) -> dict:
     agent_updates = data.pop('agent', None)
     if agent_updates is not None and not isinstance(agent_updates, dict):
         raise ValueError('YAML key "agent" must be a mapping.')
@@ -145,14 +113,12 @@ def _apply_yaml_to_flags(data: dict) -> None:
             continue
         setattr(FLAGS, key, value)
 
-    if agent_updates:
-        for k, v in agent_updates.items():
-            FLAGS.agent[k] = v
+    return agent_updates or {}
 
 
 def _setup_file_logger(run_dir: str) -> logging.Logger:
     log_path = os.path.join(run_dir, 'run.log')
-    logger = logging.getLogger('goub_phase1')
+    logger = logging.getLogger('goub_dynamics')
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fh = logging.FileHandler(log_path, encoding='utf-8')
@@ -165,14 +131,16 @@ def _setup_file_logger(run_dir: str) -> logging.Logger:
 def main(_):
     impl = _impl_dir()
 
-    # --- YAML ---
     cfg_path = FLAGS.run_config.strip() or _default_yaml_path()
+    agent_updates = {}
     if os.path.isfile(cfg_path):
-        _apply_yaml_to_flags(_load_yaml(cfg_path))
+        agent_updates = _apply_yaml_to_flags(_load_yaml(cfg_path))
     elif FLAGS.run_config.strip():
         raise FileNotFoundError(f'run_config YAML not found: {cfg_path}')
 
-    config = FLAGS.agent
+    config = get_dynamics_config()
+    for k, v in agent_updates.items():
+        config[k] = v
     _ih = config.get('idm_hidden_dims', (512, 512, 512))
     if isinstance(_ih, str):
         _ih = parse_hidden_dims(_ih)
@@ -189,10 +157,10 @@ def main(_):
                 f'train_epochs ({FLAGS.train_epochs}) must be > resume_start_epoch ({FLAGS.resume_start_epoch}) when resuming.'
             )
 
-    # --- run directory ---
     ts = time.strftime('%Y%m%d_%H%M%S')
     env_tok = _sanitize_token(FLAGS.env_name)
-    run_folder = f'{ts}_seed{FLAGS.seed}_{env_tok}'
+    agent_tok = _sanitize_token(str(config.get('agent_name', 'goub_dynamics')))
+    run_folder = f'{ts}_{agent_tok}_seed{FLAGS.seed}_{env_tok}'
     runs_root = FLAGS.runs_root.strip() or os.path.join(impl, 'runs')
     run_dir = os.path.join(runs_root, run_folder)
     ckpt_dir = os.path.join(run_dir, 'checkpoints')
@@ -227,19 +195,38 @@ def main(_):
             FLAGS.train_epochs,
         )
 
-    env, train_ds_plain, val_ds_plain = make_env_and_datasets(
+    _env, train_ds_plain, val_ds_plain = make_env_and_datasets(
         FLAGS.env_name, frame_stack=config['frame_stack'],
     )
 
-    train_dataset = HGCDataset(train_ds_plain, config)
-    val_dataset = HGCDataset(val_ds_plain, config) if val_ds_plain is not None else None
+    dataset_class = str(config.get('dataset_class', 'PathHGCDataset'))
+    if dataset_class != 'PathHGCDataset':
+        raise ValueError(
+            f'Unsupported dataset_class {dataset_class!r}; GOUB training now requires PathHGCDataset.'
+        )
+    train_dataset = PathHGCDataset(train_ds_plain, config)
+    val_dataset = PathHGCDataset(val_ds_plain, config) if val_ds_plain is not None else None
 
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
 
     example_batch = train_dataset.sample(1)
+    train_dataset.validate_sample_batch(example_batch)
+    seg_horizon = int(example_batch['trajectory_segment'].shape[1]) - 1
+    goub_horizon = int(config['goub_N'])
+    if seg_horizon != goub_horizon:
+        raise ValueError(
+            f'Dynamics training requires trajectory_segment horizon ({seg_horizon}) == goub_N ({goub_horizon}).'
+        )
+    run_logger.info(
+        'validated trajectory_segment: K=%d obs=%s target=%s next=%s',
+        seg_horizon,
+        bool(np.allclose(example_batch['trajectory_segment'][:, 0], example_batch['observations'])),
+        bool(np.allclose(example_batch['trajectory_segment'][:, -1], example_batch['high_actor_targets'])),
+        bool(np.allclose(example_batch['trajectory_segment'][:, 1], example_batch['next_observations'])),
+    )
     ex_act = np.asarray(example_batch['actions'], dtype=np.float32)
-    agent = GOUBPhase1Agent.create(FLAGS.seed, example_batch['observations'], config, ex_actions=ex_act)
+    agent = GOUBDynamicsAgent.create(FLAGS.seed, example_batch['observations'], config, ex_actions=ex_act)
 
     if resume_pkl:
         if not os.path.isfile(resume_pkl):
@@ -259,12 +246,13 @@ def main(_):
         epoch_begin = FLAGS.resume_start_epoch + 1
         epoch_end_inclusive = FLAGS.train_epochs
     run_logger.info(
-        'dataset_size=%d batch_size=%d steps_per_epoch=%d epoch_range=%d..%d',
+        'dataset_size=%d batch_size=%d steps_per_epoch=%d epoch_range=%d..%d dataset_class=%s',
         train_dataset.size,
         batch_size,
         spe,
         epoch_begin,
         epoch_end_inclusive,
+        str(config.get('dataset_class', 'PathHGCDataset')),
     )
 
     train_logger = CsvLogger(os.path.join(run_dir, 'train.csv'))
@@ -280,8 +268,11 @@ def main(_):
     for epoch in epoch_iter:
         losses = []
         losses_goub = []
+        losses_path = []
+        losses_roll = []
         losses_sub = []
         losses_idm = []
+        first_step_l1s = []
         last_info = None
 
         for _ in range(spe):
@@ -290,8 +281,11 @@ def main(_):
             last_info = update_info
             losses.append(float(update_info['phase1/loss']))
             losses_goub.append(float(update_info['phase1/loss_goub']))
+            losses_path.append(float(update_info['phase1/loss_path_step']))
+            losses_roll.append(float(update_info['phase1/loss_roll']))
             losses_sub.append(float(update_info['phase1/loss_subgoal']))
             losses_idm.append(float(update_info['phase1/loss_idm']))
+            first_step_l1s.append(float(update_info['phase1/first_step_l1']))
 
         global_step = epoch * spe
 
@@ -299,8 +293,11 @@ def main(_):
             metrics = {f'training/{k}': float(v) for k, v in last_info.items()}
             metrics['training/phase1/loss_epoch_mean'] = float(np.mean(losses))
             metrics['training/phase1/loss_goub_epoch_mean'] = float(np.mean(losses_goub))
+            metrics['training/phase1/loss_path_step_epoch_mean'] = float(np.mean(losses_path))
+            metrics['training/phase1/loss_roll_epoch_mean'] = float(np.mean(losses_roll))
             metrics['training/phase1/loss_subgoal_epoch_mean'] = float(np.mean(losses_sub))
             metrics['training/phase1/loss_idm_epoch_mean'] = float(np.mean(losses_idm))
+            metrics['training/phase1/first_step_l1_epoch_mean'] = float(np.mean(first_step_l1s))
             metrics['training/epoch'] = float(epoch)
             metrics['training/steps_per_epoch'] = float(spe)
             metrics['training/global_step'] = float(global_step)
@@ -323,23 +320,21 @@ def main(_):
             train_logger.log(metrics, step=global_step)
 
             run_logger.info(
-                'epoch=%d global_step=%d '
-                'loss_mean=%.6f loss_goub_mean=%.6f loss_sub_mean=%.6f loss_idm_mean=%.6f | last: '
-                'loss=%.6f loss_goub=%.6f loss_sub=%.6f loss_idm=%.6f eps_norm=%.6f mu_true=%.6f mu_pred=%.6f xN-1_norm=%.6f',
+                'epoch=%d global_step=%d loss_mean=%.6f goub=%.6f path=%.6f roll=%.6f sub=%.6f idm=%.6f | '
+                'first_step_l1_mean=%.6f last: loss=%.6f fs_l1=%.6f roll_l1=%.6f eps=%.6f',
                 epoch,
                 global_step,
                 metrics['training/phase1/loss_epoch_mean'],
                 metrics['training/phase1/loss_goub_epoch_mean'],
+                metrics['training/phase1/loss_path_step_epoch_mean'],
+                metrics['training/phase1/loss_roll_epoch_mean'],
                 metrics['training/phase1/loss_subgoal_epoch_mean'],
                 metrics['training/phase1/loss_idm_epoch_mean'],
+                metrics['training/phase1/first_step_l1_epoch_mean'],
                 metrics.get('training/phase1/loss', float('nan')),
-                metrics.get('training/phase1/loss_goub', float('nan')),
-                metrics.get('training/phase1/loss_subgoal', float('nan')),
-                metrics.get('training/phase1/loss_idm', float('nan')),
+                metrics.get('training/phase1/first_step_l1', float('nan')),
+                metrics.get('training/phase1/roll_h_l1', float('nan')),
                 metrics.get('training/phase1/eps_norm', float('nan')),
-                metrics.get('training/phase1/mu_true_norm', float('nan')),
-                metrics.get('training/phase1/mu_pred_norm', float('nan')),
-                metrics.get('training/phase1/xN_minus_1_norm', float('nan')),
             )
 
         if epoch % FLAGS.save_every_n_epochs == 0:

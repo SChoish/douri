@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Path-supervised GOUB Phase-1 (1000 ep, embedded IDM in main loop) for antmaze envs that
+# GOUB dynamics (1000 ep, embedded IDM in main loop) for antmaze envs that
 # do not yet have a matching run folder under runs/.
 #
 # After each env finishes training: deterministic state rollout + inv-dyn rollout
-# (planner_noise_scale=0, inv_dyn_planner_freq=10) into the same run_dir.
+# (planner_noise_scale=0, action_chunk_horizon=10) into the same run_dir.
 #
 # Usage (from douri repo root):
-#   nohup bash scripts/run_goub_phase1_path_antmaze_missing_1000_rollouts.sh &
+#   nohup bash scripts/run_goub_dynamics_antmaze_missing_1000_rollouts.sh &
 #
 set -euo pipefail
 
@@ -16,26 +16,22 @@ cd "${IMPL_DIR}"
 
 RUNS_DIR="${IMPL_DIR}/runs"
 mkdir -p "${RUNS_DIR}"
-LOG_FILE="${RUNS_DIR}/nohup_goub_phase1_path_missing_rollouts_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${RUNS_DIR}/nohup_goub_dynamics_missing_rollouts_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "log: ${LOG_FILE}"
 
 CONDA_BASE="$(conda info --base 2>/dev/null || true)"
 if [[ -n "${CONDA_BASE}" && -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
-  # shellcheck source=/dev/null
   source "${CONDA_BASE}/etc/profile.d/conda.sh"
 elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
-  # shellcheck source=/dev/null
   source "${HOME}/miniconda3/etc/profile.d/conda.sh"
 elif [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
-  # shellcheck source=/dev/null
   source "${HOME}/anaconda3/etc/profile.d/conda.sh"
 else
   eval "$(conda shell.bash hook 2>/dev/null)" || true
 fi
 conda activate offrl
 
-# Full antmaze path batch (same order as run_goub_phase1_path_antmaze_1000.sh).
 ALL_ENVS=(
   antmaze-medium-navigate-v0
   antmaze-large-navigate-v0
@@ -47,14 +43,14 @@ ALL_ENVS=(
   antmaze-teleport-stitch-v0
 )
 
-has_path_run() {
+has_dynamics_run() {
   local env="$1"
-  compgen -G "${RUNS_DIR}"/*_goub_phase1_path_seed0_"${env}" >/dev/null
+  compgen -G "${RUNS_DIR}"/*_goub_dynamics_seed0_"${env}" >/dev/null
 }
 
-latest_path_run_dir() {
+latest_dynamics_run_dir() {
   local env="$1"
-  ls -dt "${RUNS_DIR}"/*_goub_phase1_path_seed0_"${env}" 2>/dev/null | head -1
+  ls -dt "${RUNS_DIR}"/*_goub_dynamics_seed0_"${env}" 2>/dev/null | head -1
 }
 
 rollout_artifacts() {
@@ -72,26 +68,26 @@ rollout_artifacts() {
     --checkpoint_epoch=1000 \
     --traj_idx=0 \
     --max_steps=1000 \
-    --inv_dyn_planner_freq=10 \
+    --action_chunk_horizon=10 \
     --planner_noise_scale=0 \
     --out_path="${R}/deterministic_inv_dyn_rollout_goub1000_freq10.png" \
     --fps=60
 }
 
 for env in "${ALL_ENVS[@]}"; do
-  if has_path_run "${env}"; then
-    echo "========== SKIP (path run exists): ${env} =========="
+  if has_dynamics_run "${env}"; then
+    echo "========== SKIP (dynamics run exists): ${env} =========="
     continue
   fi
   echo "========== TRAIN ${env} $(date -Is) =========="
-  python main_goub_phase1_path.py \
+  python main_goub_dynamics.py \
     --env_name="${env}" \
     --train_epochs=1000 \
     --save_every_n_epochs=100 \
     --log_every_n_epochs=10 \
     --use_tqdm=false
 
-  R="$(latest_path_run_dir "${env}")"
+  R="$(latest_dynamics_run_dir "${env}")"
   if [[ -z "${R}" || ! -d "${R}" ]]; then
     echo "ERROR: could not resolve run_dir for ${env}"
     exit 1

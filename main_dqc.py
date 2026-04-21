@@ -144,8 +144,8 @@ def main(_):
     agent = DQCAgent.create(
         FLAGS.seed,
         ex['observations'],
-        ex['high_value_action_chunks'],
-        ex['partial_action_chunks'],
+        ex['full_chunk_actions'],
+        ex['action_chunk_actions'],
         config,
     )
 

@@ -19,8 +19,8 @@ agent:
   best_of_n: 64
 
   use_chunk_critic: true
-  backup_horizon: 8
-  policy_chunk_size: 4
+  full_chunk_horizon: 8
+  action_chunk_horizon: 4
   distill_method: expectile
   kappa_d: 0.7
   implicit_backup_type: expectile
@@ -30,6 +30,17 @@ agent:
   value_hidden_dims: [256, 256, 256]
   layer_norm: true
   actor_layer_norm: true
+  use_spi_actor: false
+  spi_tau: 0.5
+  spi_beta: 10.0
+  spi_num_samples: 32
+  spi_candidate_source: external
+  spi_use_partial_critic: true
+  spi_actor_hidden_dims: [256, 256, 256]
+  spi_actor_layer_norm: true
+  spi_eval_use_actor: false
+  spi_dist_normalize_by_dim: true
+  spi_warmstart_steps: 0
 
   dataset_class: DQCActionSeqDataset
   frame_stack: null

@@ -1,10 +1,10 @@
-"""Train DEAS-style detached distributional critic + value (offline, no actor).
+"""Train unified critic stacks (DEAS or DQC, critic-only, offline).
 
 Example::
 
     cd /path/to/douri
     export PYTHONPATH=.
-    python main_deas_seq_critic.py --env_name=antmaze-medium-navigate-v0 --train_epochs=2
+    python main_critic.py --env_name=antmaze-medium-navigate-v0 --train_epochs=2
 """
 
 import json
@@ -23,9 +23,10 @@ import yaml
 from absl import app, flags
 from ml_collections import config_flags
 
-from agents.deas_seq_critic import DEASSeqCriticAgent
+from agents.critic import get_critic_class
 from utils.datasets import Dataset
 from utils.deas_sequence_dataset import DEASActionSeqDataset
+from utils.dqc_sequence_dataset import DQCActionSeqDataset
 from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
@@ -38,7 +39,7 @@ def _impl_dir():
 
 
 def _default_yaml_path():
-    return os.path.join(_impl_dir(), 'config', 'deas_seq_critic_antmaze.yaml')
+    return os.path.join(_impl_dir(), 'config', 'critic_antmaze.yaml')
 
 
 def _sanitize_token(s: str) -> str:
@@ -76,7 +77,7 @@ def _apply_yaml_to_flags(data: dict) -> None:
             FLAGS.agent[k] = v
 
 
-flags.DEFINE_string('run_config', '', 'YAML config; empty uses config/deas_seq_critic_antmaze.yaml.')
+flags.DEFINE_string('run_config', '', 'YAML config; empty uses config/critic_antmaze.yaml.')
 flags.DEFINE_string('runs_root', '', 'Run root; default <repo>/runs.')
 flags.DEFINE_string('run_group', 'Debug', 'W&B group.')
 flags.DEFINE_integer('seed', 0, 'Seed.')
@@ -90,8 +91,9 @@ flags.DEFINE_integer('log_every_n_epochs', 1, 'Log interval (epochs).')
 flags.DEFINE_integer('save_every_n_epochs', 10, 'Checkpoint interval.')
 flags.DEFINE_boolean('use_wandb', False, 'W&B.')
 flags.DEFINE_boolean('use_tqdm', False, 'tqdm over epochs.')
+flags.DEFINE_enum('critic', 'deas', ['deas', 'dqc'], 'Critic stack to use.')
 
-config_flags.DEFINE_config_file('agent', 'agents/deas_seq_critic.py', lock_config=False)
+config_flags.DEFINE_config_file('agent', 'agents/critic/__init__.py', lock_config=False)
 
 
 def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
@@ -100,7 +102,7 @@ def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
 
 def _setup_file_logger(run_dir: str) -> logging.Logger:
     log_path = os.path.join(run_dir, 'run.log')
-    logger = logging.getLogger('deas_seq_critic')
+    logger = logging.getLogger('critic')
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fh = logging.FileHandler(log_path, encoding='utf-8')
@@ -119,14 +121,12 @@ def main(_):
         raise FileNotFoundError(f'run_config YAML not found: {cfg_path}')
 
     config = FLAGS.agent
-    if config['agent_name'] != 'deas_seq_critic':
-        raise ValueError(f'Expected agent_name deas_seq_critic, got {config["agent_name"]!r}.')
-    if config['dataset_class'] != 'DEASActionSeqDataset':
-        raise ValueError(f'Expected dataset_class DEASActionSeqDataset, got {config["dataset_class"]!r}.')
+    critic_name = str(FLAGS.critic).lower()
+    critic_cls = get_critic_class(critic_name)
 
     ts = time.strftime('%Y%m%d_%H%M%S')
     env_tok = _sanitize_token(FLAGS.env_name)
-    run_folder = f'{ts}_deas_seq_critic_seed{FLAGS.seed}_{env_tok}'
+    run_folder = f'{ts}_{critic_name}_critic_seed{FLAGS.seed}_{env_tok}'
     runs_root = FLAGS.runs_root.strip() or os.path.join(impl, 'runs')
     run_dir = os.path.join(runs_root, run_folder)
     ckpt_dir = os.path.join(run_dir, 'checkpoints')
@@ -134,30 +134,39 @@ def main(_):
     if os.path.isfile(cfg_path):
         shutil.copy2(cfg_path, os.path.join(run_dir, 'config_used.yaml'))
 
-    exp_name = get_exp_name(FLAGS.seed, env_name=FLAGS.env_name, agent_name=config['agent_name'])
+    exp_name = get_exp_name(FLAGS.seed, env_name=FLAGS.env_name, agent_name=f'{critic_name}_critic')
     if FLAGS.use_wandb:
-        setup_wandb(project='OGBench-DEAS', group=FLAGS.run_group, name=exp_name)
-        project = wandb.run.project
-    else:
-        project = 'OGBench-DEAS'
-
+        setup_wandb(project='OGBench-Critic', group=FLAGS.run_group, name=exp_name)
     with open(os.path.join(run_dir, 'flags.json'), 'w', encoding='utf-8') as f:
         json.dump(get_flag_dict(), f, indent=2)
 
     run_logger = _setup_file_logger(run_dir)
     run_logger.info('run_dir=%s', run_dir)
+    run_logger.info('critic=%s', critic_name)
 
     _, train_ds_plain, _ = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
-    train_dataset = DEASActionSeqDataset(Dataset.create(**train_ds_plain), config)
+    if critic_name == 'deas':
+        train_dataset = DEASActionSeqDataset(Dataset.create(**train_ds_plain), config)
+    else:
+        train_dataset = DQCActionSeqDataset(Dataset.create(**train_ds_plain), config)
 
     np.random.seed(FLAGS.seed)
     ex = train_dataset.sample(1)
-    agent = DEASSeqCriticAgent.create(
-        FLAGS.seed,
-        ex['observations'],
-        ex['actions'],
-        config,
-    )
+    if critic_name == 'deas':
+        agent = critic_cls.create(
+            FLAGS.seed,
+            ex['observations'],
+            ex['actions'],
+            config,
+        )
+    else:
+        agent = critic_cls.create(
+            FLAGS.seed,
+            ex['observations'],
+            ex['full_chunk_actions'],
+            ex['action_chunk_actions'],
+            config,
+        )
 
     batch_size = int(config['batch_size'])
     spe = _steps_per_epoch(train_dataset.size, batch_size)
@@ -176,8 +185,12 @@ def main(_):
             batch = train_dataset.sample(batch_size)
             agent, info = agent.update(batch)
             last_info = info
-            losses_v.append(float(last_info['value/value_loss']))
-            losses_c.append(float(last_info['critic/critic_loss']))
+            if critic_name == 'deas':
+                losses_v.append(float(last_info['value/value_loss']))
+                losses_c.append(float(last_info['critic/critic_loss']))
+            else:
+                losses_v.append(float(last_info['action_critic/value_loss']))
+                losses_c.append(float(last_info['chunk_critic/critic_loss']))
 
         gstep = epoch * spe
         if epoch % FLAGS.log_every_n_epochs == 0 and last_info is not None:

@@ -1,10 +1,10 @@
-# GOUB Phase-1 — antmaze-large-navigate-v0 (epoch-based)
-# Paths are interpreted relative to the working directory unless absolute.
-# Agent overrides merge into ml_collections agent config from agents/goub_phase1.py.
+# GOUB dynamics — antmaze (epoch-based)
+# Run: cd <douri> && PYTHONPATH=. python main_goub_dynamics.py
+# Requires goub_N == subgoal_steps (see agent.require_matching_horizon).
 
 env_name: antmaze-large-navigate-v0
 seed: 0
-run_group: antmaze_navigate
+run_group: antmaze_navigate_dynamics
 
 train_epochs: 1000
 log_every_n_epochs: 10
@@ -16,9 +16,18 @@ use_tqdm: false
 agent:
   batch_size: 1024
   lr: 0.0003
+  agent_name: goub_dynamics
+  dataset_class: PathHGCDataset
+  require_matching_horizon: true
+  goub_loss_weight: 1.0
+  path_loss_weight: 1.0
+  rollout_loss_weight: 0.25
+  rollout_horizon: 5
+  path_loss_slice: null
+  rollout_loss_slice: null
+  path_eval_slice: [0, 1]
   idm_loss_weight: 1.0
   idm_hidden_dims: [512, 512, 512]
-  # Subgoal estimator: (s, high_actor_goals) -> high_actor_targets (MSE).
   train_subgoal_estimator: true
   subgoal_loss_weight: 1.0
   subgoal_hidden_dims: [512, 512, 512]
@@ -27,7 +36,6 @@ agent:
   goub_beta_min: 0.1
   goub_beta_max: 20.0
   goub_lambda: 1.0
-  # Trajectory-only high-level targets (no random subgoals).
   actor_p_curgoal: 0.0
   actor_p_trajgoal: 1.0
   actor_p_randomgoal: 0.0

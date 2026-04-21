@@ -13,7 +13,7 @@ once with ``navigator`` disabled so a difficult maze layout can still be visuali
    when distance to ``s_g`` is at most ``--goal_tol`` (``<=``, inclusive); see ``--goal_stop``).
 
    Each **chunk**: ``predict_subgoal(s, s_g)`` once → one ``plan`` / ``sample_plan`` → append
-   ``trajectory[1:K+1]`` (``K`` from ``--state_chunk_horizon``; ``0`` → ``goub_N``), clamped, capped by ``N``.
+   ``trajectory[1:K+1]`` (``K`` from ``--action_chunk_horizon``; ``0`` → ``goub_N``), clamped, capped by ``N``.
    ``K=1`` uses only ``next_step`` (``trajectory[1]``) per chunk.
 
        (repeat)  hat = G(s, g);  traj = plan(s, hat);  walk traj[1], …, traj[K]
@@ -60,7 +60,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from ml_collections import ConfigDict
 
-from agents.goub_phase1 import GOUBPhase1Agent, get_config
+from agents.goub_dynamics import GOUBDynamicsAgent, get_dynamics_config
 from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import merge_checkpoint_state_dict
@@ -103,7 +103,7 @@ def _load_run_flags(run_dir: Path) -> tuple[ConfigDict, str]:
     env_name = flags.get('env_name')
     if not env_name:
         raise KeyError('flags.json must contain env_name')
-    cfg = get_config()
+    cfg = get_dynamics_config()
     for k, v in (flags.get('agent') or {}).items():
         cfg[k] = v
     return cfg, env_name
@@ -175,7 +175,7 @@ def _goal_within_tol(
 
 
 def bridge_trajectory(
-    agent: GOUBPhase1Agent,
+    agent: GOUBDynamicsAgent,
     s_start: np.ndarray,
     s_end: np.ndarray,
     k: int,
@@ -209,7 +209,7 @@ def bridge_trajectory(
 
 
 def rollout_subgoal_goub(
-    agent: GOUBPhase1Agent,
+    agent: GOUBDynamicsAgent,
     s0: np.ndarray,
     s_g: np.ndarray,
     max_steps: int,
@@ -224,7 +224,7 @@ def rollout_subgoal_goub(
     stochastic: bool = False,
     plan_key: jnp.ndarray | None = None,
     sample_noise_scale: float = 1.0,
-    state_chunk_horizon: int = 1,
+    action_chunk_horizon: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, int, bool]:
     """Roll out GOUB + subgoal in state space.
 
@@ -232,7 +232,7 @@ def rollout_subgoal_goub(
         ``roll``: shape ``(T+1, D)`` with ``roll[0]=s0`` and ``T`` planner steps
         (``T <= max_steps``).
         ``hats``: shape ``(T, D)`` — ``hats[i]`` is the bridge endpoint ``hat`` used for the transition
-        ``roll[i] → roll[i+1]`` (constant for ``state_chunk_horizon`` consecutive steps).
+        ``roll[i] → roll[i+1]`` (constant for ``action_chunk_horizon`` consecutive steps).
         ``n_steps``: number of appended states along rollouts (``T``), i.e. transition count.
         ``reached``: True if rollout stopped early because goal distance
         (subset of dims if ``goal_stop_dims``) is at most ``goal_tol`` (``<=``).
@@ -242,7 +242,7 @@ def rollout_subgoal_goub(
     ``ogbench.locomaze.maze``-aligned modes (``ij`` / ``oracle`` / ``union`` / ``center``).
 
     Args:
-        state_chunk_horizon: After each ``predict_subgoal``, call ``plan`` (or ``sample_plan``) **once**
+        action_chunk_horizon: After each ``predict_subgoal``, call ``plan`` (or ``sample_plan``) **once**
             and walk the first ``K`` states along its reverse trajectory — i.e. append
             ``trajectory[1], …, trajectory[K]`` (1-based slice ``trajectory[1:K+1]``), capped by ``goub_N``.
             Use ``1`` for legacy behaviour (only ``next_step`` / ``trajectory[1]`` per chunk, then new
@@ -261,7 +261,7 @@ def rollout_subgoal_goub(
     if stochastic and plan_key is None:
         raise ValueError('stochastic=True requires plan_key (JAX PRNGKey).')
 
-    sch = max(1, int(state_chunk_horizon))
+    sch = max(1, int(action_chunk_horizon))
 
     if _goal_within_tol(s0f, g_np, goal_stop_dims, float(goal_tol)):
         roll = np.stack(states, axis=0)
@@ -324,7 +324,7 @@ def main():
     )
     p.add_argument('--traj_idx', type=int, default=0, help='Which offline episode index to compare against.')
     p.add_argument(
-        '--state_chunk_horizon',
+        '--action_chunk_horizon',
         type=int,
         default=0,
         metavar='K',
@@ -472,8 +472,8 @@ def main():
 
     if args.segment_compare and args.sample_seeds:
         p.error('--sample_seeds cannot be used with --segment_compare')
-    if int(args.state_chunk_horizon) < 0:
-        p.error('--state_chunk_horizon must be >= 0 (0 = use goub_N)')
+    if int(args.action_chunk_horizon) < 0:
+        p.error('--action_chunk_horizon must be >= 0 (0 = use goub_N)')
     if args.sample_overlay and not args.sample_seeds:
         p.error('--sample_overlay requires --sample_seeds')
 
@@ -560,7 +560,7 @@ def main():
     ex = jnp.zeros((1, s0.shape[-1]), dtype=jnp.float32)
     act_dim = int(np.asarray(dataset['actions']).shape[-1])
     ex_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
-    agent = GOUBPhase1Agent.create(args.seed, ex, cfg, ex_actions=ex_act)
+    agent = GOUBDynamicsAgent.create(args.seed, ex, cfg, ex_actions=ex_act)
     pkl_path = ckpt_dir / f'params_{ckpt_epoch}.pkl'
     if not pkl_path.is_file():
         raise FileNotFoundError(f'Missing checkpoint: {pkl_path}')
@@ -568,10 +568,10 @@ def main():
     print(f'Loaded {pkl_path}')
 
     goub_N = int(agent.config['goub_N'])
-    raw_chunk_h = int(args.state_chunk_horizon)
+    raw_chunk_h = int(args.action_chunk_horizon)
     iter_state_chunk_h = goub_N if raw_chunk_h <= 0 else raw_chunk_h
     if iter_state_chunk_h < 1:
-        p.error('--state_chunk_horizon resolved to < 1 (use >= 1, or 0 for goub_N)')
+        p.error('--action_chunk_horizon resolved to < 1 (use >= 1, or 0 for goub_N)')
     c0 = args.clamp_dim0 if args.clamp_dim0 >= 0 else args.plot_dim0
     c1 = args.clamp_dim1 if args.clamp_dim1 >= 0 else args.plot_dim1
 
@@ -615,7 +615,7 @@ def main():
                 goal_stop_dims=stop_dims,
                 **nav_kw,
                 **skw,
-                state_chunk_horizon=iter_state_chunk_h,
+                action_chunk_horizon=iter_state_chunk_h,
             )
             if navigator is not None and tol > 0 and not reached:
                 print(
@@ -632,16 +632,16 @@ def main():
                     goal_stop_dims=stop_dims,
                     **nav_kw_raw,
                     **skw,
-                    state_chunk_horizon=iter_state_chunk_h,
+                    action_chunk_horizon=iter_state_chunk_h,
                 )
             if plan_seed is not None:
                 print(
-                    f'State rollout: K={iter_state_chunk_h} (raw --state_chunk_horizon={raw_chunk_h}), '
+                    f'State rollout: K={iter_state_chunk_h} (raw --action_chunk_horizon={raw_chunk_h}), '
                     f'sample_plan, seed={plan_seed}'
                 )
             else:
                 print(
-                    f'State rollout: K={iter_state_chunk_h} (raw --state_chunk_horizon={raw_chunk_h}); '
+                    f'State rollout: K={iter_state_chunk_h} (raw --action_chunk_horizon={raw_chunk_h}); '
                     f'each chunk: predict_subgoal → plan → trajectory[1:K+1]'
                 )
             rollouts.append((roll, hats, n_planner_steps, reached, plan_seed, bool(skw['stochastic'])))

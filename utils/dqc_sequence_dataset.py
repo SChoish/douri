@@ -1,4 +1,4 @@
-"""Dataset sampler for DQC chunk/value/flow training."""
+"""Dataset sampler for DQC full/action-chunk training."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from utils.datasets import Dataset, batched_random_crop
 
 @dataclasses.dataclass
 class DQCActionSeqDataset:
-    """Samples full/partial action chunks without crossing episode boundaries."""
+    """Samples full/action chunks without crossing episode boundaries."""
 
     dataset: Dataset
     config: Any
@@ -25,24 +25,24 @@ class DQCActionSeqDataset:
         self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
         assert self.terminal_locs[-1] == self.size - 1
 
-        self.h = int(self.config['backup_horizon'])
-        self.ha = int(self.config['policy_chunk_size'])
-        if self.h < 1:
-            raise ValueError('backup_horizon must be >= 1.')
-        if self.ha < 1:
-            raise ValueError('policy_chunk_size must be >= 1.')
-        if self.ha > self.h:
-            raise ValueError('policy_chunk_size must be <= backup_horizon.')
+        self.full_chunk_horizon = int(self.config['full_chunk_horizon'])
+        self.action_chunk_horizon = int(self.config['action_chunk_horizon'])
+        if self.full_chunk_horizon < 1:
+            raise ValueError('full_chunk_horizon must be >= 1.')
+        if self.action_chunk_horizon < 1:
+            raise ValueError('action_chunk_horizon must be >= 1.')
+        if self.action_chunk_horizon > self.full_chunk_horizon:
+            raise ValueError('action_chunk_horizon must be <= full_chunk_horizon.')
 
         valids = np.zeros(self.size, dtype=np.float32)
         for start, end in zip(self.initial_locs, self.terminal_locs):
-            last_start = int(end) - self.h
+            last_start = int(end) - self.full_chunk_horizon
             if last_start >= int(start):
                 valids[int(start) : last_start + 1] = 1.0
         (self.valid_starts,) = np.nonzero(valids > 0)
         if len(self.valid_starts) == 0:
             raise ValueError(
-                f'No valid starts for backup_horizon={self.h} in dataset size={self.size}.'
+                f'No valid starts for full_chunk_horizon={self.full_chunk_horizon} in dataset size={self.size}.'
             )
 
         if self.config.get('frame_stack') is not None:
@@ -100,7 +100,7 @@ class DQCActionSeqDataset:
 
     def _validate_starts(self, idxs: np.ndarray) -> None:
         finals = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
-        bad = idxs + self.h > finals
+        bad = idxs + self.full_chunk_horizon > finals
         if np.any(bad):
             raise ValueError('DQCActionSeqDataset sampled starts crossing episode boundaries.')
 
@@ -114,42 +114,44 @@ class DQCActionSeqDataset:
         actions_step = np.asarray(self.dataset['actions'][idxs], dtype=np.float32)
         next_obs = np.asarray(self.get_observations(idxs + 1), dtype=np.float32)
 
-        full_offsets = np.arange(self.h, dtype=np.int64)[None, :]
+        full_offsets = np.arange(self.full_chunk_horizon, dtype=np.int64)[None, :]
         full_idx = idxs[:, None] + full_offsets
-        full_actions = np.asarray(self.dataset['actions'][full_idx], dtype=np.float32)  # [B, h, A]
-        partial_actions = full_actions[:, : self.ha, :]
-        high_value_action_chunks = full_actions.reshape(full_actions.shape[0], -1)
-        partial_action_chunks = partial_actions.reshape(partial_actions.shape[0], -1)
+        full_chunk_actions_3d = np.asarray(self.dataset['actions'][full_idx], dtype=np.float32)  # [B, H_full, A]
+        action_chunk_actions_3d = full_chunk_actions_3d[:, : self.action_chunk_horizon, :]
+        full_chunk_actions = full_chunk_actions_3d.reshape(full_chunk_actions_3d.shape[0], -1)
+        action_chunk_actions = action_chunk_actions_3d.reshape(action_chunk_actions_3d.shape[0], -1)
 
         value_goal_idxs = self.sample_goals(idxs)
         value_goals = np.asarray(self.get_observations(value_goal_idxs), dtype=np.float32)
         success_steps = (full_idx == value_goal_idxs[:, None]).astype(np.float32)
         reward_offset = 1.0 if bool(self.config.get('gc_negative', True)) else 0.0
         step_rewards = success_steps - reward_offset
-        discounts = np.power(float(self.config['discount']), np.arange(self.h, dtype=np.float32))[None, :]
-        high_value_rewards = np.sum(step_rewards * discounts, axis=1).astype(np.float32)
+        discounts = np.power(float(self.config['discount']), np.arange(self.full_chunk_horizon, dtype=np.float32))[None, :]
+        full_chunk_rewards = np.sum(step_rewards * discounts, axis=1).astype(np.float32)
 
         terminals = np.asarray(self.dataset['terminals'], dtype=np.float32)
-        term_window = np.stack([terminals[idxs + t] for t in range(self.h)], axis=-1)
-        high_value_masks = (1.0 - np.max(term_window, axis=-1)).astype(np.float32)
-        high_value_next_observations = np.asarray(self.get_observations(idxs + self.h), dtype=np.float32)
-        high_value_backup_horizon = np.full((idxs.shape[0],), self.h, dtype=np.float32)
-        valids = np.ones((idxs.shape[0], self.ha), dtype=np.float32)
+        term_window = np.stack([terminals[idxs + t] for t in range(self.full_chunk_horizon)], axis=-1)
+        full_chunk_masks = (1.0 - np.max(term_window, axis=-1)).astype(np.float32)
+        full_chunk_next_observations = np.asarray(
+            self.get_observations(idxs + self.full_chunk_horizon), dtype=np.float32
+        )
+        full_chunk_horizon = np.full((idxs.shape[0],), self.full_chunk_horizon, dtype=np.float32)
+        valids = np.ones((idxs.shape[0], self.action_chunk_horizon), dtype=np.float32)
 
         batch = {
             'observations': obs,
             'actions': actions_step,
             'next_observations': next_obs,
             'value_goals': value_goals,
-            'high_value_action_chunks': high_value_action_chunks,
-            'partial_action_chunks': partial_action_chunks,
-            'high_value_next_observations': high_value_next_observations,
-            'high_value_rewards': high_value_rewards,
-            'high_value_masks': high_value_masks,
-            'high_value_backup_horizon': high_value_backup_horizon,
+            'full_chunk_actions': full_chunk_actions,
+            'action_chunk_actions': action_chunk_actions,
+            'full_chunk_next_observations': full_chunk_next_observations,
+            'full_chunk_rewards': full_chunk_rewards,
+            'full_chunk_masks': full_chunk_masks,
+            'full_chunk_horizon': full_chunk_horizon,
             'valids': valids,
         }
 
         if not evaluation:
-            self.augment(batch, ['observations', 'next_observations', 'value_goals', 'high_value_next_observations'])
+            self.augment(batch, ['observations', 'next_observations', 'value_goals', 'full_chunk_next_observations'])
         return batch

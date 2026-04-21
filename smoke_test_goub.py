@@ -1,4 +1,4 @@
-"""Smoke test for GOUB-inspired Phase-1 implementation.
+"""Smoke test for GOUB dynamics implementation.
 
 Run from the repository root (directory containing ``main_*.py`` and ``agents/``):
     python smoke_test_goub.py
@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from agents.goub_dynamics import GOUBDynamicsAgent, get_dynamics_config
 from utils.goub import bridge_sample, make_goub_schedule, model_mean, posterior_mean
 
 PASS = 0
@@ -37,6 +38,34 @@ def check(name, cond, detail=''):
     else:
         FAIL += 1
         print(f'  [FAIL] {name}  {detail}')
+
+
+def _make_test_config(N: int = 10, *, batch_size: int = 64, lr: float = 3e-4):
+    config = get_dynamics_config()
+    config['goub_N'] = N
+    config['subgoal_steps'] = N
+    config['batch_size'] = batch_size
+    config['lr'] = lr
+    config['idm_loss_weight'] = 0.0
+    return config
+
+
+def _make_dynamics_batch(B: int, D: int, N: int):
+    obs = jnp.linspace(0.0, 1.0, B * D, dtype=jnp.float32).reshape(B, D)
+    target = jnp.linspace(1.0, 2.0, B * D, dtype=jnp.float32).reshape(B, D)
+    high_goal = 0.5 * (obs + target)
+    alphas = jnp.linspace(0.0, 1.0, N + 1, dtype=jnp.float32).reshape(1, N + 1, 1)
+    segment = obs[:, None, :] * (1.0 - alphas) + target[:, None, :] * alphas
+    next_obs = segment[:, 1, :]
+    actions = jnp.zeros((B, 2), dtype=jnp.float32)
+    return {
+        'observations': obs,
+        'next_observations': next_obs,
+        'high_actor_goals': high_goal,
+        'high_actor_targets': target,
+        'trajectory_segment': segment,
+        'actions': actions,
+    }
 
 
 # ------------------------------------------------------------------
@@ -155,17 +184,13 @@ def test_model_mean():
 
 def test_agent_creation():
     print('\n--- Agent creation ---')
-    from agents.goub_phase1 import GOUBPhase1Agent, get_config
-
-    config = get_config()
-    config['goub_N'] = 10
-    config['idm_loss_weight'] = 0.0
+    config = _make_test_config(N=10)
 
     B, D = 4, 10
     ex_obs = jnp.zeros((B, D))
     ex_act = jnp.zeros((1, 2), dtype=jnp.float32)
 
-    agent = GOUBPhase1Agent.create(0, ex_obs, config, ex_actions=ex_act)
+    agent = GOUBDynamicsAgent.create(0, ex_obs, config, ex_actions=ex_act)
     n_params = sum(p.size for p in jax.tree_util.tree_leaves(agent.network.params))
     print(f'  Total parameters: {n_params:,}')
     check('agent created', agent is not None)
@@ -177,20 +202,13 @@ def test_agent_creation():
 
 def test_agent_loss():
     print('\n--- Agent loss ---')
-    from agents.goub_phase1 import GOUBPhase1Agent, get_config
-
-    config = get_config()
-    config['goub_N'] = 10
-    config['idm_loss_weight'] = 0.0
+    config = _make_test_config(N=10)
 
     B, D = 64, 10
-    agent = GOUBPhase1Agent.create(0, jnp.zeros((1, D)), config, ex_actions=jnp.zeros((1, 2), dtype=jnp.float32))
-
-    batch = {
-        'observations': jnp.ones((B, D)),
-        'high_actor_goals': jnp.full((B, D), 0.5),
-        'high_actor_targets': jnp.zeros((B, D)),
-    }
+    agent = GOUBDynamicsAgent.create(
+        0, jnp.zeros((1, D)), config, ex_actions=jnp.zeros((1, 2), dtype=jnp.float32)
+    )
+    batch = _make_dynamics_batch(B, D, int(config['goub_N']))
 
     rng = jax.random.PRNGKey(0)
     loss, info = agent.total_loss(batch, agent.network.params, rng=rng)
@@ -209,28 +227,33 @@ def test_agent_loss():
 
 def test_loss_decreases():
     print('\n--- Loss decrease (200 steps) ---')
-    from agents.goub_phase1 import GOUBPhase1Agent, get_config
-
-    config = get_config()
-    config['goub_N'] = 10
-    config['batch_size'] = 64
-    config['lr'] = 1e-3
-    config['idm_loss_weight'] = 0.0
+    config = _make_test_config(N=10, batch_size=64, lr=1e-3)
 
     D = 10
-    agent = GOUBPhase1Agent.create(0, jnp.zeros((1, D)), config, ex_actions=jnp.zeros((1, 2), dtype=jnp.float32))
+    N = int(config['goub_N'])
+    agent = GOUBDynamicsAgent.create(
+        0, jnp.zeros((1, D)), config, ex_actions=jnp.zeros((1, 2), dtype=jnp.float32)
+    )
 
     np.random.seed(42)
-    x_T_data = np.random.randn(256, D).astype(np.float32)
-    x_0_data = np.random.randn(256, D).astype(np.float32)
+    obs_data = np.random.randn(256, D).astype(np.float32)
+    target_data = np.random.randn(256, D).astype(np.float32)
 
     losses = []
     for step in range(200):
         idx = np.random.choice(256, 64)
+        obs = jnp.array(obs_data[idx])
+        target = jnp.array(target_data[idx])
+        high_goal = target * 0.1
+        alphas = jnp.linspace(0.0, 1.0, N + 1, dtype=jnp.float32).reshape(1, N + 1, 1)
+        segment = obs[:, None, :] * (1.0 - alphas) + target[:, None, :] * alphas
         batch = {
-            'observations': jnp.array(x_T_data[idx]),
-            'high_actor_goals': jnp.array(x_0_data[idx]) * 0.1,
-            'high_actor_targets': jnp.array(x_0_data[idx]),
+            'observations': obs,
+            'next_observations': segment[:, 1, :],
+            'high_actor_goals': high_goal,
+            'high_actor_targets': target,
+            'trajectory_segment': segment,
+            'actions': jnp.zeros((64, 2), dtype=jnp.float32),
         }
         agent, info = agent.update(batch)
         losses.append(float(info['phase1/loss']))
@@ -248,15 +271,13 @@ def test_loss_decreases():
 
 def test_inference():
     print('\n--- Inference ---')
-    from agents.goub_phase1 import GOUBPhase1Agent, get_config
-
-    config = get_config()
-    config['goub_N'] = 10
-    config['idm_loss_weight'] = 0.0
+    config = _make_test_config(N=10)
     N = config['goub_N']
 
     D = 10
-    agent = GOUBPhase1Agent.create(0, jnp.zeros((1, D)), config, ex_actions=jnp.zeros((1, 2), dtype=jnp.float32))
+    agent = GOUBDynamicsAgent.create(
+        0, jnp.zeros((1, D)), config, ex_actions=jnp.zeros((1, 2), dtype=jnp.float32)
+    )
 
     # Single input
     current = jnp.ones(D)
@@ -286,15 +307,13 @@ def test_inference():
 
 def test_next_step_is_learned():
     print('\n--- next_step is learned ---')
-    from agents.goub_phase1 import GOUBPhase1Agent, get_config
-
-    config = get_config()
-    config['goub_N'] = 10
-    config['lr'] = 1e-3
-    config['idm_loss_weight'] = 0.0
+    config = _make_test_config(N=10, lr=1e-3)
 
     D = 10
-    agent = GOUBPhase1Agent.create(0, jnp.zeros((1, D)), config, ex_actions=jnp.zeros((1, 2), dtype=jnp.float32))
+    N = int(config['goub_N'])
+    agent = GOUBDynamicsAgent.create(
+        0, jnp.zeros((1, D)), config, ex_actions=jnp.zeros((1, 2), dtype=jnp.float32)
+    )
 
     current = jnp.ones(D)
     endpoint = jnp.zeros(D)
@@ -305,10 +324,15 @@ def test_next_step_is_learned():
     for _ in range(20):
         obs = jax.random.normal(jax.random.PRNGKey(0), (64, D))
         targets = jax.random.normal(jax.random.PRNGKey(1), (64, D))
+        alphas = jnp.linspace(0.0, 1.0, N + 1, dtype=jnp.float32).reshape(1, N + 1, 1)
+        segment = obs[:, None, :] * (1.0 - alphas) + targets[:, None, :] * alphas
         batch = {
             'observations': obs,
+            'next_observations': segment[:, 1, :],
             'high_actor_goals': targets * 0.1,
             'high_actor_targets': targets,
+            'trajectory_segment': segment,
+            'actions': jnp.zeros((64, 2), dtype=jnp.float32),
         }
         agent, _ = agent.update(batch)
 
@@ -334,7 +358,7 @@ def test_next_step_is_learned():
 
 if __name__ == '__main__':
     print('=' * 60)
-    print('GOUB-inspired Phase 1 — Smoke Test')
+    print('GOUB dynamics — Smoke Test')
     print('=' * 60)
 
     test_schedule()

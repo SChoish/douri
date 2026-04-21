@@ -55,9 +55,9 @@ for rel in "${RUNS[@]}"; do
     IDM_PKL="$R/idm/checkpoints/params_${EPOCH}.pkl"
     if [[ -f "$IDM_PKL" ]]; then
       IDM_ARGS=(--idm_checkpoint="$IDM_PKL")
-      echo "=== IDM env rollout: $R (standalone $IDM_PKL, inv_dyn_planner_freq=$IDM_FREQ) ==="
+      echo "=== IDM env rollout: $R (standalone $IDM_PKL, action_chunk_horizon=$IDM_FREQ) ==="
     else
-      echo "=== IDM env rollout: $R (embedded idm_net in GOUB ckpt, inv_dyn_planner_freq=$IDM_FREQ) ==="
+      echo "=== IDM env rollout: $R (embedded idm_net in GOUB ckpt, action_chunk_horizon=$IDM_FREQ) ==="
     fi
     "$PY" rollout_idm_goub.py \
       --run_dir="$R" \
@@ -65,7 +65,7 @@ for rel in "${RUNS[@]}"; do
       --traj_idx="$TRAJ_IDX" \
       --max_steps="$MAX_STEPS" \
       "${IDM_ARGS[@]}" \
-      --inv_dyn_planner_freq="$IDM_FREQ" \
+      --action_chunk_horizon="$IDM_FREQ" \
       --out_path="$R/deterministic_inv_dyn_rollout_freq${IDM_FREQ}.png" \
       --fps="$FPS"
   fi

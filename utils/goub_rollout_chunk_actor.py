@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from agents.goub_phase1 import GOUBPhase1Agent
+from agents.goub_dynamics import GOUBDynamicsAgent
 from utils.goub_rollout_env import (
     env_render_rgb_u8,
     make_xy_clamper,
@@ -75,7 +75,7 @@ def _summarize_chunk_debug(debug: dict[str, np.ndarray], dataset_action_norm_mea
 
 def rollout_chunked_bridge_chunk_actor(
     env,
-    agent: GOUBPhase1Agent,
+    agent: GOUBDynamicsAgent,
     chunk_agent,
     s0: np.ndarray,
     s_g: np.ndarray,

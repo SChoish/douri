@@ -244,6 +244,64 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             result = jax.tree_util.tree_map(lambda x: x[0], result)
         return result
 
+    def _sample_plan_trajectory(self, current_state, desired_endpoint, rng, noise_scale: float):
+        x_T = current_state
+        x_0_goal = desired_endpoint
+        n_total = self.config['goub_N']
+        batch_size = x_T.shape[0]
+        step_rngs = jax.random.split(rng, n_total)
+
+        def scan_body(x, inputs):
+            step_n, step_rng = inputs
+            n = jnp.full((batch_size,), step_n, dtype=jnp.int32)
+            x_new, _ = self._reverse_step(x, x_T, x_0_goal, n, step_rng, True, noise_scale, params=None)
+            return x_new, x_new
+
+        steps = jnp.arange(n_total, 0, -1)
+        _, traj_body = jax.lax.scan(scan_body, x_T, (steps, step_rngs))
+        traj = jnp.concatenate([x_T[None], traj_body], axis=0)
+        return jnp.swapaxes(traj, 0, 1)
+
+    @partial(jax.jit, static_argnames=('num_candidates', 'include_mean', 'noise_scale'))
+    def sample_plan_candidates(
+        self,
+        current_state,
+        desired_endpoint,
+        rng,
+        *,
+        num_candidates: int,
+        noise_scale: float = 1.0,
+        include_mean: bool = True,
+    ):
+        squeeze = current_state.ndim == 1
+        if squeeze:
+            current_state = current_state[None]
+            desired_endpoint = desired_endpoint[None]
+
+        if include_mean:
+            det = self.plan(current_state, desired_endpoint)['trajectory'][:, None, ...]
+            if num_candidates == 1:
+                out = det
+            else:
+                sample_rngs = jax.random.split(rng, num_candidates - 1)
+                sampled = jax.vmap(
+                    lambda r: self._sample_plan_trajectory(current_state, desired_endpoint, r, noise_scale),
+                    in_axes=0,
+                )(sample_rngs)
+                sampled = jnp.swapaxes(sampled, 0, 1)
+                out = jnp.concatenate([det, sampled], axis=1)
+        else:
+            sample_rngs = jax.random.split(rng, num_candidates)
+            sampled = jax.vmap(
+                lambda r: self._sample_plan_trajectory(current_state, desired_endpoint, r, noise_scale),
+                in_axes=0,
+            )(sample_rngs)
+            out = jnp.swapaxes(sampled, 0, 1)
+
+        if squeeze:
+            out = out[0]
+        return out
+
     @jax.jit
     def predict_subgoal(self, observations, high_actor_goals):
         squeeze = observations.ndim == 1

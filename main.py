@@ -40,6 +40,7 @@ from utils.flax_utils import save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
+_DEFAULT_JOINT_HORIZON = 25
 
 
 def _impl_dir():
@@ -66,7 +67,10 @@ flags.DEFINE_integer('save_every_n_epochs', 10, 'Checkpoint interval.')
 flags.DEFINE_boolean('use_wandb', False, 'W&B.')
 flags.DEFINE_boolean('use_tqdm', False, 'tqdm over epochs.')
 flags.DEFINE_enum('critic', 'dqc', ['deas', 'dqc'], 'External critic stack.')
-flags.DEFINE_integer('shared_batch_size', 0, 'Override all module batch sizes when > 0.')
+flags.DEFINE_integer('batch_size', 256, 'Shared batch size for GOUB, critic, and actor.')
+flags.DEFINE_integer(
+    'joint_horizon', _DEFAULT_JOINT_HORIZON, 'Shared horizon for goub_N, subgoal_steps, and full_chunk_horizon.'
+)
 flags.DEFINE_integer('plan_candidates', 8, 'Number of GOUB candidate plans scored by the critic.')
 flags.DEFINE_integer('proposal_topk', 4, 'How many critic-ranked GOUB proposals to pass to the actor.')
 flags.DEFINE_float('plan_noise_scale', 1.0, 'Noise scale used for stochastic GOUB plan sampling.')
@@ -146,6 +150,16 @@ def _update_config(config: Any, updates: dict) -> Any:
     for key, value in updates.items():
         config[key] = value
     return config
+
+
+def _apply_joint_horizon(goub_config: Any, critic_config: Any) -> tuple[Any, Any]:
+    joint_horizon = int(FLAGS.joint_horizon)
+    if joint_horizon < 1:
+        raise ValueError(f'joint_horizon must be >= 1, got {joint_horizon}.')
+    goub_config['goub_N'] = joint_horizon
+    goub_config['subgoal_steps'] = joint_horizon
+    critic_config['full_chunk_horizon'] = joint_horizon
+    return goub_config, critic_config
 
 
 def _require_matching_frame_stack(goub_config: Any, critic_config: Any) -> None:
@@ -362,6 +376,7 @@ def _prepare_joint_configs(goub_updates: dict, critic_updates: dict, actor_updat
     goub_config = _update_config(get_dynamics_config(), goub_updates)
     critic_config = _update_config(get_critic_config(), critic_updates)
     actor_config = _merge_actor_updates(get_actor_config(), actor_updates)
+    goub_config, critic_config = _apply_joint_horizon(goub_config, critic_config)
     critic_name = normalize_critic_name(FLAGS.critic)
     critic_config['critic'] = critic_name
     actor_config['critic'] = critic_name
@@ -388,11 +403,12 @@ def _prepare_joint_configs(goub_updates: dict, critic_updates: dict, actor_updat
         proposal_topk=int(FLAGS.proposal_topk),
         deas_spi_requested=deas_spi_requested,
     )
-    if FLAGS.shared_batch_size > 0:
-        shared_batch = int(FLAGS.shared_batch_size)
-        goub_config['batch_size'] = shared_batch
-        critic_config['batch_size'] = shared_batch
-        actor_config['batch_size'] = shared_batch
+    shared_batch = int(FLAGS.batch_size)
+    if shared_batch < 1:
+        raise ValueError(f'batch_size must be >= 1, got {shared_batch}.')
+    goub_config['batch_size'] = shared_batch
+    critic_config['batch_size'] = shared_batch
+    actor_config['batch_size'] = shared_batch
     batch_sizes = {
         'goub': int(goub_config['batch_size']),
         'critic': int(critic_config['batch_size']),

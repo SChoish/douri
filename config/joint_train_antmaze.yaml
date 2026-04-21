@@ -5,27 +5,27 @@ critic: dqc
 seed: 0
 run_group: antmaze_joint
 
-train_epochs: 10
-log_every_n_epochs: 1
-save_every_n_epochs: 10
+train_epochs: 1000
+log_every_n_epochs: 10
+save_every_n_epochs: 100
 
 use_wandb: false
 use_tqdm: false
 
-shared_batch_size: 256
-plan_candidates: 8
-proposal_topk: 4
-plan_noise_scale: 1.0
+batch_size: 1024
+joint_horizon: 25
+plan_candidates: 16
+proposal_topk: 16
+plan_noise_scale: 0.01
 
 goub:
   agent_name: goub_dynamics
-  batch_size: 256
   lr: 0.0003
   dataset_class: PathHGCDataset
   require_matching_horizon: true
   goub_loss_weight: 1.0
-  path_loss_weight: 1.0
-  rollout_loss_weight: 0.25
+  path_loss_weight: 0.0
+  rollout_loss_weight: 1.0
   rollout_horizon: 5
   path_loss_slice: null
   rollout_loss_slice: null
@@ -35,8 +35,6 @@ goub:
   train_subgoal_estimator: true
   subgoal_loss_weight: 1.0
   subgoal_hidden_dims: [512, 512, 512]
-  goub_N: 25
-  subgoal_steps: 25
   goub_beta_min: 0.1
   goub_beta_max: 20.0
   goub_lambda: 1.0
@@ -54,15 +52,13 @@ goub:
 
 critic_agent:
   agent_name: critic
-  batch_size: 256
   lr: 0.0003
   tau: 0.005
   layer_norm: true
   frame_stack: null
   p_aug: 0.0
   q_agg: min
-  full_chunk_horizon: 8
-  action_chunk_horizon: 4
+  action_chunk_horizon: 10
   # DEAS fields
   expectile: 0.7
   num_atoms: 51
@@ -95,11 +91,8 @@ actor:
   use_spi_actor: true
   spi_tau: 0.5
   spi_beta: 10.0
-  spi_num_samples: 32
-  spi_candidate_source: external
   spi_use_partial_critic: true
   spi_actor_hidden_dims: [256, 256, 256]
   spi_actor_layer_norm: true
-  spi_eval_use_actor: false
   spi_dist_normalize_by_dim: true
   spi_warmstart_steps: 0

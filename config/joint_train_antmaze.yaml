@@ -14,9 +14,18 @@ use_tqdm: false
 
 batch_size: 1024
 joint_horizon: 25
-plan_candidates: 16
-proposal_topk: 16
+plan_candidates: 1
+proposal_topk: 1
+# Used only when plan_candidates > 1 and stochastic_plan_candidates is true.
 plan_noise_scale: 0.01
+stochastic_plan_candidates: false
+measure_timing: false
+eval_freq: 100
+eval_task_ids: "1,2,3,4,5"
+eval_episodes_per_task: 5
+eval_max_chunks: 50
+eval_goal_tol: 0.5
+eval_goal_dims: "0,1"
 
 goub:
   agent_name: goub_dynamics
@@ -90,7 +99,7 @@ actor:
   # Set true to train a separate actor against the selected critic.
   use_spi_actor: true
   spi_tau: 0.5
-  spi_beta: 10.0
+  spi_beta: 1.0
   spi_use_partial_critic: true
   spi_actor_hidden_dims: [256, 256, 256]
   spi_actor_layer_norm: true

@@ -12,37 +12,48 @@ from PIL import Image, ImageEnhance
 class CsvLogger:
     """CSV logger for logging metrics to a CSV file."""
 
-    def __init__(self, path, *, resume: bool = False):
+    def __init__(self, path, *, resume: bool = False, flush_every_n: int = 20):
         self.path = path
         self.resume = bool(resume)
+        self.flush_every_n = max(1, int(flush_every_n))
         self.header = None
         self.file = None
+        self._rows_since_flush = 0
         self.disallowed_types = (wandb.Image, wandb.Video, wandb.Histogram)
+
+    def _filtered_row(self, row):
+        return {k: v for k, v in row.items() if not isinstance(v, self.disallowed_types)}
+
+    def _ensure_file(self, row):
+        if self.file is not None:
+            return
+        if self.resume and os.path.isfile(self.path):
+            with open(self.path, 'r', encoding='utf-8') as rf:
+                header_line = rf.readline().strip()
+            if not header_line:
+                raise ValueError(f'Cannot resume empty CSV: {self.path}')
+            self.header = header_line.split(',')
+            self.file = open(self.path, 'a', encoding='utf-8')
+            return
+
+        self.file = open(self.path, 'w', encoding='utf-8')
+        filtered_row = self._filtered_row(row)
+        self.header = list(filtered_row.keys())
+        self.file.write(','.join(self.header) + '\n')
 
     def log(self, row, step):
         row['step'] = step
-        if self.file is None:
-            if self.resume and os.path.isfile(self.path):
-                with open(self.path, 'r', encoding='utf-8') as rf:
-                    header_line = rf.readline().strip()
-                if not header_line:
-                    raise ValueError(f'Cannot resume empty CSV: {self.path}')
-                self.header = header_line.split(',')
-                self.file = open(self.path, 'a', encoding='utf-8')
-            else:
-                self.file = open(self.path, 'w', encoding='utf-8')
-                if self.header is None:
-                    self.header = [k for k, v in row.items() if not isinstance(v, self.disallowed_types)]
-                    self.file.write(','.join(self.header) + '\n')
-                filtered_row = {k: v for k, v in row.items() if not isinstance(v, self.disallowed_types)}
-                self.file.write(','.join([str(filtered_row.get(k, '')) for k in self.header]) + '\n')
-        else:
-            filtered_row = {k: v for k, v in row.items() if not isinstance(v, self.disallowed_types)}
-            self.file.write(','.join([str(filtered_row.get(k, '')) for k in self.header]) + '\n')
-        self.file.flush()
+        self._ensure_file(row)
+        filtered_row = self._filtered_row(row)
+        self.file.write(','.join([str(filtered_row.get(k, '')) for k in self.header]) + '\n')
+        self._rows_since_flush += 1
+        if self._rows_since_flush >= self.flush_every_n:
+            self.file.flush()
+            self._rows_since_flush = 0
 
     def close(self):
         if self.file is not None:
+            self.file.flush()
             self.file.close()
 
 

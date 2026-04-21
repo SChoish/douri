@@ -8,6 +8,38 @@ import numpy as np
 from flax.core.frozen_dict import FrozenDict
 
 
+def lookup_final_indices(terminal_locs: np.ndarray, idxs: np.ndarray) -> np.ndarray:
+    """Return terminal index for each transition index."""
+    return terminal_locs[np.searchsorted(terminal_locs, idxs)]
+
+
+def gather_stacked_observations(
+    observations: Any,
+    idxs: np.ndarray,
+    initial_locs: np.ndarray,
+    frame_stack: int,
+) -> Any:
+    """Shared helper to gather frame-stacked observations."""
+    initial_state_idxs = initial_locs[np.searchsorted(initial_locs, idxs, side='right') - 1]
+    rets = []
+    for i in reversed(range(int(frame_stack))):
+        cur_idxs = np.maximum(idxs - i, initial_state_idxs)
+        rets.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], observations))
+    return jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *rets)
+
+
+def augment_batch_images(batch: dict, keys: list[str], *, padding: int = 3) -> None:
+    """Apply random-crop augmentation to image-like leaves in-place."""
+    batch_size = len(batch[keys[0]])
+    crop_froms = np.random.randint(0, 2 * padding + 1, (batch_size, 2))
+    crop_froms = np.concatenate([crop_froms, np.zeros((batch_size, 1), dtype=np.int64)], axis=1)
+    for key in keys:
+        batch[key] = jax.tree_util.tree_map(
+            lambda arr: np.array(batched_random_crop(arr, crop_froms, padding)) if len(arr.shape) == 4 else arr,
+            batch[key],
+        )
+
+
 def get_size(data):
     """Return the size of the dataset."""
     sizes = jax.tree_util.tree_map(lambda arr: len(arr), data)
@@ -257,7 +289,7 @@ class GCDataset:
         random_goal_idxs = self.dataset.get_random_idxs(batch_size)
 
         # Goals from the same trajectory (excluding the current state, unless it is the final state).
-        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        final_state_idxs = lookup_final_indices(self.terminal_locs, idxs)
         if geom_sample:
             # Geometric sampling.
             offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
@@ -282,15 +314,7 @@ class GCDataset:
 
     def augment(self, batch, keys):
         """Apply image augmentation to the given keys."""
-        padding = 3
-        batch_size = len(batch[keys[0]])
-        crop_froms = np.random.randint(0, 2 * padding + 1, (batch_size, 2))
-        crop_froms = np.concatenate([crop_froms, np.zeros((batch_size, 1), dtype=np.int64)], axis=1)
-        for key in keys:
-            batch[key] = jax.tree_util.tree_map(
-                lambda arr: np.array(batched_random_crop(arr, crop_froms, padding)) if len(arr.shape) == 4 else arr,
-                batch[key],
-            )
+        augment_batch_images(batch, keys, padding=3)
 
     def get_observations(self, idxs):
         """Return the observations for the given indices."""
@@ -301,12 +325,12 @@ class GCDataset:
 
     def get_stacked_observations(self, idxs):
         """Return the frame-stacked observations for the given indices."""
-        initial_state_idxs = self.initial_locs[np.searchsorted(self.initial_locs, idxs, side='right') - 1]
-        rets = []
-        for i in reversed(range(self.config['frame_stack'])):
-            cur_idxs = np.maximum(idxs - i, initial_state_idxs)
-            rets.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self.dataset['observations']))
-        return jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *rets)
+        return gather_stacked_observations(
+            self.dataset['observations'],
+            idxs,
+            self.initial_locs,
+            int(self.config['frame_stack']),
+        )
 
 
 @dataclasses.dataclass
@@ -353,7 +377,7 @@ class HGCDataset(GCDataset):
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
 
         # Set low-level actor goals.
-        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        final_state_idxs = lookup_final_indices(self.terminal_locs, idxs)
         low_goal_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
         batch['low_actor_goals'] = self.get_observations(low_goal_idxs)
 
@@ -443,7 +467,7 @@ class PathHGCDataset(HGCDataset):
         if np.any(idxs < 0) or np.any(idxs >= self.size):
             raise ValueError(f'PathHGCDataset idxs out of range for dataset size {self.size}.')
 
-        finals = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        finals = lookup_final_indices(self.terminal_locs, idxs)
         bad = idxs + K > finals
         if np.any(bad):
             first_bad = int(np.nonzero(bad)[0][0])
@@ -495,7 +519,7 @@ class PathHGCDataset(HGCDataset):
         batch = super().sample(batch_size, idxs, evaluation)
         traj_indices = idxs[:, None] + self.path_offsets
         traj = self.get_observations(traj_indices)
-        finals = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        finals = lookup_final_indices(self.terminal_locs, idxs)
         batch['trajectory_segment'] = np.asarray(traj, dtype=np.float32)
         batch['trajectory_indices'] = np.asarray(traj_indices, dtype=np.int64)
         batch['trajectory_start_indices'] = np.asarray(idxs, dtype=np.int64)
@@ -529,6 +553,8 @@ class ChunkHGCDataset(HGCDataset):
 
         observations = np.asarray(self.dataset['observations'])
         actions = np.asarray(self.dataset['actions'])
+        self._obs_np = observations
+        self._actions_np = actions
         if observations.ndim != 2:
             raise ValueError('ChunkHGCDataset currently expects 2D state observations.')
         if actions.ndim != 2:
@@ -553,12 +579,12 @@ class ChunkHGCDataset(HGCDataset):
     def _slice_observations(self, start_idxs, horizon):
         offsets = np.arange(1, horizon + 1, dtype=np.int32)[None, :]
         obs_idxs = start_idxs[:, None] + offsets
-        return np.asarray(self.dataset['observations'])[obs_idxs]
+        return self._obs_np[obs_idxs]
 
     def _slice_actions(self, start_idxs, horizon):
         offsets = np.arange(horizon, dtype=np.int32)[None, :]
         action_idxs = start_idxs[:, None] + offsets
-        return np.asarray(self.dataset['actions'])[action_idxs]
+        return self._actions_np[action_idxs]
 
     def _build_local_plan_context(self, observations, future_observations):
         goal_obs = observations[:, self.low_goal_slice]

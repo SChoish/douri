@@ -312,7 +312,7 @@ class GOUBPhase1Agent(flax.struct.PyTreeNode):
             result = jax.tree_util.tree_map(lambda x: x[0], result)
         return result
 
-    @partial(jax.jit, static_argnames=('noise_scale',))
+    @jax.jit
     def sample_plan(self, current_state, desired_endpoint, rng, noise_scale: float = 1.0):
         """Stochastic learned reverse pass.
 
@@ -338,6 +338,7 @@ class GOUBPhase1Agent(flax.struct.PyTreeNode):
         B = x_T.shape[0]
 
         step_rngs = jax.random.split(rng, N)
+        noise_scale = jnp.asarray(noise_scale, dtype=jnp.float32)
 
         def scan_body(x, inputs):
             step_n, step_rng = inputs

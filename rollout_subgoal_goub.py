@@ -29,7 +29,7 @@ averaged over an epoch (``training/phase1/loss_subgoal_epoch_mean``).
 
 Example::
 
-    cd impls
+    cd <douri repo root>
     python rollout_subgoal_goub.py \\
         --run_dir=runs/20260416_235557_seed0_antmaze-large-navigate-v0 \\
         --checkpoint_epoch=1000 \\

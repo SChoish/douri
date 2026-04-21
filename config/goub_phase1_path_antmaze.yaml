@@ -1,5 +1,5 @@
 # GOUB Phase-1 path-supervised — antmaze (epoch-based)
-# Run: cd impls && python main_goub_phase1_path.py
+# Run: cd <douri> && PYTHONPATH=. python main_goub_phase1_path.py
 # Requires goub_N == subgoal_steps (see agent.require_matching_horizon).
 
 env_name: antmaze-large-navigate-v0

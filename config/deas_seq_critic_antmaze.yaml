@@ -1,4 +1,4 @@
-# DEAS-style sequence critic + value (douri/impls).
+# DEAS-style sequence critic + value (douri repo root).
 
 env_name: antmaze-medium-navigate-v0
 use_wandb: false

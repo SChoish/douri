@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Path-supervised GOUB Phase-1 (1000 ep, embedded IDM in main loop) for antmaze envs that
-# do not yet have a matching run folder under impls/runs/.
+# do not yet have a matching run folder under runs/.
 #
 # After each env finishes training: deterministic state rollout + inv-dyn rollout
 # (planner_noise_scale=0, inv_dyn_planner_freq=10) into the same run_dir.
 #
-# Usage (from impls/):
+# Usage (from douri repo root):
 #   nohup bash scripts/run_goub_phase1_path_antmaze_missing_1000_rollouts.sh &
 #
 set -euo pipefail

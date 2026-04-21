@@ -3,7 +3,7 @@
 
 Example::
 
-    cd impls
+    cd <douri repo root>
     python render_phase2_policy_videos.py \\
         --run_dir=runs/20260419_174012_goub_phase2_policy_seed0_antmaze-medium-navigate-v0 \\
         --checkpoint_step=489000

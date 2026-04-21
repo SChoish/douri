@@ -22,10 +22,11 @@ baseline은 `HGCDataset`을 사용합니다. path-supervised 버전은 `PathHGCD
 
 ## 학습 실행
 
-작업 디렉터리는 **`impls/`** 를 권장합니다.
+작업 디렉터리는 **이 저장소(douri) 루트**이고, `PYTHONPATH=.` 를 설정합니다.
 
 ```bash
-cd impls
+cd /path/to/douri
+export PYTHONPATH=.
 python main_goub_phase1.py
 ```
 
@@ -36,7 +37,8 @@ python main_goub_phase1.py
 ### Path-supervised 실행
 
 ```bash
-cd impls
+cd /path/to/douri
+export PYTHONPATH=.
 python main_goub_phase1_path.py
 ```
 
@@ -131,7 +133,8 @@ runs/<YYYYMMDD_HHMMSS>_goub_phase1_path_seed<seed>_<env_name>/
 환경 `step` 없이, 데이터셋에서 자른 **에피소드 하나**의 \(s_0\)에서 `max_steps`만큼 위 파이프라인을 반복하고, 관측의 두 차원으로 데이터 궤적과 겹쳐 그립니다.
 
 ```bash
-cd impls
+cd /path/to/douri
+export PYTHONPATH=.
 python rollout_subgoal_goub.py \
   --run_dir=runs/<your_run_folder> \
   --checkpoint_epoch=-1 \
@@ -150,8 +153,9 @@ python rollout_subgoal_goub.py \
 path-supervised 구현은 long run 전에 아래 스크립트로 빠르게 점검할 수 있습니다.
 
 ```bash
-cd impls
-conda run -n offrl python smoke_test_goub_phase1_path.py
+cd /path/to/douri
+export PYTHONPATH=.
+conda run -n offrl python smoke_test_goub.py
 ```
 
 이 스크립트는 5가지를 확인합니다.

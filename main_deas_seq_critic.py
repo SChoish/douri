@@ -2,7 +2,7 @@
 
 Example::
 
-    cd douri/impls
+    cd /path/to/douri
     export PYTHONPATH=.
     python main_deas_seq_critic.py --env_name=antmaze-medium-navigate-v0 --train_epochs=2
 """
@@ -77,7 +77,7 @@ def _apply_yaml_to_flags(data: dict) -> None:
 
 
 flags.DEFINE_string('run_config', '', 'YAML config; empty uses config/deas_seq_critic_antmaze.yaml.')
-flags.DEFINE_string('runs_root', '', 'Run root; default <impl>/runs.')
+flags.DEFINE_string('runs_root', '', 'Run root; default <repo>/runs.')
 flags.DEFINE_string('run_group', 'Debug', 'W&B group.')
 flags.DEFINE_integer('seed', 0, 'Seed.')
 flags.DEFINE_string(

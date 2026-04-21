@@ -1,5 +1,5 @@
 # GOUB Phase-2 policy training on top of frozen GOUB phase1 checkpoints.
-# Run: cd impls && python main_goub_phase2_policy.py
+# Run: cd <douri> && PYTHONPATH=. python main_goub_phase2_policy.py
 
 env_name: antmaze-large-navigate-v0
 seed: 0

@@ -1,6 +1,6 @@
 """Smoke test for GOUB-inspired Phase-1 implementation.
 
-Run from the ``impls/`` directory:
+Run from the repository root (directory containing ``main_*.py`` and ``agents/``):
     python smoke_test_goub.py
 
 Checklist

@@ -4,7 +4,7 @@
 #   - deterministic_inv_dyn_rollout_freq<F>.{png,mp4} → chunked_idm (idm_net inside GOUB ckpt, or legacy idm/checkpoints)
 #
 # Usage:
-#   cd impls && bash scripts/regenerate_deterministic_rollouts.sh
+#   cd <douri repo root> && bash scripts/regenerate_deterministic_rollouts.sh
 #   EPOCH=500 bash scripts/regenerate_deterministic_rollouts.sh
 #   SKIP_IDM=1 bash scripts/regenerate_deterministic_rollouts.sh
 

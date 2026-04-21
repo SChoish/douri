@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# GOUB phase-1 (includes inverse-dynamics head in the same checkpoint): OGBench antmaze navigate + stitch, 1000 epochs each env.
-# Checkpoints: runs/<ts>_seed0_<env>/checkpoints/params_<epoch>.pkl
+# GOUB phase-1 path-supervised: OGBench antmaze navigate + stitch, 1000 epochs each env.
+# Checkpoints: runs/<ts>_goub_phase1_path_seed0_<env>/checkpoints/params_<epoch>.pkl
 #
 # Usage:
-#   cd impls && nohup bash scripts/run_goub_phase1_antmaze_navigate_1000.sh &
-# Log file is always under impls/runs/nohup_goub_phase1_antmaze_<timestamp>.log (see below).
+#   cd <douri repo root> && nohup bash scripts/run_goub_phase1_path_antmaze_1000.sh &
+# Log file is written under runs/nohup_goub_phase1_path_antmaze_<timestamp>.log
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,10 +13,10 @@ cd "${IMPL_DIR}"
 
 RUNS_DIR="${IMPL_DIR}/runs"
 mkdir -p "${RUNS_DIR}"
-LOG_FILE="${RUNS_DIR}/nohup_goub_phase1_antmaze_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${RUNS_DIR}/nohup_goub_phase1_path_antmaze_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "nohup batch log: ${LOG_FILE}"
-echo "Checkpoints per env under: ${RUNS_DIR}/<timestamp>_seed0_<env_name>/"
+echo "Checkpoints per env under: ${RUNS_DIR}/<timestamp>_goub_phase1_path_seed0_<env_name>/"
 
 CONDA_BASE="$(conda info --base 2>/dev/null || true)"
 if [[ -n "${CONDA_BASE}" && -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
@@ -47,13 +47,12 @@ ENVS=(
 
 for env in "${ENVS[@]}"; do
   echo "========== START ${env} $(date -Is) =========="
-  python main_goub_phase1.py \
+  python main_goub_phase1_path.py \
     --env_name="${env}" \
     --train_epochs=1000 \
     --save_every_n_epochs=100 \
     --log_every_n_epochs=10 \
-    --use_tqdm=true
-
+    --use_tqdm=false
   echo "========== DONE ${env} $(date -Is) =========="
 done
 

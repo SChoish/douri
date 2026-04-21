@@ -74,7 +74,7 @@ def _sanitize_token(s: str) -> str:
 flags.DEFINE_string(
     'run_config',
     '',
-    'YAML training config. Empty -> use impls/config/goub_phase2_policy_antmaze.yaml if it exists.',
+    'YAML training config. Empty -> use config/goub_phase2_policy_antmaze.yaml if it exists.',
 )
 flags.DEFINE_string(
     'runs_root',

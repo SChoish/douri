@@ -10,7 +10,7 @@ Headless RGB: if ``DISPLAY`` is unset, ``MUJOCO_GL`` defaults to ``egl`` (see ``
 
 Example::
 
-    cd impls
+    cd <douri repo root>
     python rollout_idm_goub.py \\
         --run_dir=runs/... \\
         --checkpoint_epoch=1000 \\

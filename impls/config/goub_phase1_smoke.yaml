@@ -1,0 +1,24 @@
+# Short smoke run (2 epochs) — not for production.
+env_name: antmaze-large-navigate-v0
+seed: 0
+run_group: smoke
+
+train_epochs: 2
+log_every_n_epochs: 1
+save_every_n_epochs: 1
+
+use_wandb: false
+use_tqdm: false
+
+agent:
+  batch_size: 4096
+  lr: 0.0003
+  train_subgoal_estimator: true
+  subgoal_loss_weight: 1.0
+  subgoal_hidden_dims: [512, 512, 512]
+  goub_N: 25
+  subgoal_steps: 25
+  actor_p_curgoal: 0.0
+  actor_p_trajgoal: 1.0
+  actor_p_randomgoal: 0.0
+  actor_geom_sample: false

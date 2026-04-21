@@ -1,0 +1,32 @@
+# GOUB planner + chunked low-level actor (Phase-1 planner frozen, chunk actor trained on real offline segments)
+
+env_name: antmaze-large-navigate-v0
+seed: 0
+run_group: antmaze_chunk
+
+train_steps: 1000000
+log_interval: 5000
+save_interval: 100000
+
+use_wandb: false
+use_tqdm: false
+
+agent:
+  lr: 0.0003
+  batch_size: 1024
+  actor_hidden_dims: [512, 512, 512]
+  value_hidden_dims: [512, 512, 512]
+  subgoal_steps: 25
+  chunk_context_horizon: 8
+  chunk_policy_horizon: 4
+  chunk_commit_length: 1
+  low_goal_slice: [0, 1]
+  chunk_use_relative_context: true
+  chunk_adv_eta: 0.9
+  chunk_actor_beta: 3.0
+  planner_frozen: true
+  low_level_mode: chunk_actor
+  actor_p_curgoal: 0.0
+  actor_p_trajgoal: 1.0
+  actor_p_randomgoal: 0.0
+  actor_geom_sample: false

@@ -8,14 +8,14 @@
 
 ## 근거 요약
 
-1. 실행 엔트리포인트가 다수 존재하며 목적별 분리가 되어 있음
-  - `main_goub_dynamics.py`, `main_goub_chunk_low.py`, `main_dqc.py`, `main_critic.py`
-2. GOUB 학습 기준선이 `main_goub_dynamics.py` 하나로 수렴되면 문서/실행 경로 혼선이 크게 줄어듦
+1. 실행 엔트리포인트를 단일화해 운영 경로를 고정함
+  - `main.py`
+2. 단일 엔트리포인트 기준으로 문서/실행 경로 혼선이 크게 줄어듦
 3. 파일 크기 관점에서 결합이 큰 모듈 존재
   - `utils/datasets.py`와 `agents/goub_dynamics.py`처럼 역할이 큰 파일에 로직이 집중됨
 4. 정리 필요 신호
   - 문서가 예전 GOUB 파일명(`agents/goub_phase1.py`)을 가리키는 구간이 있었음
-  - `main_goub_chunk_low.py`는 남아 있지만 현재 워킹트리 기준 관련 agent 파일 동기화 여부를 확인할 필요가 있음
+  - joint 학습은 `critic=deas|dqc` 선택과 별도 actor state를 함께 다루므로, README/설정 문서에서 이 경계를 계속 명확히 유지할 필요가 있음
   - chunk 길이 관련 용어는 `full_chunk` / `action_chunk` 기준으로 통일해 두는 편이 추후 유지보수에 유리함
 
 ## 우선순위별 정리 후보
@@ -24,7 +24,8 @@
 
 - **문서-코드 기준선 일치**
   - README / 구조 리뷰 / 실행 스크립트가 현재 실제 파일명과 같은 기준을 보도록 유지할 필요가 있음.
-  - 특히 GOUB 학습 진입점은 `main_goub_dynamics.py`, 구현 기준 파일은 `agents/goub_dynamics.py`로 고정하는 편이 혼란이 적음.
+  - 학습 진입점은 `main.py`, 구현 기준 파일은 `agents/goub_dynamics.py` + `agents/critic/`로 고정하는 편이 혼란이 적음.
+  - critic-only / joint 모두 top-level `critic: deas | dqc` 선택을 공통 기준으로 보는 편이 혼란이 적음.
 
 ### P1 (단기)
 
@@ -32,9 +33,9 @@
   - YAML 로딩, run dir 구성, 로깅/체크포인트, 시드 초기화 코드를 공용 유틸(예: `utils/train_runtime.py`)로 추출.
   - 기대효과: 버그 수정 시 중복 반영 방지, 신규 실험 엔트리 추가 속도 개선.
 
-- **레거시/부분 지원 엔트리 상태 표기**
-  - `main_goub_chunk_low.py`처럼 진입점은 남아 있지만 관련 구현 파일 동기화가 필요할 수 있는 경로는 README나 별도 표에서 상태를 명확히 적는 편이 좋음.
-  - 기대효과: 실행 전 혼동 감소, 유지보수 우선순위 명확화.
+- **critic / actor 경계 유지**
+  - 현재 joint 경로는 critic과 actor를 별도 agent/state/checkpoint로 분리해 두었으므로, 신규 실험을 추가해도 이 경계를 깨지 않는 편이 좋음.
+  - 기대효과: DEAS/DQC 선택 로직 단순화, joint 디버깅 비용 감소.
 
 - **데이터셋 모듈 분할**
   - `utils/datasets.py`를 `datasets/base.py`, `datasets/hgc.py`, `datasets/path_hgc.py` 등으로 분리.

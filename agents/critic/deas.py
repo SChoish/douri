@@ -42,6 +42,46 @@ class DEASSeqCriticAgent(flax.struct.PyTreeNode):
         b, ell, a = actions.shape
         return jnp.reshape(actions, (b, ell * a))
 
+    def aggregate_ensemble_q(self, qs: jnp.ndarray) -> jnp.ndarray:
+        q_agg = str(self.config.get('q_agg', 'min')).lower()
+        if q_agg == 'mean':
+            return jnp.mean(qs, axis=0)
+        if q_agg == 'min':
+            return jnp.min(qs, axis=0)
+        raise ValueError(f'Unknown q_agg: {q_agg!r} (expected min or mean).')
+
+    def _flatten_action_candidates(self, action_chunk_actions: jnp.ndarray) -> tuple[jnp.ndarray, int]:
+        actions = jnp.asarray(action_chunk_actions, dtype=jnp.float32)
+        if actions.ndim == 4:
+            bsz, num_candidates = actions.shape[:2]
+            return actions.reshape(bsz, num_candidates, -1), num_candidates
+        if actions.ndim == 3:
+            bsz = actions.shape[0]
+            return actions.reshape(bsz, 1, -1), 1
+        if actions.ndim == 2:
+            return actions[:, None, :], 1
+        raise ValueError(f'action_chunk_actions must be rank-2/3/4, got shape={actions.shape}')
+
+    def score_action_chunks(
+        self,
+        observations: jnp.ndarray,
+        goals: jnp.ndarray | None,
+        action_chunk_actions: jnp.ndarray,
+        network_params: dict | None = None,
+        use_partial_critic: bool | None = None,
+    ) -> jnp.ndarray:
+        # NOTE: this scorer is not goal-conditioned in this implementation.
+        # Joint DEAS mode is intended to be critic-only; SPI actor training is blocked at config validation.
+        del goals, use_partial_critic
+        actions, num_candidates = self._flatten_action_candidates(action_chunk_actions)
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        obs_rep = jnp.repeat(obs[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
+        flat_actions = actions.reshape(obs.shape[0] * num_candidates, -1)
+        logits = self.network.select('critic')(obs_rep, flat_actions, params=network_params)
+        probs = jax.nn.softmax(logits, axis=-1)
+        qs = transform_from_probs(probs, z_centers=self._z()).reshape(logits.shape[0], obs.shape[0], num_candidates)
+        return self.aggregate_ensemble_q(qs).reshape(obs.shape[0], num_candidates)
+
     def value_loss(self, batch: dict, grad_params: dict) -> tuple[jnp.ndarray, dict]:
         z = self._z()
         obs = batch['observations']
@@ -140,7 +180,14 @@ class DEASSeqCriticAgent(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @classmethod
-    def create(cls, seed: int, ex_observations: np.ndarray, ex_actions_seq: np.ndarray, config: dict):
+    def create(
+        cls,
+        seed: int,
+        ex_observations: np.ndarray,
+        ex_actions_seq: np.ndarray,
+        config: dict,
+        ex_goals: np.ndarray | None = None,
+    ):
         rng = jax.random.PRNGKey(int(seed))
         rng, init_rng = jax.random.split(rng)
         ex_obs = jnp.asarray(ex_observations, dtype=jnp.float32)

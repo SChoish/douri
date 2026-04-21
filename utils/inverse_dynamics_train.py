@@ -225,8 +225,8 @@ def train_inverse_dynamics_run(
     np.random.seed(seed)
 
     _env, train_raw, val_raw = make_env_and_datasets(env_name, frame_stack=None)
-    train_ds = Dataset.create(**train_raw)
-    val_ds = Dataset.create(**val_raw) if val_raw is not None else None
+    train_ds = train_raw if isinstance(train_raw, Dataset) else Dataset.create(**train_raw)
+    val_ds = None if val_raw is None else (val_raw if isinstance(val_raw, Dataset) else Dataset.create(**val_raw))
 
     ex = train_ds.sample(1)
     obs_dim = int(ex['observations'].shape[-1])

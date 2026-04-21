@@ -96,6 +96,7 @@ def rollout_chunked_bridge_chunk_actor(
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray | None, dict[str, np.ndarray]]:
     """Chunked GOUB bridge + chunk actor rollout in the real environment."""
     g_np = np.asarray(s_g, dtype=np.float32)
+    g_jax = jnp.asarray(g_np, dtype=jnp.float32)
     low = np.asarray(action_low, dtype=np.float32).reshape(-1)
     high = np.asarray(action_high, dtype=np.float32).reshape(-1)
     xy_clamper = make_xy_clamper(
@@ -145,14 +146,12 @@ def rollout_chunked_bridge_chunk_actor(
 
     for chunk_i in range(max_chunks):
         s_np = np.asarray(states[-1], dtype=np.float32).reshape(-1)
-        s = jnp.asarray(xy_clamper(s_np), dtype=jnp.float32)
-        g = jnp.asarray(s_g, dtype=jnp.float32)
-        hat = agent.predict_subgoal(s, g)
-        hat_np = xy_clamper(np.asarray(jax.device_get(hat), dtype=np.float32).reshape(-1))
-        hat = jnp.asarray(hat_np, dtype=jnp.float32)
+        s_jax = jnp.asarray(xy_clamper(s_np), dtype=jnp.float32)
+        hat_np = xy_clamper(np.asarray(agent.predict_subgoal(s_jax, g_jax), dtype=np.float32).reshape(-1))
+        hat_jax = jnp.asarray(hat_np, dtype=jnp.float32)
 
-        out = agent.plan(s, hat)
-        chunk_traj = np.asarray(jax.device_get(out['trajectory']), dtype=np.float32)
+        out = agent.plan(s_jax, hat_jax)
+        chunk_traj = np.asarray(out['trajectory'], dtype=np.float32)
         if chunk_traj.shape[0] < 2:
             break
         chunk_traj = np.stack([xy_clamper(chunk_traj[i]) for i in range(chunk_traj.shape[0])])
@@ -177,12 +176,12 @@ def rollout_chunked_bridge_chunk_actor(
         action_chunk = chunk_agent.sample_action_chunk(
             jnp.asarray(s_np, dtype=jnp.float32),
             jnp.asarray(local_plan_context, dtype=jnp.float32),
-            g,
+            g_jax,
             seed=(jax.random.PRNGKey(chunk_i) if not deterministic else None),
             deterministic=deterministic,
             temperature=float(temperature),
         )
-        actions = np.asarray(jax.device_get(action_chunk), dtype=np.float32).reshape(policy_horizon, -1)
+        actions = np.asarray(action_chunk, dtype=np.float32).reshape(policy_horizon, -1)
         debug['chunk_action_norms'].append(float(np.linalg.norm(actions)))
         debug['first_action_norms'].append(float(np.linalg.norm(actions[0])))
 

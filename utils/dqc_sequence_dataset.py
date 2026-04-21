@@ -8,7 +8,11 @@ from typing import Any
 import jax
 import numpy as np
 
-from utils.datasets import Dataset, batched_random_crop
+from utils.datasets import (
+    Dataset,
+    augment_batch_images,
+    gather_stacked_observations,
+)
 
 
 @dataclasses.dataclass
@@ -45,6 +49,18 @@ class DQCActionSeqDataset:
                 f'No valid starts for full_chunk_horizon={self.full_chunk_horizon} in dataset size={self.size}.'
             )
 
+        # Cached metadata for hot-path sampling.
+        self.final_state_for_idx = np.empty(self.size, dtype=np.int64)
+        for start, end in zip(self.initial_locs, self.terminal_locs):
+            self.final_state_for_idx[int(start) : int(end) + 1] = int(end)
+        self.full_offsets = np.arange(self.full_chunk_horizon, dtype=np.int64)
+        self.action_offsets = np.arange(self.action_chunk_horizon, dtype=np.int64)
+        self.discount_pows = np.power(float(self.config['discount']), self.full_offsets.astype(np.float32))
+        self.valids_template = np.ones((self.action_chunk_horizon,), dtype=np.float32)
+        self.full_chunk_horizon_template = np.full((1,), self.full_chunk_horizon, dtype=np.float32)
+        # valid_starts guarantee no terminal inside full chunk; masks are always ones.
+        self.full_chunk_masks_template = np.ones((1,), dtype=np.float32)
+
         if self.config.get('frame_stack') is not None:
             assert 'next_observations' not in self.dataset
             if self.preprocess_frame_stack:
@@ -57,17 +73,23 @@ class DQCActionSeqDataset:
         return self.get_stacked_observations(idxs)
 
     def get_stacked_observations(self, idxs):
-        initial_state_idxs = self.initial_locs[np.searchsorted(self.initial_locs, idxs, side='right') - 1]
-        rets = []
-        for i in reversed(range(int(self.config['frame_stack']))):
-            cur_idxs = np.maximum(idxs - i, initial_state_idxs)
-            rets.append(jax.tree_util.tree_map(lambda arr: np.asarray(arr[cur_idxs]), self.dataset['observations']))
-        return jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *rets)
+        return gather_stacked_observations(
+            self.dataset['observations'],
+            idxs,
+            self.initial_locs,
+            int(self.config['frame_stack']),
+        )
+
+    def _lookup_finals(self, idxs: np.ndarray) -> np.ndarray:
+        return self.final_state_for_idx[idxs]
+
+    def _build_full_chunk_indices(self, idxs: np.ndarray) -> np.ndarray:
+        return idxs[:, None] + self.full_offsets[None, :]
 
     def sample_goals(self, idxs):
         batch_size = len(idxs)
         random_goal_idxs = self.dataset.get_random_idxs(batch_size)
-        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        final_state_idxs = self._lookup_finals(idxs)
         if bool(self.config['value_geom_sample']):
             offsets = np.random.geometric(p=1 - float(self.config['discount']), size=batch_size)
             traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
@@ -88,18 +110,10 @@ class DQCActionSeqDataset:
         p_aug = self.config.get('p_aug')
         if not p_aug or float(p_aug) <= 0:
             return
-        padding = 3
-        batch_size = len(batch[keys[0]])
-        crop_froms = np.random.randint(0, 2 * padding + 1, (batch_size, 2))
-        crop_froms = np.concatenate([crop_froms, np.zeros((batch_size, 1), dtype=np.int64)], axis=1)
-        for key in keys:
-            batch[key] = jax.tree_util.tree_map(
-                lambda arr: np.array(batched_random_crop(arr, crop_froms, padding)) if len(arr.shape) == 4 else arr,
-                batch[key],
-            )
+        augment_batch_images(batch, keys, padding=3)
 
     def _validate_starts(self, idxs: np.ndarray) -> None:
-        finals = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        finals = self._lookup_finals(idxs)
         bad = idxs + self.full_chunk_horizon > finals
         if np.any(bad):
             raise ValueError('DQCActionSeqDataset sampled starts crossing episode boundaries.')
@@ -114,8 +128,7 @@ class DQCActionSeqDataset:
         actions_step = np.asarray(self.dataset['actions'][idxs], dtype=np.float32)
         next_obs = np.asarray(self.get_observations(idxs + 1), dtype=np.float32)
 
-        full_offsets = np.arange(self.full_chunk_horizon, dtype=np.int64)[None, :]
-        full_idx = idxs[:, None] + full_offsets
+        full_idx = self._build_full_chunk_indices(idxs)
         full_chunk_actions_3d = np.asarray(self.dataset['actions'][full_idx], dtype=np.float32)  # [B, H_full, A]
         action_chunk_actions_3d = full_chunk_actions_3d[:, : self.action_chunk_horizon, :]
         full_chunk_actions = full_chunk_actions_3d.reshape(full_chunk_actions_3d.shape[0], -1)
@@ -126,17 +139,14 @@ class DQCActionSeqDataset:
         success_steps = (full_idx == value_goal_idxs[:, None]).astype(np.float32)
         reward_offset = 1.0 if bool(self.config.get('gc_negative', True)) else 0.0
         step_rewards = success_steps - reward_offset
-        discounts = np.power(float(self.config['discount']), np.arange(self.full_chunk_horizon, dtype=np.float32))[None, :]
-        full_chunk_rewards = np.sum(step_rewards * discounts, axis=1).astype(np.float32)
+        full_chunk_rewards = np.sum(step_rewards * self.discount_pows[None, :], axis=1).astype(np.float32)
 
-        terminals = np.asarray(self.dataset['terminals'], dtype=np.float32)
-        term_window = np.stack([terminals[idxs + t] for t in range(self.full_chunk_horizon)], axis=-1)
-        full_chunk_masks = (1.0 - np.max(term_window, axis=-1)).astype(np.float32)
+        full_chunk_masks = np.repeat(self.full_chunk_masks_template, idxs.shape[0]).astype(np.float32)
         full_chunk_next_observations = np.asarray(
             self.get_observations(idxs + self.full_chunk_horizon), dtype=np.float32
         )
-        full_chunk_horizon = np.full((idxs.shape[0],), self.full_chunk_horizon, dtype=np.float32)
-        valids = np.ones((idxs.shape[0], self.action_chunk_horizon), dtype=np.float32)
+        full_chunk_horizon = np.repeat(self.full_chunk_horizon_template, idxs.shape[0]).astype(np.float32)
+        valids = np.repeat(self.valids_template[None, :], idxs.shape[0], axis=0).astype(np.float32)
 
         batch = {
             'observations': obs,

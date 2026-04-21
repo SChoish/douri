@@ -1,0 +1,131 @@
+# Joint GOUB + critic + actor offline training.
+
+env_name: antmaze-medium-navigate-v0
+critic: dqc
+seed: 0
+run_group: antmaze_joint
+
+train_epochs: 10
+log_every_n_epochs: 1
+save_every_n_epochs: 10
+
+use_wandb: false
+use_tqdm: false
+
+shared_batch_size: 256
+plan_candidates: 8
+proposal_topk: 4
+plan_noise_scale: 1.0
+
+goub:
+  agent_name: goub_dynamics
+  batch_size: 256
+  lr: 0.0003
+  dataset_class: PathHGCDataset
+  require_matching_horizon: true
+  goub_loss_weight: 1.0
+  path_loss_weight: 1.0
+  rollout_loss_weight: 0.25
+  rollout_horizon: 5
+  path_loss_slice: null
+  rollout_loss_slice: null
+  path_eval_slice: [0, 1]
+  idm_loss_weight: 1.0
+  idm_hidden_dims: [512, 512, 512]
+  train_subgoal_estimator: true
+  subgoal_loss_weight: 1.0
+  subgoal_hidden_dims: [512, 512, 512]
+  goub_N: 25
+  subgoal_steps: 25
+  goub_beta_min: 0.1
+  goub_beta_max: 20.0
+  goub_lambda: 1.0
+  actor_p_curgoal: 0.0
+  actor_p_trajgoal: 1.0
+  actor_p_randomgoal: 0.0
+  actor_geom_sample: false
+  value_p_curgoal: 0.2
+  value_p_trajgoal: 0.5
+  value_p_randomgoal: 0.3
+  value_geom_sample: true
+  gc_negative: true
+  frame_stack: null
+  p_aug: 0.0
+
+critic_agent:
+  agent_name: critic
+  batch_size: 256
+  lr: 0.0003
+  tau: 0.005
+  layer_norm: true
+  frame_stack: null
+  p_aug: 0.0
+  q_agg: min
+  full_chunk_horizon: 8
+  action_chunk_horizon: 4
+  # DEAS fields
+  expectile: 0.7
+  num_atoms: 51
+  v_min: -200.0
+  v_max: 0.0
+  sigma: 1.0
+  num_critic_ensembles: 2
+  gamma1: 0.99
+  gamma2: 0.99
+  nstep_options: 1
+  critic_hidden_dims: [256, 256, 256]
+  value_hidden_dims: [256, 256, 256]
+  # DQC fields
+  discount: 0.99
+  num_qs: 2
+  use_chunk_critic: true
+  distill_method: expectile
+  kappa_d: 0.7
+  implicit_backup_type: expectile
+  kappa_b: 0.7
+  value_p_curgoal: 0.2
+  value_p_trajgoal: 0.5
+  value_p_randomgoal: 0.3
+  value_geom_sample: true
+  gc_negative: true
+
+actor:
+  agent_name: dqc
+  batch_size: 256
+  lr: 0.0003
+  discount: 0.99
+  tau: 0.005
+  num_qs: 2
+  q_agg: min
+  flow_steps: 16
+  best_of_n: 64
+  use_chunk_critic: true
+  full_chunk_horizon: 8
+  action_chunk_horizon: 4
+  distill_method: expectile
+  kappa_d: 0.7
+  implicit_backup_type: expectile
+  kappa_b: 0.7
+  actor_hidden_dims: [256, 256, 256]
+  value_hidden_dims: [256, 256, 256]
+  layer_norm: true
+  actor_layer_norm: true
+  use_spi_actor: true
+  spi_tau: 0.5
+  spi_beta: 10.0
+  spi_num_samples: 32
+  spi_candidate_source: external
+  spi_use_partial_critic: true
+  spi_actor_hidden_dims: [256, 256, 256]
+  spi_actor_layer_norm: true
+  spi_eval_use_actor: false
+  spi_dist_normalize_by_dim: true
+  spi_warmstart_steps: 0
+  dataset_class: DQCActionSeqDataset
+  frame_stack: null
+  p_aug: 0.0
+  value_p_curgoal: 0.2
+  value_p_trajgoal: 0.5
+  value_p_randomgoal: 0.3
+  value_geom_sample: true
+  gc_negative: true

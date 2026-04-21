@@ -3,7 +3,7 @@
 
 This script is **separate** from ``rollout_subgoal_goub.py`` (pure state-space trajectory plots).
 Each replan: ``predict_subgoal`` → ``plan`` or stochastic ``sample_plan`` (see
-``--planner_noise_scale``) → IDM actions for up to ``--inv_dyn_planner_freq`` env steps
+``--planner_noise_scale``) → IDM actions for up to ``--action_chunk_horizon`` env steps
 (capped at ``goub_N``), then repeat.
 
 Headless RGB: if ``DISPLAY`` is unset, ``MUJOCO_GL`` defaults to ``egl`` (see ``--mujoco_gl``).
@@ -38,7 +38,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from agents.goub_phase1 import GOUBPhase1Agent, get_config
+from agents.goub_dynamics import GOUBDynamicsAgent
 from rollout_subgoal_goub import (
     _get_trajectory,
     _goal_within_tol,
@@ -63,7 +63,7 @@ from utils.maze_navigator import MazeNavigatorMap
 
 def rollout_goub_idm_env(
     env,
-    agent: GOUBPhase1Agent,
+    agent: GOUBDynamicsAgent,
     idm_model: InverseDynamicsMLP,
     idm_params,
     s0: np.ndarray,
@@ -79,7 +79,7 @@ def rollout_goub_idm_env(
     *,
     action_low: np.ndarray,
     action_high: np.ndarray,
-    inv_dyn_planner_freq: int = 5,
+    action_chunk_horizon: int = 5,
     record_env_rgb: bool = True,
     planner_noise_scale: float = 0.0,
     planner_seed: int = 0,
@@ -149,7 +149,7 @@ def rollout_goub_idm_env(
         o_next = jnp.asarray(chunk_traj[1:], dtype=jnp.float32)
         actions = np.asarray(jax.device_get(_idm_actions(idm_params, o_prev, o_next)), dtype=np.float32)
 
-        n_exec = min(int(actions.shape[0]), max(1, int(inv_dyn_planner_freq)))
+        n_exec = min(int(actions.shape[0]), max(1, int(action_chunk_horizon)))
         for i in range(n_exec):
             # One hat row per env transition (same as ``rollout_subgoal_goub``) so
             # ``overlay_rgb_frames_obs2d_panel(..., chunk_hat_stride=inv_dyn_freq)`` stays aligned.
@@ -197,7 +197,7 @@ def main() -> None:
         default='',
         help='Standalone inverse dynamics params_*.pkl. Empty → use idm_net inside GOUB checkpoint.',
     )
-    p.add_argument('--inv_dyn_planner_freq', type=int, default=5)
+    p.add_argument('--action_chunk_horizon', type=int, default=5)
     p.add_argument(
         '--planner_noise_scale',
         type=float,
@@ -233,8 +233,8 @@ def main() -> None:
     except ValueError as e:
         p.error(str(e))
 
-    if int(args.inv_dyn_planner_freq) < 1:
-        p.error('--inv_dyn_planner_freq must be >= 1')
+    if int(args.action_chunk_horizon) < 1:
+        p.error('--action_chunk_horizon must be >= 1')
     planner_seed = int(args.seed) if int(args.planner_seed) < 0 else int(args.planner_seed)
 
     ckpt_epoch = int(args.checkpoint_epoch)
@@ -292,7 +292,7 @@ def main() -> None:
     ex = jnp.zeros((1, s0.shape[-1]), dtype=jnp.float32)
     act_dim = int(np.prod(env.action_space.shape))
     ex_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
-    agent = GOUBPhase1Agent.create(args.seed, ex, cfg, ex_actions=ex_act)
+    agent = GOUBDynamicsAgent.create(args.seed, ex, cfg, ex_actions=ex_act)
     pkl_path = ckpt_dir / f'params_{ckpt_epoch}.pkl'
     agent = _load_checkpoint_pkl(agent, pkl_path)
     goub_N = int(agent.config['goub_N'])
@@ -361,13 +361,13 @@ def main() -> None:
         **nav_kw,
         action_low=low,
         action_high=high,
-        inv_dyn_planner_freq=int(args.inv_dyn_planner_freq),
+        action_chunk_horizon=int(args.action_chunk_horizon),
         planner_noise_scale=float(args.planner_noise_scale),
         planner_seed=planner_seed,
     )
     n_trans = max(0, int(roll.shape[0]) - 1)
-    idm_freq = int(args.inv_dyn_planner_freq)
-    steps_per_replan = min(idm_freq, goub_N)
+    action_chunk_horizon = int(args.action_chunk_horizon)
+    steps_per_replan = min(action_chunk_horizon, goub_N)
     print(
         f'IDM rollout: {n_chunks} replans × up to {steps_per_replan} env steps/replan → '
         f'{roll.shape[0]} obs ({n_trans} transitions), goal_reached={reached}'
@@ -380,7 +380,7 @@ def main() -> None:
         mp4_out = Path(args.out_mp4.strip()) if str(args.out_mp4).strip() else Path(args.out_path).with_suffix('.mp4')
         mp4_out.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _pf = min(idm_freq, goub_N)
+            _pf = min(action_chunk_horizon, goub_N)
             frames = overlay_rgb_frames_obs2d_panel(
                 env_frames,
                 traj,

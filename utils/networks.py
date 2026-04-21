@@ -266,6 +266,30 @@ class GCDiscreteActor(nn.Module):
         return distribution
 
 
+class ActorVectorField(nn.Module):
+    """Flow-matching vector field over flattened action chunks."""
+
+    hidden_dims: Sequence[int]
+    action_dim: int
+    layer_norm: bool = True
+    gc_encoder: nn.Module = None
+
+    @nn.compact
+    def __call__(self, observations, goals, noisy_actions, flow_t):
+        if flow_t.ndim == 1:
+            flow_t = flow_t[:, None]
+        if self.gc_encoder is not None:
+            base = self.gc_encoder(observations, goals)
+        else:
+            base = [observations]
+            if goals is not None:
+                base.append(goals)
+            base = jnp.concatenate(base, axis=-1)
+        x = jnp.concatenate([base, noisy_actions, flow_t], axis=-1)
+        x = MLP((*self.hidden_dims, self.action_dim), activate_final=False, layer_norm=self.layer_norm)(x)
+        return x
+
+
 class GCValue(nn.Module):
     """Goal-conditioned value/critic function.
 

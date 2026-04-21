@@ -298,7 +298,7 @@ def _eval_batch_size(common_valid_starts: np.ndarray, batch_size: int) -> int:
     return max(1, min(int(batch_size), int(len(common_valid_starts))))
 
 
-def _idm_actions_from_trajectories(goub_agent: GOUBDynamicsAgent, trajectories: np.ndarray, horizon: int) -> np.ndarray:
+def _idm_actions_from_trajectories(goub_agent: GOUBDynamicsAgent, trajectories: np.ndarray, horizon: int) -> jnp.ndarray:
     if trajectories.shape[1] <= horizon:
         raise ValueError(
             f'GOUB trajectory length {trajectories.shape[1]} is too short for horizon={horizon}. '
@@ -309,20 +309,20 @@ def _idm_actions_from_trajectories(goub_agent: GOUBDynamicsAgent, trajectories: 
     flat_prev = prev_states.reshape(-1, prev_states.shape[-1])
     flat_next = next_states.reshape(-1, next_states.shape[-1])
     pred = goub_agent.network.select('idm_net')(jnp.asarray(flat_prev), jnp.asarray(flat_next))
-    return np.asarray(pred, dtype=np.float32).reshape(trajectories.shape[0], horizon, -1)
+    return jnp.asarray(pred, dtype=jnp.float32).reshape(trajectories.shape[0], horizon, -1)
 
 
 def _rank_candidate_actions(
-    candidate_actions: np.ndarray,
-    scores: np.ndarray,
+    candidate_actions: jnp.ndarray,
+    scores: jnp.ndarray,
     keep_topk: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     keep_topk = max(1, min(int(keep_topk), candidate_actions.shape[1]))
-    order = np.argsort(-scores, axis=1)[:, :keep_topk]
+    order = jnp.argsort(-scores, axis=1)[:, :keep_topk]
     gather_idx = order[:, :, None, None]
-    gathered = np.take_along_axis(candidate_actions, gather_idx, axis=1)
-    gathered_scores = np.take_along_axis(scores, order, axis=1)
-    return np.asarray(gathered, dtype=np.float32), np.asarray(gathered_scores, dtype=np.float32)
+    gathered = jnp.take_along_axis(candidate_actions, gather_idx, axis=1)
+    gathered_scores = jnp.take_along_axis(scores, order, axis=1)
+    return jnp.asarray(gathered, dtype=jnp.float32), jnp.asarray(gathered_scores, dtype=jnp.float32)
 
 
 def _build_actor_batch_from_goub(
@@ -331,17 +331,17 @@ def _build_actor_batch_from_goub(
     goub_batch: dict,
     actor_config: Any,
 ) -> tuple[GOUBDynamicsAgent, dict, dict, dict[str, float]]:
-    obs = np.asarray(goub_batch['observations'], dtype=np.float32)
-    high_goals = np.asarray(goub_batch['high_actor_goals'], dtype=np.float32)
+    obs = jnp.asarray(goub_batch['observations'], dtype=jnp.float32)
+    high_goals = jnp.asarray(goub_batch['high_actor_goals'], dtype=jnp.float32)
     measure_timing = bool(FLAGS.measure_timing)
     timing = {}
 
     if measure_timing:
         t0 = time.perf_counter()
-        predicted_subgoals = np.asarray(goub_agent.predict_subgoal(obs, high_goals), dtype=np.float32)
+        predicted_subgoals = jnp.asarray(goub_agent.predict_subgoal(obs, high_goals), dtype=jnp.float32)
         timing['predict_subgoal'] = time.perf_counter() - t0
     else:
-        predicted_subgoals = np.asarray(goub_agent.predict_subgoal(obs, high_goals), dtype=np.float32)
+        predicted_subgoals = jnp.asarray(goub_agent.predict_subgoal(obs, high_goals), dtype=jnp.float32)
 
     plan_candidates = max(1, int(FLAGS.plan_candidates))
     proposal_horizon = int(actor_config['actor_chunk_horizon'])
@@ -369,14 +369,14 @@ def _build_actor_batch_from_goub(
                 noise_scale=0.0,
             )
         plan_rng, _ = jax.random.split(plan_rng)
-        candidate_trajectories = np.asarray(sampled['trajectory'], dtype=np.float32)[:, None, ...]
+        candidate_trajectories = jnp.asarray(sampled['trajectory'], dtype=jnp.float32)[:, None, ...]
     else:
         if measure_timing:
             t0 = time.perf_counter()
-            det_plan = np.asarray(goub_agent.plan(obs, predicted_subgoals)['trajectory'], dtype=np.float32)
+            det_plan = jnp.asarray(goub_agent.plan(obs, predicted_subgoals)['trajectory'], dtype=jnp.float32)
             timing['plan_det'] = time.perf_counter() - t0
         else:
-            det_plan = np.asarray(goub_agent.plan(obs, predicted_subgoals)['trajectory'], dtype=np.float32)
+            det_plan = jnp.asarray(goub_agent.plan(obs, predicted_subgoals)['trajectory'], dtype=jnp.float32)
         sample_noise_scale = float(FLAGS.plan_noise_scale) if bool(FLAGS.stochastic_plan_candidates) else 0.0
         plan_rng, sample_rng = jax.random.split(plan_rng)
         if measure_timing:
@@ -399,8 +399,8 @@ def _build_actor_batch_from_goub(
                 noise_scale=sample_noise_scale,
                 include_mean=False,
             )
-        sampled = np.asarray(sampled, dtype=np.float32)
-        candidate_trajectories = np.concatenate([det_plan[:, None, ...], sampled], axis=1)
+        sampled = jnp.asarray(sampled, dtype=jnp.float32)
+        candidate_trajectories = jnp.concatenate([det_plan[:, None, ...], sampled], axis=1)
     if measure_timing:
         timing['sample_plan'] = sample_plan_time
     goub_agent = goub_agent.replace(rng=plan_rng)
@@ -418,67 +418,48 @@ def _build_actor_batch_from_goub(
         proposal_horizon,
         -1,
     )  # [B, N, ha, A]
-    if candidate_actions.shape[1] == 1:
-        candidate_scores = np.zeros((candidate_actions.shape[0], 1), dtype=np.float32)
-        if measure_timing:
-            timing['score'] = 0.0
-    else:
-        if measure_timing:
-            t0 = time.perf_counter()
-            candidate_scores = np.asarray(
-                critic_agent.score_action_chunks(
-                    obs,
-                    predicted_subgoals,
-                    candidate_actions,
-                    network_params=critic_agent.network.params,
-                    use_partial_critic=bool(actor_config.get('spi_use_partial_critic', True)),
-                ),
-                dtype=np.float32,
-            )
-            timing['score'] = time.perf_counter() - t0
-        else:
-            candidate_scores = np.asarray(
-                critic_agent.score_action_chunks(
-                    obs,
-                    predicted_subgoals,
-                    candidate_actions,
-                    network_params=critic_agent.network.params,
-                    use_partial_critic=bool(actor_config.get('spi_use_partial_critic', True)),
-                ),
-                dtype=np.float32,
-            )
+    if measure_timing:
+        timing['score'] = 0.0
     actor_batch = {
         'observations': obs,
         'spi_goals': predicted_subgoals,
         # Candidate action chunks generated from GOUB proposals; rescored after critic update.
         # Shape: [B, N, ha, A]
         'candidate_partial_chunks': candidate_actions,
-        'valids': np.ones((obs.shape[0], proposal_horizon), dtype=np.float32),
+        'valids': jnp.ones((obs.shape[0], proposal_horizon), dtype=jnp.float32),
     }
 
     coupling_info = {
-        'coupling/predicted_subgoal_norm': float(np.linalg.norm(predicted_subgoals, axis=-1).mean()),
-        'coupling/critic_score_mean': float(candidate_scores.mean()),
-        'coupling/critic_score_max': float(candidate_scores.max()),
-        'coupling/critic_score_min': float(candidate_scores.min()),
+        'coupling/predicted_subgoal_norm': float(jnp.linalg.norm(predicted_subgoals, axis=-1).mean()),
+        'coupling/critic_score_mean': float('nan'),
+        'coupling/critic_score_max': float('nan'),
+        'coupling/critic_score_min': float('nan'),
         'coupling/proposal_count': float(candidate_actions.shape[1]),
     }
     return goub_agent, actor_batch, coupling_info, timing
 
 
-def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_config: Any) -> dict:
-    obs = np.asarray(actor_batch['observations'], dtype=np.float32)
-    goals = np.asarray(actor_batch['spi_goals'], dtype=np.float32)
-    candidates = np.asarray(actor_batch['candidate_partial_chunks'], dtype=np.float32)  # [B, N, ha, A]
+def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_config: Any) -> tuple[dict, dict]:
+    obs = jnp.asarray(actor_batch['observations'], dtype=jnp.float32)
+    goals = jnp.asarray(actor_batch['spi_goals'], dtype=jnp.float32)
+    candidates = jnp.asarray(actor_batch['candidate_partial_chunks'], dtype=jnp.float32)  # [B, N, ha, A]
     if candidates.shape[1] == 1:
-        return {
-            'observations': obs,
-            'spi_goals': goals,
-            'proposal_partial_chunks': candidates,
-            'proposal_scores': np.zeros((obs.shape[0], 1), dtype=np.float32),
-            'valids': np.asarray(actor_batch['valids'], dtype=np.float32),
-        }
-    rescored = np.asarray(
+        zeros = jnp.zeros((obs.shape[0], 1), dtype=jnp.float32)
+        return (
+            {
+                'observations': obs,
+                'spi_goals': goals,
+                'proposal_partial_chunks': candidates,
+                'proposal_scores': zeros,
+                'valids': jnp.asarray(actor_batch['valids'], dtype=jnp.float32),
+            },
+            {
+                'coupling/critic_score_mean': float(zeros.mean()),
+                'coupling/critic_score_max': float(zeros.max()),
+                'coupling/critic_score_min': float(zeros.min()),
+            },
+        )
+    rescored = jnp.asarray(
         critic_agent.score_action_chunks(
             obs,
             goals,
@@ -486,18 +467,25 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
             network_params=critic_agent.network.params,
             use_partial_critic=bool(actor_config.get('spi_use_partial_critic', True)),
         ),
-        dtype=np.float32,
+        dtype=jnp.float32,
     )
     proposal_chunks, proposal_scores = _rank_candidate_actions(candidates, rescored, keep_topk=int(FLAGS.proposal_topk))
-    return {
-        'observations': obs,
-        'spi_goals': goals,
-        # Shape: [B, K, ha, A]
-        'proposal_partial_chunks': proposal_chunks,
-        # Shape: [B, K]
-        'proposal_scores': proposal_scores,
-        'valids': np.asarray(actor_batch['valids'], dtype=np.float32),
-    }
+    return (
+        {
+            'observations': obs,
+            'spi_goals': goals,
+            # Shape: [B, K, ha, A]
+            'proposal_partial_chunks': proposal_chunks,
+            # Shape: [B, K]
+            'proposal_scores': proposal_scores,
+            'valids': jnp.asarray(actor_batch['valids'], dtype=jnp.float32),
+        },
+        {
+            'coupling/critic_score_mean': float(proposal_scores.mean()),
+            'coupling/critic_score_max': float(proposal_scores.max()),
+            'coupling/critic_score_min': float(proposal_scores.min()),
+        },
+    )
 
 
 def _build_joint_batches_deas(
@@ -883,7 +871,11 @@ def main(_):
             if actor_agent is not None and actor_batch is not None:
                 if measure_timing:
                     t0 = time.perf_counter()
-                actor_batch_for_update = _rescore_actor_batch_for_update(actor_batch, critic_agent, actor_config)
+                actor_batch_for_update, score_coupling_info = _rescore_actor_batch_for_update(
+                    actor_batch, critic_agent, actor_config
+                )
+                coupling_info = dict(coupling_info)
+                coupling_info.update(score_coupling_info)
                 if measure_timing:
                     actor_rescore_time += time.perf_counter() - t0
 

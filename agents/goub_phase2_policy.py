@@ -226,6 +226,49 @@ class GOUBPhase2PolicyAgent(flax.struct.PyTreeNode):
             'critic/target_mean': target.mean(),
         }
 
+    def _deas_critic_loss(self, batch, grad_params):
+        """Detached critic update that avoids actor-sampled target actions.
+
+        Uses offline batch actions as the bootstrap action proxy at ``s_{t+1}``.
+        This mirrors the DEAS spirit (detached targets from dataset actions)
+        while keeping a one-step critic architecture.
+        """
+        next_target_q, _, _ = self._min_q(
+            batch['next_observations'],
+            batch['value_goals'],
+            batch['actions'],
+            target=True,
+        )
+        target = batch['rewards'] + float(self.config['discount']) * batch['masks'] * next_target_q
+        q1, q2 = self._critic(batch['observations'], batch['value_goals'], batch['actions'], params=grad_params)
+        critic_loss = ((q1 - target) ** 2 + (q2 - target) ** 2).mean()
+        return critic_loss, {
+            'critic/loss': critic_loss,
+            'critic/q1_mean': q1.mean(),
+            'critic/q2_mean': q2.mean(),
+            'critic/target_mean': target.mean(),
+        }
+
+    def _critic_loss(self, batch, grad_params, rng):
+        rl_algo = str(self.config['rl_algo'])
+        critic_update = str(self.config['critic_update'])
+        if critic_update not in ('dqc', 'deas'):
+            raise ValueError(f"agent.critic_update must be 'dqc' or 'deas', got {critic_update!r}")
+
+        if rl_algo == 'iql':
+            critic_loss, critic_info = self._iql_critic_loss(batch, grad_params)
+        elif rl_algo == 'td3bc':
+            if critic_update == 'deas':
+                critic_loss, critic_info = self._deas_critic_loss(batch, grad_params)
+            else:
+                critic_loss, critic_info = self._td3_critic_loss(batch, grad_params, rng)
+        else:
+            raise ValueError(f'Unsupported rl_algo={rl_algo!r}')
+
+        critic_info = dict(critic_info)
+        critic_info['critic/update_is_deas'] = jnp.asarray(1.0 if critic_update == 'deas' else 0.0, dtype=jnp.float32)
+        return critic_loss, critic_info
+
     def _td3_actor_loss(self, batch, grad_params):
         actions_pi = self._actor_actions(batch['observations'], batch['value_goals'], params=grad_params)
         q_pi, q1_pi, _ = self._min_q(batch['observations'], batch['value_goals'], actions_pi)
@@ -249,13 +292,13 @@ class GOUBPhase2PolicyAgent(flax.struct.PyTreeNode):
             info = {}
             rl_algo = str(self.config['rl_algo'])
             if rl_algo == 'iql':
-                critic_loss, critic_info = self._iql_critic_loss(batch, grad_params)
+                critic_loss, critic_info = self._critic_loss(batch, grad_params, rng)
                 value_loss, value_info = self._iql_value_loss(batch, grad_params)
                 total_loss = critic_loss + value_loss
                 info.update(critic_info)
                 info.update(value_info)
             elif rl_algo == 'td3bc':
-                critic_loss, critic_info = self._td3_critic_loss(batch, grad_params, rng)
+                critic_loss, critic_info = self._critic_loss(batch, grad_params, rng)
                 total_loss = critic_loss
                 info.update(critic_info)
             else:
@@ -284,7 +327,7 @@ class GOUBPhase2PolicyAgent(flax.struct.PyTreeNode):
             info = {}
             rl_algo = str(self.config['rl_algo'])
             if rl_algo == 'iql':
-                critic_loss, critic_info = self._iql_critic_loss(batch, grad_params)
+                critic_loss, critic_info = self._critic_loss(batch, grad_params, rng)
                 value_loss, value_info = self._iql_value_loss(batch, grad_params)
                 actor_loss, actor_info = self._iql_actor_loss(batch, grad_params)
                 total_loss = critic_loss + value_loss + actor_loss
@@ -292,7 +335,7 @@ class GOUBPhase2PolicyAgent(flax.struct.PyTreeNode):
                 info.update(value_info)
                 info.update(actor_info)
             elif rl_algo == 'td3bc':
-                critic_loss, critic_info = self._td3_critic_loss(batch, grad_params, rng)
+                critic_loss, critic_info = self._critic_loss(batch, grad_params, rng)
                 total_loss = critic_loss
                 info.update(critic_info)
 
@@ -363,6 +406,9 @@ class GOUBPhase2PolicyAgent(flax.struct.PyTreeNode):
         rl_algo = str(config['rl_algo'])
         if rl_algo not in ('iql', 'td3bc'):
             raise ValueError(f"agent.rl_algo must be 'iql' or 'td3bc', got {rl_algo!r}")
+        critic_update = str(config['critic_update'])
+        if critic_update not in ('dqc', 'deas'):
+            raise ValueError(f"agent.critic_update must be 'dqc' or 'deas', got {critic_update!r}")
         if rl_algo == 'td3bc' and str(config['distill_loss']) == 'nll':
             raise ValueError("TD3+BC phase2 does not support distill_loss='nll'; use 'mse'.")
 
@@ -464,6 +510,7 @@ def get_config():
         dict(
             agent_name='goub_phase2_policy',
             rl_algo='iql',
+            critic_update='dqc',
             batch_size=1024,
             actor_hidden_dims=(512, 512, 512),
             critic_hidden_dims=(512, 512, 512),

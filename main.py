@@ -369,7 +369,7 @@ def _build_actor_batch_from_goub(
                 noise_scale=0.0,
             )
         plan_rng, _ = jax.random.split(plan_rng)
-        trajectories = [np.asarray(sampled['trajectory'], dtype=np.float32)]
+        candidate_trajectories = np.asarray(sampled['trajectory'], dtype=np.float32)[:, None, ...]
     else:
         if measure_timing:
             t0 = time.perf_counter()
@@ -377,33 +377,34 @@ def _build_actor_batch_from_goub(
             timing['plan_det'] = time.perf_counter() - t0
         else:
             det_plan = np.asarray(goub_agent.plan(obs, predicted_subgoals)['trajectory'], dtype=np.float32)
-        trajectories = [det_plan]
-
         sample_noise_scale = float(FLAGS.plan_noise_scale) if bool(FLAGS.stochastic_plan_candidates) else 0.0
-        for _ in range(plan_candidates - 1):
-            plan_rng, sample_rng = jax.random.split(plan_rng)
-            if measure_timing:
-                t0 = time.perf_counter()
-                sampled = goub_agent.sample_plan(
-                    obs,
-                    predicted_subgoals,
-                    sample_rng,
-                    noise_scale=sample_noise_scale,
-                )
-                sample_plan_time += time.perf_counter() - t0
-            else:
-                sampled = goub_agent.sample_plan(
-                    obs,
-                    predicted_subgoals,
-                    sample_rng,
-                    noise_scale=sample_noise_scale,
-                )
-            trajectories.append(np.asarray(sampled['trajectory'], dtype=np.float32))
+        plan_rng, sample_rng = jax.random.split(plan_rng)
+        if measure_timing:
+            t0 = time.perf_counter()
+            sampled = goub_agent.sample_plan_candidates(
+                obs,
+                predicted_subgoals,
+                sample_rng,
+                num_candidates=plan_candidates - 1,
+                noise_scale=sample_noise_scale,
+                include_mean=False,
+            )
+            sample_plan_time += time.perf_counter() - t0
+        else:
+            sampled = goub_agent.sample_plan_candidates(
+                obs,
+                predicted_subgoals,
+                sample_rng,
+                num_candidates=plan_candidates - 1,
+                noise_scale=sample_noise_scale,
+                include_mean=False,
+            )
+        sampled = np.asarray(sampled, dtype=np.float32)
+        candidate_trajectories = np.concatenate([det_plan[:, None, ...], sampled], axis=1)
     if measure_timing:
         timing['sample_plan'] = sample_plan_time
     goub_agent = goub_agent.replace(rng=plan_rng)
 
-    candidate_trajectories = np.stack(trajectories, axis=1)  # [B, N, T, D]
     flat_trajectories = candidate_trajectories.reshape(-1, candidate_trajectories.shape[2], candidate_trajectories.shape[3])
     if measure_timing:
         t0 = time.perf_counter()

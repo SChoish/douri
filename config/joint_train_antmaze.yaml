@@ -23,7 +23,7 @@ measure_timing: false
 eval_freq: 100
 eval_task_ids: "1,2,3,4,5"
 eval_episodes_per_task: 5
-eval_max_chunks: 50
+eval_max_chunks: 200
 eval_goal_tol: 0.5
 eval_goal_dims: "0,1"
 
@@ -33,7 +33,7 @@ goub:
   dataset_class: PathHGCDataset
   require_matching_horizon: true
   goub_loss_weight: 1.0
-  path_loss_weight: 0.0
+  path_loss_weight: 1.0
   rollout_loss_weight: 1.0
   rollout_horizon: 5
   path_loss_slice: null
@@ -67,7 +67,7 @@ critic_agent:
   frame_stack: null
   p_aug: 0.0
   q_agg: min
-  action_chunk_horizon: 10
+  action_chunk_horizon: 5
   # DEAS fields
   expectile: 0.7
   num_atoms: 51
@@ -78,8 +78,8 @@ critic_agent:
   gamma1: 0.99
   gamma2: 0.99
   nstep_options: 1
-  critic_hidden_dims: [256, 256, 256]
-  value_hidden_dims: [256, 256, 256]
+  critic_hidden_dims: [512, 512, 512]
+  value_hidden_dims: [512, 512, 512]
   # DQC fields
   discount: 0.99
   num_qs: 2
@@ -98,10 +98,10 @@ actor:
   # Shared joint actor config for both DEAS and DQC.
   # Set true to train a separate actor against the selected critic.
   use_spi_actor: true
-  spi_tau: 0.5
+  spi_tau: 1.0
   spi_beta: 1.0
   spi_use_partial_critic: true
-  spi_actor_hidden_dims: [256, 256, 256]
+  spi_actor_hidden_dims: [512, 512, 512]
   spi_actor_layer_norm: true
-  spi_dist_normalize_by_dim: true
+  spi_dist_normalize_by_dim: false
   spi_warmstart_steps: 0

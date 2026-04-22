@@ -187,7 +187,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
-    def plan(self, current_state, desired_endpoint):
+    def plan(self, current_state, desired_endpoint, *, num_steps: int | None = None):
         squeeze = current_state.ndim == 1
         if squeeze:
             current_state = current_state[None]
@@ -196,6 +196,9 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         x_T = current_state
         x_0_goal = desired_endpoint
         n_total = self.config['goub_N']
+        steps_to_roll = n_total if num_steps is None else int(num_steps)
+        if steps_to_roll < 1 or steps_to_roll > n_total:
+            raise ValueError(f'num_steps must be in [1, {n_total}], got {steps_to_roll}.')
         batch_size = x_T.shape[0]
 
         def scan_body(x, step_n):
@@ -203,7 +206,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             x_new, _ = self._learned_reverse_mean(x, x_T, x_0_goal, n, self.schedule)
             return x_new, x_new
 
-        steps = jnp.arange(n_total, 0, -1)
+        steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
         _, traj_body = jax.lax.scan(scan_body, x_T, steps)
         traj = jnp.concatenate([x_T[None], traj_body], axis=0)
         traj = jnp.swapaxes(traj, 0, 1)
@@ -214,8 +217,8 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             result = jax.tree_util.tree_map(lambda x: x[0], result)
         return result
 
-    @partial(jax.jit, static_argnames=('noise_scale',))
-    def sample_plan(self, current_state, desired_endpoint, rng, noise_scale: float = 1.0):
+    @partial(jax.jit, static_argnames=('noise_scale', 'num_steps'))
+    def sample_plan(self, current_state, desired_endpoint, rng, noise_scale: float = 1.0, num_steps: int | None = None):
         squeeze = current_state.ndim == 1
         if squeeze:
             current_state = current_state[None]
@@ -224,8 +227,11 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         x_T = current_state
         x_0_goal = desired_endpoint
         n_total = self.config['goub_N']
+        steps_to_roll = n_total if num_steps is None else int(num_steps)
+        if steps_to_roll < 1 or steps_to_roll > n_total:
+            raise ValueError(f'num_steps must be in [1, {n_total}], got {steps_to_roll}.')
         batch_size = x_T.shape[0]
-        step_rngs = jax.random.split(rng, n_total)
+        step_rngs = jax.random.split(rng, steps_to_roll)
 
         def scan_body(x, inputs):
             step_n, step_rng = inputs
@@ -233,7 +239,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             x_new, _ = self._reverse_step(x, x_T, x_0_goal, n, step_rng, True, noise_scale, params=None)
             return x_new, x_new
 
-        steps = jnp.arange(n_total, 0, -1)
+        steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
         _, traj_body = jax.lax.scan(scan_body, x_T, (steps, step_rngs))
         traj = jnp.concatenate([x_T[None], traj_body], axis=0)
         traj = jnp.swapaxes(traj, 0, 1)
@@ -244,12 +250,17 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             result = jax.tree_util.tree_map(lambda x: x[0], result)
         return result
 
-    def _sample_plan_trajectory(self, current_state, desired_endpoint, rng, noise_scale: float):
+    def _sample_plan_trajectory(
+        self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None
+    ):
         x_T = current_state
         x_0_goal = desired_endpoint
         n_total = self.config['goub_N']
+        steps_to_roll = n_total if num_steps is None else int(num_steps)
+        if steps_to_roll < 1 or steps_to_roll > n_total:
+            raise ValueError(f'num_steps must be in [1, {n_total}], got {steps_to_roll}.')
         batch_size = x_T.shape[0]
-        step_rngs = jax.random.split(rng, n_total)
+        step_rngs = jax.random.split(rng, steps_to_roll)
 
         def scan_body(x, inputs):
             step_n, step_rng = inputs
@@ -257,12 +268,12 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             x_new, _ = self._reverse_step(x, x_T, x_0_goal, n, step_rng, True, noise_scale, params=None)
             return x_new, x_new
 
-        steps = jnp.arange(n_total, 0, -1)
+        steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
         _, traj_body = jax.lax.scan(scan_body, x_T, (steps, step_rngs))
         traj = jnp.concatenate([x_T[None], traj_body], axis=0)
         return jnp.swapaxes(traj, 0, 1)
 
-    @partial(jax.jit, static_argnames=('num_candidates', 'include_mean', 'noise_scale'))
+    @partial(jax.jit, static_argnames=('num_candidates', 'include_mean', 'noise_scale', 'num_steps'))
     def sample_plan_candidates(
         self,
         current_state,
@@ -272,6 +283,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         num_candidates: int,
         noise_scale: float = 1.0,
         include_mean: bool = True,
+        num_steps: int | None = None,
     ):
         squeeze = current_state.ndim == 1
         if squeeze:
@@ -279,13 +291,15 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             desired_endpoint = desired_endpoint[None]
 
         if include_mean:
-            det = self.plan(current_state, desired_endpoint)['trajectory'][:, None, ...]
+            det = self.plan(current_state, desired_endpoint, num_steps=num_steps)['trajectory'][:, None, ...]
             if num_candidates == 1:
                 out = det
             else:
                 sample_rngs = jax.random.split(rng, num_candidates - 1)
                 sampled = jax.vmap(
-                    lambda r: self._sample_plan_trajectory(current_state, desired_endpoint, r, noise_scale),
+                    lambda r: self._sample_plan_trajectory(
+                        current_state, desired_endpoint, r, noise_scale, num_steps=num_steps
+                    ),
                     in_axes=0,
                 )(sample_rngs)
                 sampled = jnp.swapaxes(sampled, 0, 1)
@@ -293,7 +307,9 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         else:
             sample_rngs = jax.random.split(rng, num_candidates)
             sampled = jax.vmap(
-                lambda r: self._sample_plan_trajectory(current_state, desired_endpoint, r, noise_scale),
+                lambda r: self._sample_plan_trajectory(
+                    current_state, desired_endpoint, r, noise_scale, num_steps=num_steps
+                ),
                 in_axes=0,
             )(sample_rngs)
             out = jnp.swapaxes(sampled, 0, 1)
@@ -317,6 +333,62 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
     def plan_from_high_goal(self, current_state, high_actor_goals):
         endpoint = self.predict_subgoal(current_state, high_actor_goals)
         return self.plan(current_state, endpoint)
+
+    def _idm_actions_from_trajectories(self, trajectories: jnp.ndarray, horizon: int) -> jnp.ndarray:
+        prev_states = trajectories[:, :horizon, :]
+        next_states = trajectories[:, 1 : horizon + 1, :]
+        flat_prev = prev_states.reshape(-1, prev_states.shape[-1])
+        flat_next = next_states.reshape(-1, next_states.shape[-1])
+        pred = self.network.select('idm_net')(flat_prev, flat_next)
+        return jnp.asarray(pred, dtype=jnp.float32).reshape(trajectories.shape[0], horizon, -1)
+
+    @partial(jax.jit, static_argnames=('proposal_horizon', 'plan_candidates', 'sample_noise_scale'))
+    def build_actor_proposals(
+        self,
+        observations,
+        high_actor_goals,
+        rng,
+        *,
+        proposal_horizon: int,
+        plan_candidates: int,
+        sample_noise_scale: float = 0.0,
+    ):
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        goals = jnp.asarray(high_actor_goals, dtype=jnp.float32)
+        predicted_subgoals = self.predict_subgoal(obs, goals)
+
+        if plan_candidates == 1:
+            sampled = self.sample_plan(
+                obs,
+                predicted_subgoals,
+                rng,
+                noise_scale=0.0,
+                num_steps=proposal_horizon,
+            )
+            new_rng, _ = jax.random.split(rng)
+            candidate_trajectories = sampled['trajectory'][:, None, ...]
+        else:
+            det_plan = self.plan(obs, predicted_subgoals, num_steps=proposal_horizon)['trajectory']
+            new_rng, sample_rng = jax.random.split(rng)
+            sampled = self.sample_plan_candidates(
+                obs,
+                predicted_subgoals,
+                sample_rng,
+                num_candidates=plan_candidates - 1,
+                noise_scale=sample_noise_scale,
+                include_mean=False,
+                num_steps=proposal_horizon,
+            )
+            candidate_trajectories = jnp.concatenate([det_plan[:, None, ...], sampled], axis=1)
+
+        flat_trajectories = candidate_trajectories.reshape(
+            -1, candidate_trajectories.shape[2], candidate_trajectories.shape[3]
+        )
+        candidate_actions = self._idm_actions_from_trajectories(flat_trajectories, proposal_horizon)
+        candidate_actions = candidate_actions.reshape(
+            candidate_trajectories.shape[0], candidate_trajectories.shape[1], proposal_horizon, -1
+        )
+        return predicted_subgoals, candidate_actions, new_rng
 
     @classmethod
     def create(cls, seed, ex_observations, config, ex_actions=None):

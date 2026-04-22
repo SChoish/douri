@@ -21,9 +21,8 @@ Example::
 ``params_<epoch>.pkl``. Use a standalone IDM pickle only for older GOUB runs without ``idm_net``.
 
 OGBench-style evaluation goals: pass ``--task_id`` in ``[1, num_tasks]`` (typically 5). The script
-then calls ``env.reset(options=dict(task_id=..., render_goal=False))`` and uses the returned
-observation as ``s0`` and ``info['goal']`` as ``s_g``. When ``--task_id`` is 0 (default), start/goal
-come from offline dataset episode ``--traj_idx`` instead (legacy visualization path).
+calls ``env.reset(options=dict(task_id=..., render_goal=False))`` and uses the returned observation
+as ``s0`` and ``info['goal']`` as ``s_g``.
 """
 
 from __future__ import annotations
@@ -40,13 +39,12 @@ import numpy as np
 
 from agents.goub_dynamics import GOUBDynamicsAgent
 from rollout_subgoal_goub import (
-    _get_trajectory,
     _goal_within_tol,
     _list_checkpoint_suffixes,
     _load_checkpoint_pkl,
     _load_run_flags,
+    _resolve_goub_checkpoint_dir,
 )
-from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
 from utils.goub_rollout_env import (
     configure_mujoco_gl,
@@ -56,7 +54,12 @@ from utils.goub_rollout_env import (
     make_xy_clamper,
     sync_env_state_from_obs_vector_aligned,
 )
-from utils.goub_rollout_plot import maze_navigator_for_xy_plot, overlay_rgb_frames_obs2d_panel, write_rgb_array_mp4
+from utils.goub_rollout_plot import (
+    axis_limits,
+    maze_navigator_for_xy_plot,
+    overlay_rgb_frames_obs2d_panel,
+    write_rgb_array_mp4,
+)
 from utils.inverse_dynamics_train import InverseDynamicsMLP
 from utils.maze_navigator import MazeNavigatorMap
 
@@ -84,7 +87,13 @@ def rollout_goub_idm_env(
     planner_noise_scale: float = 0.0,
     planner_seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None, np.ndarray]:
-    """Chunked GOUB bridge + inverse dynamics in the real environment."""
+    """Chunked GOUB bridge + inverse dynamics in the real environment.
+
+    Note: ``navigator`` / ``xy_clamper`` are used only for visualization outputs
+    (subgoal markers and planned state-space trajectories). The actual rollout
+    policy runs on the raw environment observations / GOUB predictions so this
+    path stays aligned with training-time evaluation in ``main.py``.
+    """
     g_np = np.asarray(s_g, dtype=np.float32)
     low = np.asarray(action_low, dtype=np.float32).reshape(-1)
     high = np.asarray(action_high, dtype=np.float32).reshape(-1)
@@ -127,33 +136,33 @@ def rollout_goub_idm_env(
 
     for chunk_i in range(max_chunks):
         s_np = np.asarray(states[-1], dtype=np.float32).reshape(-1)
-        s = jnp.asarray(xy_clamper(s_np), dtype=jnp.float32)
+        s = jnp.asarray(s_np, dtype=jnp.float32)
         g = jnp.asarray(s_g, dtype=jnp.float32)
         hat = agent.predict_subgoal(s, g)
-        hat_np = xy_clamper(np.asarray(jax.device_get(hat), dtype=np.float32).reshape(-1))
-        hat = jnp.asarray(hat_np, dtype=jnp.float32)
+        hat_np = np.asarray(jax.device_get(hat), dtype=np.float32).reshape(-1)
+        hat_plot_np = xy_clamper(hat_np.copy())
 
         if use_stoch_plan:
             plan_rng, sk = jax.random.split(plan_rng)
             out = agent.sample_plan(s, hat, sk, noise_scale=float(planner_noise_scale))
         else:
             out = agent.plan(s, hat)
-        chunk_traj = np.asarray(jax.device_get(out['trajectory']), dtype=np.float32)
-        if chunk_traj.shape[0] < 2:
+        chunk_traj_raw = np.asarray(jax.device_get(out['trajectory']), dtype=np.float32)
+        if chunk_traj_raw.shape[0] < 2:
             break
-        chunk_traj = np.stack([xy_clamper(chunk_traj[i]) for i in range(chunk_traj.shape[0])])
-        plan_seg = np.asarray(chunk_traj[1:], dtype=np.float32)
+        chunk_traj_plot = np.stack([xy_clamper(chunk_traj_raw[i].copy()) for i in range(chunk_traj_raw.shape[0])])
+        plan_seg = np.asarray(chunk_traj_plot[1:], dtype=np.float32)
         if len(frame_plan_trajs) < len(states):
             frame_plan_trajs.append(plan_seg.copy())
-        o_prev = jnp.asarray(chunk_traj[:-1], dtype=jnp.float32)
-        o_next = jnp.asarray(chunk_traj[1:], dtype=jnp.float32)
+        o_prev = jnp.asarray(chunk_traj_raw[:-1], dtype=jnp.float32)
+        o_next = jnp.asarray(chunk_traj_raw[1:], dtype=jnp.float32)
         actions = np.asarray(jax.device_get(_idm_actions(idm_params, o_prev, o_next)), dtype=np.float32)
 
         n_exec = min(int(actions.shape[0]), max(1, int(action_chunk_horizon)))
         for i in range(n_exec):
             # One hat row per env transition (same as ``rollout_subgoal_goub``) so
             # ``overlay_rgb_frames_obs2d_panel(..., chunk_hat_stride=inv_dyn_freq)`` stays aligned.
-            hats_list.append(hat_np.copy())
+            hats_list.append(hat_plot_np.copy())
             a = np.clip(actions[i], low, high)
             ob, _r, terminated, truncated, _info = env.step(a)
             ob_f = np.asarray(ob, dtype=np.float32).reshape(-1)
@@ -183,12 +192,11 @@ def main() -> None:
         default=1000,
         help='GOUB params_<n>.pkl suffix (default 1000). If missing, nearest available is used.',
     )
-    p.add_argument('--traj_idx', type=int, default=0, help='Offline dataset episode index (used only if --task_id=0).')
     p.add_argument(
         '--task_id',
         type=int,
-        default=0,
-        help='OGBench eval task id in [1, num_tasks] via env.reset(options=dict(task_id=...)); 0 uses --traj_idx.',
+        required=True,
+        help='OGBench eval task id in [1, num_tasks] via env.reset(options=dict(task_id=...)).',
     )
     p.add_argument('--max_steps', type=int, default=1000, help='Max replan chunks (default 1000).')
     p.add_argument(
@@ -226,6 +234,18 @@ def main() -> None:
     p.add_argument('--out_mp4', type=str, default='')
     p.add_argument('--fps', type=float, default=60.0)
     p.add_argument('--no_mp4', action='store_true')
+    p.add_argument(
+        '--value_heatmap',
+        action='store_true',
+        help='Overlay DQC scalar value V(s, goal) on the right XY panel (requires joint checkpoints/critic/).',
+    )
+    p.add_argument('--value_grid_n', type=int, default=56, help='Square grid resolution for value heatmap.')
+    p.add_argument(
+        '--critic_epoch',
+        type=int,
+        default=-1,
+        help='Critic params_<n>.pkl suffix; -1 = same suffix as GOUB --checkpoint_epoch.',
+    )
     args = p.parse_args()
 
     try:
@@ -239,9 +259,7 @@ def main() -> None:
 
     ckpt_epoch = int(args.checkpoint_epoch)
     run_dir = Path(args.run_dir).resolve()
-    ckpt_dir = run_dir / 'checkpoints'
-    if not ckpt_dir.is_dir():
-        raise FileNotFoundError(f'No checkpoints/ under {run_dir}')
+    ckpt_dir = _resolve_goub_checkpoint_dir(run_dir)
     suffixes = _list_checkpoint_suffixes(ckpt_dir)
     if not suffixes:
         raise FileNotFoundError(f'No params_*.pkl in {ckpt_dir}')
@@ -262,25 +280,19 @@ def main() -> None:
         env_name, frame_stack=cfg.get('frame_stack'), render_mode='rgb_array',
     )
     tid = int(args.task_id)
-    if tid != 0:
-        u = env.unwrapped
-        n_tasks = int(getattr(u, 'num_tasks', 5))
-        if not (1 <= tid <= n_tasks):
-            p.error(f'--task_id must be in [1, {n_tasks}] for {env_name!r} (got {tid})')
-        ob, info = env.reset(options=dict(task_id=tid, render_goal=False))
-        if 'goal' not in info:
-            raise RuntimeError(
-                f'{env_name!r} reset(task_id=...) did not set info["goal"]; cannot run IDM rollout in task_id mode.'
-            )
-        s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
-        s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
-        traj = np.stack([s0, s_g], axis=0)
-        print(f'OGBench eval reset: task_id={tid}  obs_dim={s0.shape[-1]}  goal_dim={s_g.shape[-1]}')
-    else:
-        dataset = Dataset.create(**train_raw)
-        traj = _get_trajectory(dataset, args.traj_idx)
-        s0 = np.asarray(traj[0], dtype=np.float32).reshape(-1)
-        s_g = np.asarray(traj[-1], dtype=np.float32).reshape(-1)
+    u = env.unwrapped
+    n_tasks = int(getattr(u, 'num_tasks', 5))
+    if not (1 <= tid <= n_tasks):
+        p.error(f'--task_id must be in [1, {n_tasks}] for {env_name!r} (got {tid})')
+    ob, info = env.reset(options=dict(task_id=tid, render_goal=False))
+    if 'goal' not in info:
+        raise RuntimeError(
+            f'{env_name!r} reset(task_id=...) did not set info["goal"]; cannot run IDM rollout in task mode.'
+        )
+    s0 = np.asarray(ob, dtype=np.float32).reshape(-1)
+    s_g = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+    traj = np.stack([s0, s_g], axis=0)
+    print(f'OGBench eval reset: task_id={tid}  obs_dim={s0.shape[-1]}  goal_dim={s_g.shape[-1]}')
     tol = float(args.goal_tol)
     if tol > 0 and args.goal_stop == 'plot':
         stop_dims = (args.plot_dim0, args.plot_dim1)
@@ -376,6 +388,34 @@ def main() -> None:
     d0, d1 = args.plot_dim0, args.plot_dim1
     plot_nav = maze_navigator_for_xy_plot(navigator, env_name, d0, d1)
 
+    heat_mesh = None
+    heat_vmin = heat_vmax = None
+    if bool(args.value_heatmap):
+        from utils.rollout_value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
+
+        ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(ckpt_epoch)
+        critic_agent = load_dqc_critic_joint_run(
+            run_dir,
+            ce,
+            env,
+            train_raw,
+            seed=int(args.seed),
+        )
+        print(f'Loaded critic for value heatmap (epoch suffix {ce})')
+        xlim, ylim = axis_limits(traj, roll, hats, d0, d1, s_g, s0, navigator=plot_nav, seg=None)
+        tpl = np.asarray(roll[0], dtype=np.float32).reshape(-1)
+        XX, YY, ZZ, heat_vmin, heat_vmax = dqc_value_mesh_for_xy(
+            critic_agent,
+            tpl,
+            np.asarray(s_g, dtype=np.float32).reshape(-1),
+            int(d0),
+            int(d1),
+            xlim,
+            ylim,
+            grid_n=int(args.value_grid_n),
+        )
+        heat_mesh = (XX, YY, ZZ)
+
     if (not args.no_mp4) and env_frames is not None and env_frames.size > 0:
         mp4_out = Path(args.out_mp4.strip()) if str(args.out_mp4).strip() else Path(args.out_path).with_suffix('.mp4')
         mp4_out.parent.mkdir(parents=True, exist_ok=True)
@@ -394,6 +434,9 @@ def main() -> None:
                 plot_nav,
                 env_name=env_name,
                 chunk_hat_stride=_pf,
+                value_heatmap=heat_mesh,
+                value_heatmap_vmin=heat_vmin,
+                value_heatmap_vmax=heat_vmax,
             )
             write_rgb_array_mp4(frames, mp4_out, float(args.fps))
             print(f'Wrote MP4 {mp4_out.resolve()}')

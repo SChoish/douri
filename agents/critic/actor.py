@@ -110,7 +110,10 @@ class JointActorAgent(flax.struct.PyTreeNode):
         if bool(self.config['spi_dist_normalize_by_dim']):
             sqdist = sqdist / float(proposal_chunks.shape[-1])
         prox = jnp.sum(rho * sqdist, axis=1)
-        actor_loss = jnp.mean(-actor_q + prox / (2.0 * float(self.config['spi_tau'])))
+        # Scale critic Q so the SPI term is ``-Q / (|Q| + eps)`` instead of raw ``-Q`` (per batch row).
+        q_eps = jnp.asarray(float(self.config.get('spi_q_norm_eps', 1e-6)), dtype=jnp.float32)
+        actor_q_scaled = actor_q / (jnp.abs(actor_q) + q_eps)
+        actor_loss = jnp.mean(-actor_q_scaled + prox / (2.0 * float(self.config['spi_tau'])))
 
         rho_eps = 1e-8
         rho_entropy = -jnp.sum(rho * jnp.log(rho + rho_eps), axis=1).mean()
@@ -192,6 +195,7 @@ def get_actor_config():
             spi_actor_layer_norm=True,
             spi_eval_use_actor=False,
             spi_dist_normalize_by_dim=True,
+            spi_q_norm_eps=1e-6,
             spi_warmstart_steps=0,
             actor_chunk_horizon=ml_collections.config_dict.placeholder(int),
             action_dim=2,

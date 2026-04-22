@@ -270,6 +270,10 @@ def overlay_rgb_frames_obs2d_panel(
     hats_size: float = 68.0,
     dataset_line_alpha: float = 0.44,
     dataset_scatter_alpha: float = 0.4,
+    value_heatmap: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    value_heatmap_vmin: float | None = None,
+    value_heatmap_vmax: float | None = None,
+    value_heatmap_alpha: float = 0.5,
 ) -> np.ndarray:
     """Compose env frames with a right-side XY panel.
 
@@ -278,6 +282,9 @@ def overlay_rgb_frames_obs2d_panel(
     25-step segment for that replan, rather than the cumulative executed rollout.
 
     Pass ``navigator`` from ``--navigator snap`` if maze tiles should appear on the panel.
+
+    Optional ``value_heatmap=(XX, YY, ZZ)`` draws a goal-conditioned scalar value field (e.g. DQC
+    ``sigmoid(V)``) under trajectories using ``pcolormesh`` (same ``xlim``/``ylim`` as the panel).
     """
     if frames.ndim != 4 or frames.shape[-1] != 3:
         raise ValueError(f'Expected uint8 frames (T,H,W,3), got {frames.shape}')
@@ -302,6 +309,20 @@ def overlay_rgb_frames_obs2d_panel(
         fig, ax = plt.subplots(figsize=(pw / float(dpi), H / float(dpi)), dpi=int(dpi))
         fig.patch.set_facecolor('white')
         ax.set_facecolor('white')
+        if value_heatmap is not None:
+            XX, YY, ZZ = value_heatmap
+            ax.pcolormesh(
+                XX,
+                YY,
+                ZZ,
+                shading='auto',
+                cmap='magma',
+                alpha=float(value_heatmap_alpha),
+                vmin=value_heatmap_vmin,
+                vmax=value_heatmap_vmax,
+                zorder=1,
+                rasterized=True,
+            )
         plot_maze_cell_tiles(ax, nav_panel, d0, d1)
         cur = roll[min(int(t), int(roll.shape[0]) - 1)]
         plan_seg = None

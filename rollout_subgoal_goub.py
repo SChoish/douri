@@ -13,15 +13,18 @@ once with ``navigator`` disabled so a difficult maze layout can still be visuali
    when distance to ``s_g`` is at most ``--goal_tol`` (``<=``, inclusive); see ``--goal_stop``).
 
    Each **chunk**: ``predict_subgoal(s, s_g)`` once → one ``plan`` / ``sample_plan`` → append
-   ``trajectory[1:K+1]`` (``K`` from ``--action_chunk_horizon``; ``0`` → ``goub_N``), clamped, capped by ``N``.
+   ``trajectory[1:K+1]`` (``K`` from ``--action_chunk_horizon``; ``0`` → **full** ``goub_N``), clamped, capped by ``N``.
+   There is no environment simulator here, so **K=0 (default) is recommended**: walk the entire planned
+   bridge each replan. Use ``K < goub_N`` only when you want to match a shorter real-env execution horizon
+   (e.g. IDM ``action_chunk_horizon``) for apples-to-oranges plots.
    ``K=1`` uses only ``next_step`` (``trajectory[1]``) per chunk.
 
        (repeat)  hat = G(s, g);  traj = plan(s, hat);  walk traj[1], …, traj[K]
 
 4. Plot dataset vs rollout in 2D; writes **PNG** and optional **matplotlib MP4** at ``--fps``.
 
-**Real env + IDM** rollouts live in ``rollout_idm_goub.py``. **Chunk low-level actor** rollouts:
-``rollout_chunk_actor_goub.py``.
+**Real env + IDM** rollouts live in ``rollout_idm_goub.py``. **Joint chunk actor** rollouts:
+``rollout_actor_goub.py``.
 
 ``loss_sub_mean`` in training logs is the batch-mean of ``phase1/loss_subgoal``,
 i.e. MSE between ``subgoal_net(s, g)`` and teacher ``high_actor_targets``,
@@ -93,6 +96,21 @@ def _list_checkpoint_suffixes(checkpoints_dir: Path) -> list[int]:
     return sorted(out)
 
 
+def _resolve_goub_checkpoint_dir(run_dir: Path) -> Path:
+    """Return directory containing ``params_*.pkl`` for GOUB (joint runs use ``checkpoints/goub/``)."""
+    base = run_dir / 'checkpoints'
+    if not base.is_dir():
+        raise FileNotFoundError(f'No checkpoints/ under {run_dir}')
+    if _list_checkpoint_suffixes(base):
+        return base
+    nested = base / 'goub'
+    if nested.is_dir() and _list_checkpoint_suffixes(nested):
+        return nested
+    raise FileNotFoundError(
+        f'No params_*.pkl under {base} or {nested} (expected GOUB checkpoints for rollout).'
+    )
+
+
 def _load_run_flags(run_dir: Path) -> tuple[ConfigDict, str]:
     """Return ``(merged agent config, env_name)`` from ``flags.json``."""
     flags_path = run_dir / 'flags.json'
@@ -101,11 +119,18 @@ def _load_run_flags(run_dir: Path) -> tuple[ConfigDict, str]:
     with open(flags_path, 'r', encoding='utf-8') as f:
         flags = json.load(f)
     env_name = flags.get('env_name')
+    if not env_name and isinstance(flags.get('flags'), dict):
+        env_name = flags['flags'].get('env_name')
     if not env_name:
-        raise KeyError('flags.json must contain env_name')
+        raise KeyError('flags.json must contain env_name (top-level or flags.env_name)')
     cfg = get_dynamics_config()
-    for k, v in (flags.get('agent') or {}).items():
-        cfg[k] = v
+    agent_updates = flags.get('agent')
+    if agent_updates:
+        for k, v in agent_updates.items():
+            cfg[k] = v
+    elif isinstance(flags.get('goub'), dict):
+        for k, v in flags['goub'].items():
+            cfg[k] = v
     return cfg, env_name
 
 
@@ -330,7 +355,8 @@ def main():
         metavar='K',
         help=(
             'Per chunk: append first K states from plan trajectory (trajectory[1:K+1]), one plan() call. '
-            'K=0 (default) uses goub_N from checkpoint. Capped by N. K=1 = next_step only per chunk.'
+            'K=0 (default): full goub_N from checkpoint (open-loop state rollout; no env cost). '
+            'K>0: shorter prefix, e.g. to match real-env chunk length. Capped by N. K=1 = next_step only per chunk.'
         ),
     )
     p.add_argument(
@@ -486,9 +512,7 @@ def main():
         ckpt_epoch = int(args.checkpoint_epoch)
 
     run_dir = Path(args.run_dir).resolve()
-    ckpt_dir = run_dir / 'checkpoints'
-    if not ckpt_dir.is_dir():
-        raise FileNotFoundError(f'No checkpoints/ under {run_dir}')
+    ckpt_dir = _resolve_goub_checkpoint_dir(run_dir)
 
     suffixes = _list_checkpoint_suffixes(ckpt_dir)
     if not suffixes:

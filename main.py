@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import json
 import logging
 import math
@@ -36,7 +37,7 @@ from utils.datasets import Dataset, PathHGCDataset
 from utils.deas_sequence_dataset import DEASActionSeqDataset
 from utils.dqc_sequence_dataset import DQCActionSeqDataset
 from utils.env_utils import make_env_and_datasets
-from utils.flax_utils import save_agent
+from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
@@ -56,8 +57,19 @@ def _sanitize_token(s: str) -> str:
     return s[:120] if len(s) > 120 else s
 
 
+def _block_until_ready(tree: Any) -> Any:
+    """Synchronize a JAX pytree so wall-clock timing reflects real compute."""
+
+    def _ready(x):
+        return x.block_until_ready() if hasattr(x, 'block_until_ready') else x
+
+    return jax.tree_util.tree_map(_ready, tree)
+
+
 flags.DEFINE_string('run_config', '', 'YAML config; empty uses config/joint_train_antmaze.yaml.')
 flags.DEFINE_string('runs_root', '', 'Run root; default <repo>/runs.')
+flags.DEFINE_string('resume_run_dir', '', 'Existing run dir to resume in-place.')
+flags.DEFINE_integer('resume_epoch', 0, 'Checkpoint epoch to resume from; 0 disables resume.')
 flags.DEFINE_string('run_group', 'Debug', 'W&B group.')
 flags.DEFINE_integer('seed', 0, 'Seed.')
 flags.DEFINE_string('env_name', 'antmaze-medium-navigate-v0', 'OGBench env / dataset name.')
@@ -99,6 +111,7 @@ _SPI_ACTOR_KEYS = {
     'spi_actor_layer_norm',
     'spi_eval_use_actor',
     'spi_dist_normalize_by_dim',
+    'spi_q_norm_eps',
     'spi_warmstart_steps',
 }
 
@@ -219,6 +232,7 @@ def _format_epoch_log(metrics: dict[str, float]) -> str:
         ('actor_entropy', 'train/actor/spi_actor/rho_entropy_epoch_mean'),
         ('t_data', 'time/data_epoch_sec'),
         ('t_build', 'time/build_batches_epoch_sec'),
+        ('t_prop', 'time/build/proposal_build_epoch_sec'),
         ('t_sg', 'time/build/predict_subgoal_epoch_sec'),
         ('t_mean', 'time/build/mean_ode_epoch_sec'),
         ('t_plan', 'time/build/plan_det_epoch_sec'),
@@ -298,18 +312,24 @@ def _eval_batch_size(common_valid_starts: np.ndarray, batch_size: int) -> int:
     return max(1, min(int(batch_size), int(len(common_valid_starts))))
 
 
+@partial(jax.jit, static_argnames=('horizon',))
+def _idm_actions_from_trajectories_jit(network: Any, trajectories: jnp.ndarray, horizon: int) -> jnp.ndarray:
+    prev_states = trajectories[:, :horizon, :]
+    next_states = trajectories[:, 1 : horizon + 1, :]
+    flat_prev = prev_states.reshape(-1, prev_states.shape[-1])
+    flat_next = next_states.reshape(-1, next_states.shape[-1])
+    pred = network.select('idm_net')(flat_prev, flat_next)
+    return jnp.asarray(pred, dtype=jnp.float32).reshape(trajectories.shape[0], horizon, -1)
+
+
 def _idm_actions_from_trajectories(goub_agent: GOUBDynamicsAgent, trajectories: np.ndarray, horizon: int) -> jnp.ndarray:
     if trajectories.shape[1] <= horizon:
         raise ValueError(
             f'GOUB trajectory length {trajectories.shape[1]} is too short for horizon={horizon}. '
             'Increase goub_N / subgoal_steps or reduce chunk horizons.'
         )
-    prev_states = trajectories[:, :horizon, :]
-    next_states = trajectories[:, 1 : horizon + 1, :]
-    flat_prev = prev_states.reshape(-1, prev_states.shape[-1])
-    flat_next = next_states.reshape(-1, next_states.shape[-1])
-    pred = goub_agent.network.select('idm_net')(jnp.asarray(flat_prev), jnp.asarray(flat_next))
-    return jnp.asarray(pred, dtype=jnp.float32).reshape(trajectories.shape[0], horizon, -1)
+    trajectories = jnp.asarray(trajectories, dtype=jnp.float32)
+    return _idm_actions_from_trajectories_jit(goub_agent.network, trajectories, horizon)
 
 
 def _rank_candidate_actions(
@@ -336,90 +356,25 @@ def _build_actor_batch_from_goub(
     measure_timing = bool(FLAGS.measure_timing)
     timing = {}
 
-    if measure_timing:
-        t0 = time.perf_counter()
-        predicted_subgoals = jnp.asarray(goub_agent.predict_subgoal(obs, high_goals), dtype=jnp.float32)
-        timing['predict_subgoal'] = time.perf_counter() - t0
-    else:
-        predicted_subgoals = jnp.asarray(goub_agent.predict_subgoal(obs, high_goals), dtype=jnp.float32)
-
     plan_candidates = max(1, int(FLAGS.plan_candidates))
     proposal_horizon = int(actor_config['actor_chunk_horizon'])
-    plan_rng = goub_agent.rng
-    if measure_timing:
-        timing['mean_ode'] = 0.0
-        timing['plan_det'] = 0.0
-    sample_plan_time = 0.0
-
-    if plan_candidates == 1:
-        if measure_timing:
-            t0 = time.perf_counter()
-            sampled = goub_agent.sample_plan(
-                obs,
-                predicted_subgoals,
-                plan_rng,
-                noise_scale=0.0,
-            )
-            timing['mean_ode'] = time.perf_counter() - t0
-        else:
-            sampled = goub_agent.sample_plan(
-                obs,
-                predicted_subgoals,
-                plan_rng,
-                noise_scale=0.0,
-            )
-        plan_rng, _ = jax.random.split(plan_rng)
-        candidate_trajectories = jnp.asarray(sampled['trajectory'], dtype=jnp.float32)[:, None, ...]
-    else:
-        if measure_timing:
-            t0 = time.perf_counter()
-            det_plan = jnp.asarray(goub_agent.plan(obs, predicted_subgoals)['trajectory'], dtype=jnp.float32)
-            timing['plan_det'] = time.perf_counter() - t0
-        else:
-            det_plan = jnp.asarray(goub_agent.plan(obs, predicted_subgoals)['trajectory'], dtype=jnp.float32)
-        sample_noise_scale = float(FLAGS.plan_noise_scale) if bool(FLAGS.stochastic_plan_candidates) else 0.0
-        plan_rng, sample_rng = jax.random.split(plan_rng)
-        if measure_timing:
-            t0 = time.perf_counter()
-            sampled = goub_agent.sample_plan_candidates(
-                obs,
-                predicted_subgoals,
-                sample_rng,
-                num_candidates=plan_candidates - 1,
-                noise_scale=sample_noise_scale,
-                include_mean=False,
-            )
-            sample_plan_time += time.perf_counter() - t0
-        else:
-            sampled = goub_agent.sample_plan_candidates(
-                obs,
-                predicted_subgoals,
-                sample_rng,
-                num_candidates=plan_candidates - 1,
-                noise_scale=sample_noise_scale,
-                include_mean=False,
-            )
-        sampled = jnp.asarray(sampled, dtype=jnp.float32)
-        candidate_trajectories = jnp.concatenate([det_plan[:, None, ...], sampled], axis=1)
-    if measure_timing:
-        timing['sample_plan'] = sample_plan_time
-    goub_agent = goub_agent.replace(rng=plan_rng)
-
-    flat_trajectories = candidate_trajectories.reshape(-1, candidate_trajectories.shape[2], candidate_trajectories.shape[3])
     if measure_timing:
         t0 = time.perf_counter()
-        candidate_actions = _idm_actions_from_trajectories(goub_agent, flat_trajectories, proposal_horizon)
-        timing['idm'] = time.perf_counter() - t0
-    else:
-        candidate_actions = _idm_actions_from_trajectories(goub_agent, flat_trajectories, proposal_horizon)
-    candidate_actions = candidate_actions.reshape(
-        candidate_trajectories.shape[0],
-        candidate_trajectories.shape[1],
-        proposal_horizon,
-        -1,
-    )  # [B, N, ha, A]
+    sample_noise_scale = float(FLAGS.plan_noise_scale) if bool(FLAGS.stochastic_plan_candidates) else 0.0
+    predicted_subgoals, candidate_actions, plan_rng = goub_agent.build_actor_proposals(
+        obs,
+        high_goals,
+        goub_agent.rng,
+        proposal_horizon=proposal_horizon,
+        plan_candidates=plan_candidates,
+        sample_noise_scale=sample_noise_scale,
+    )
     if measure_timing:
-        timing['score'] = 0.0
+        _block_until_ready((predicted_subgoals, candidate_actions, plan_rng))
+        timing['proposal_build'] = time.perf_counter() - t0
+    else:
+        timing = {}
+    goub_agent = goub_agent.replace(rng=plan_rng)
     actor_batch = {
         'observations': obs,
         'spi_goals': predicted_subgoals,
@@ -632,11 +587,50 @@ def _create_actor_agent(seed: int, ex_goub: dict, actor_config):
     )
 
 
+def _execute_action_chunk(
+    env,
+    obs: np.ndarray,
+    goal: np.ndarray,
+    action_chunk: np.ndarray,
+    *,
+    low: np.ndarray,
+    high: np.ndarray,
+    goal_dims: tuple[int, ...] | None,
+    goal_tol: float,
+) -> tuple[np.ndarray, bool, bool, bool]:
+    success = _goal_within_tol(obs, goal, goal_dims, goal_tol)
+    terminated = False
+    truncated = False
+    for action in np.asarray(action_chunk, dtype=np.float32):
+        clipped = np.clip(action, low, high)
+        ob, _reward, terminated, truncated, info = env.step(clipped)
+        obs = np.asarray(ob, dtype=np.float32).reshape(-1)
+        success_flag = bool(info.get('success', False)) if isinstance(info, dict) else False
+        success = success or success_flag or _goal_within_tol(obs, goal, goal_dims, goal_tol)
+        if success or terminated or truncated:
+            break
+    return obs, success, bool(terminated), bool(truncated)
+
+
+def _idm_action_chunk(
+    goub_agent: GOUBDynamicsAgent,
+    obs: np.ndarray,
+    predicted_subgoal: np.ndarray,
+    horizon: int,
+) -> np.ndarray:
+    traj = np.asarray(goub_agent.plan(obs, predicted_subgoal)['trajectory'], dtype=np.float32)
+    if traj.ndim != 2:
+        raise RuntimeError(f'Expected single-trajectory plan with rank 2, got shape={traj.shape}.')
+    action_chunk = np.asarray(_idm_actions_from_trajectories(goub_agent, traj[None, ...], horizon), dtype=np.float32)
+    return action_chunk[0]
+
+
 def _evaluate_env_tasks(
     env,
     goub_agent: GOUBDynamicsAgent,
     actor_agent: Any,
     actor_config: Any,
+    critic_config: Any,
     *,
     task_ids: tuple[int, ...],
     episodes_per_task: int,
@@ -644,48 +638,88 @@ def _evaluate_env_tasks(
     goal_tol: float,
     goal_dims: tuple[int, ...] | None,
 ) -> dict[str, float]:
-    if actor_agent is None or not task_ids:
+    if not task_ids:
         return {}
 
     low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
-    horizon = int(actor_config['actor_chunk_horizon'])
-    task_successes = []
+    actor_horizon = int(actor_config['actor_chunk_horizon'])
+    idm_horizon = int(critic_config['action_chunk_horizon'])
+    actor_task_successes = []
+    idm_task_successes = []
     metrics = {}
 
     for task_id in task_ids:
-        episode_successes = []
+        actor_episode_successes = []
+        idm_episode_successes = []
         for _ in range(max(1, int(episodes_per_task))):
+            if actor_agent is not None:
+                ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
+                if 'goal' not in info:
+                    raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
+                obs = np.asarray(ob, dtype=np.float32).reshape(-1)
+                goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+                success = _goal_within_tol(obs, goal, goal_dims, goal_tol)
+                terminated = False
+                truncated = False
+
+                for _ in range(max(1, int(max_chunks))):
+                    if success or terminated or truncated:
+                        break
+                    predicted_subgoal = np.asarray(goub_agent.predict_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+                    action_chunk = np.asarray(actor_agent.sample_actions(obs, predicted_subgoal), dtype=np.float32).reshape(
+                        actor_horizon, -1
+                    )
+                    obs, success, terminated, truncated = _execute_action_chunk(
+                        env,
+                        obs,
+                        goal,
+                        action_chunk,
+                        low=low,
+                        high=high,
+                        goal_dims=goal_dims,
+                        goal_tol=goal_tol,
+                    )
+                actor_episode_successes.append(1.0 if success else 0.0)
+
             ob, info = env.reset(options=dict(task_id=int(task_id), render_goal=False))
             if 'goal' not in info:
                 raise RuntimeError(f'Env reset(task_id={task_id}) did not provide info["goal"].')
             obs = np.asarray(ob, dtype=np.float32).reshape(-1)
             goal = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
             success = _goal_within_tol(obs, goal, goal_dims, goal_tol)
+            terminated = False
+            truncated = False
 
             for _ in range(max(1, int(max_chunks))):
-                if success:
-                    break
-                predicted_subgoal = np.asarray(goub_agent.predict_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-                action_chunk = np.asarray(actor_agent.sample_actions(obs, predicted_subgoal), dtype=np.float32).reshape(horizon, -1)
-                for action in action_chunk:
-                    clipped = np.clip(action, low, high)
-                    ob, reward, terminated, truncated, info = env.step(clipped)
-                    obs = np.asarray(ob, dtype=np.float32).reshape(-1)
-                    success_flag = bool(info.get('success', False)) if isinstance(info, dict) else False
-                    success = success or success_flag or _goal_within_tol(obs, goal, goal_dims, goal_tol)
-                    if success or terminated or truncated:
-                        break
                 if success or terminated or truncated:
                     break
+                predicted_subgoal = np.asarray(goub_agent.predict_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+                action_chunk = _idm_action_chunk(goub_agent, obs, predicted_subgoal, idm_horizon)
+                obs, success, terminated, truncated = _execute_action_chunk(
+                    env,
+                    obs,
+                    goal,
+                    action_chunk,
+                    low=low,
+                    high=high,
+                    goal_dims=goal_dims,
+                    goal_tol=goal_tol,
+                )
+            idm_episode_successes.append(1.0 if success else 0.0)
 
-            episode_successes.append(1.0 if success else 0.0)
+        if actor_agent is not None:
+            task_success_rate = float(np.mean(actor_episode_successes))
+            metrics[f'eval/task_{task_id}/success_rate'] = task_success_rate
+            actor_task_successes.append(task_success_rate)
 
-        task_success_rate = float(np.mean(episode_successes))
-        metrics[f'eval/task_{task_id}/success_rate'] = task_success_rate
-        task_successes.append(task_success_rate)
+        idm_task_success_rate = float(np.mean(idm_episode_successes))
+        metrics[f'eval_idm/task_{task_id}/success_rate'] = idm_task_success_rate
+        idm_task_successes.append(idm_task_success_rate)
 
-    metrics['eval/success_rate_mean'] = float(np.mean(task_successes))
+    if actor_agent is not None:
+        metrics['eval/success_rate_mean'] = float(np.mean(actor_task_successes))
+    metrics['eval_idm/success_rate_mean'] = float(np.mean(idm_task_successes))
     metrics['eval/num_tasks'] = float(len(task_ids))
     metrics['eval/episodes_per_task'] = float(max(1, int(episodes_per_task)))
     return metrics
@@ -708,11 +742,21 @@ def main(_):
         actor_updates,
     )
 
-    ts = time.strftime('%Y%m%d_%H%M%S')
-    env_tok = _sanitize_token(FLAGS.env_name)
-    run_folder = f'{ts}_joint_{critic_name}_seed{FLAGS.seed}_{env_tok}'
+    resume_run_dir = FLAGS.resume_run_dir.strip()
+    resume_epoch = int(FLAGS.resume_epoch)
+    if bool(resume_run_dir) != bool(resume_epoch > 0):
+        raise ValueError('resume_run_dir and resume_epoch must be provided together.')
+
     runs_root = FLAGS.runs_root.strip() or os.path.join(impl, 'runs')
-    run_dir = os.path.join(runs_root, run_folder)
+    if resume_run_dir:
+        run_dir = os.path.abspath(resume_run_dir)
+        if not os.path.isdir(run_dir):
+            raise FileNotFoundError(f'resume_run_dir not found: {run_dir}')
+    else:
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        env_tok = _sanitize_token(FLAGS.env_name)
+        run_folder = f'{ts}_joint_{critic_name}_seed{FLAGS.seed}_{env_tok}'
+        run_dir = os.path.join(runs_root, run_folder)
     ckpt_root = os.path.join(run_dir, 'checkpoints')
     goub_ckpt_dir = os.path.join(ckpt_root, 'goub')
     critic_ckpt_dir = os.path.join(ckpt_root, 'critic')
@@ -721,12 +765,20 @@ def main(_):
     os.makedirs(critic_ckpt_dir, exist_ok=True)
     if bool(actor_config.get('use_spi_actor', False)):
         os.makedirs(actor_ckpt_dir, exist_ok=True)
-    if os.path.isfile(cfg_path):
+    if os.path.isfile(cfg_path) and not resume_run_dir:
         shutil.copy2(cfg_path, os.path.join(run_dir, 'config_used.yaml'))
 
     exp_name = get_exp_name(FLAGS.seed, env_name=FLAGS.env_name, agent_name=f'joint_{critic_name}')
     if FLAGS.use_wandb:
         setup_wandb(project='OGBench-Joint', group=FLAGS.run_group, name=exp_name)
+
+    run_logger = _setup_file_logger(run_dir)
+    run_logger.info('run_dir=%s critic=%s', run_dir, critic_name)
+
+    env, train_plain, _ = make_env_and_datasets(FLAGS.env_name, frame_stack=critic_config['frame_stack'])
+    action_dim = int(np.asarray(env.action_space.shape).prod())
+    critic_config['action_dim'] = action_dim
+    actor_config['action_dim'] = action_dim
 
     with open(os.path.join(run_dir, 'flags.json'), 'w', encoding='utf-8') as f:
         json.dump(
@@ -739,14 +791,6 @@ def main(_):
             f,
             indent=2,
         )
-
-    run_logger = _setup_file_logger(run_dir)
-    run_logger.info('run_dir=%s critic=%s', run_dir, critic_name)
-
-    env, train_plain, _ = make_env_and_datasets(FLAGS.env_name, frame_stack=critic_config['frame_stack'])
-    action_dim = int(np.asarray(env.action_space.shape).prod())
-    critic_config['action_dim'] = action_dim
-    actor_config['action_dim'] = action_dim
 
     goub_dataset = PathHGCDataset(Dataset.create(**train_plain), goub_config)
     critic_dataset = _make_critic_dataset(train_plain, critic_name, critic_config)
@@ -770,6 +814,11 @@ def main(_):
     )
     critic_agent = _create_critic_agent(critic_name, critic_cls, FLAGS.seed, ex_critic, critic_config)
     actor_agent = _create_actor_agent(FLAGS.seed, ex_goub, actor_config)
+    if resume_run_dir:
+        goub_agent = restore_agent(goub_agent, goub_ckpt_dir, resume_epoch)
+        critic_agent = restore_agent(critic_agent, critic_ckpt_dir, resume_epoch)
+        if actor_agent is not None:
+            actor_agent = restore_agent(actor_agent, actor_ckpt_dir, resume_epoch)
 
     batch_size = int(goub_config['batch_size'])
     spe = _steps_per_epoch(len(common_valid_starts), batch_size)
@@ -784,7 +833,7 @@ def main(_):
         bool(actor_config.get('use_spi_actor', False)),
     )
 
-    train_logger = CsvLogger(os.path.join(run_dir, 'train.csv'), flush_every_n=1)
+    train_logger = CsvLogger(os.path.join(run_dir, 'train.csv'), resume=bool(resume_run_dir), flush_every_n=1)
     first_time = time.time()
     last_log = time.time()
     measure_timing = bool(FLAGS.measure_timing)
@@ -796,7 +845,8 @@ def main(_):
     eval_goal_tol = float(FLAGS.eval_goal_tol)
     eval_max_chunks = max(1, int(FLAGS.eval_max_chunks))
 
-    epoch_iter = range(1, FLAGS.train_epochs + 1)
+    start_epoch = resume_epoch + 1 if resume_run_dir else 1
+    epoch_iter = range(start_epoch, FLAGS.train_epochs + 1)
     if FLAGS.use_tqdm:
         epoch_iter = tqdm.tqdm(epoch_iter, smoothing=0.1, dynamic_ncols=True)
 
@@ -853,6 +903,7 @@ def main(_):
                     actor_config,
                 )
             if measure_timing:
+                _block_until_ready((critic_batch, actor_batch))
                 build_time += time.perf_counter() - t0
                 _accumulate_time_sums(build_detail_times, build_detail_info)
 
@@ -860,12 +911,14 @@ def main(_):
                 t0 = time.perf_counter()
             goub_agent, goub_info = goub_agent.update(goub_batch)
             if measure_timing:
+                _block_until_ready(goub_info)
                 goub_time += time.perf_counter() - t0
 
             if measure_timing:
                 t0 = time.perf_counter()
             critic_agent, critic_info = critic_agent.update(critic_batch)
             if measure_timing:
+                _block_until_ready(critic_info)
                 critic_time += time.perf_counter() - t0
 
             if actor_agent is not None and actor_batch is not None:
@@ -877,12 +930,14 @@ def main(_):
                 coupling_info = dict(coupling_info)
                 coupling_info.update(score_coupling_info)
                 if measure_timing:
+                    _block_until_ready(actor_batch_for_update)
                     actor_rescore_time += time.perf_counter() - t0
 
                 if measure_timing:
                     t0 = time.perf_counter()
                 actor_agent, actor_info = actor_agent.update(actor_batch_for_update, critic_agent)
                 if measure_timing:
+                    _block_until_ready(actor_info)
                     actor_time += time.perf_counter() - t0
             else:
                 actor_info = None
@@ -932,6 +987,7 @@ def main(_):
                         goub_agent,
                         actor_agent,
                         actor_config,
+                        critic_config,
                         task_ids=eval_task_ids,
                         episodes_per_task=eval_episodes_per_task,
                         max_chunks=eval_max_chunks,
@@ -966,18 +1022,33 @@ def main(_):
                 _format_epoch_log(metrics),
             )
             if eval_freq > 0 and epoch % eval_freq == 0:
-                run_logger.info('=== EVAL START epoch=%d ===', epoch)
-                for task_id in eval_task_ids:
-                    task_key = f'eval/task_{task_id}/success_rate'
-                    if task_key in metrics:
-                        run_logger.info('task_%d success_rate=%.6f', task_id, metrics[task_key])
+                num_tasks = int(metrics.get('eval/num_tasks', 0.0))
+                episodes_per_task = int(metrics.get('eval/episodes_per_task', 0.0))
                 run_logger.info(
-                    'eval epoch=%d success_rate_mean=%.6f num_tasks=%d episodes_per_task=%d',
+                    '=== EVAL START epoch=%d num_tasks=%d episodes_per_task=%d ===',
                     epoch,
-                    metrics.get('eval/success_rate_mean', float('nan')),
-                    int(metrics.get('eval/num_tasks', 0.0)),
-                    int(metrics.get('eval/episodes_per_task', 0.0)),
+                    num_tasks,
+                    episodes_per_task,
                 )
+                run_logger.info('[IDM POLICY]')
+                run_logger.info(
+                    'idm success_rate_mean=%.2f',
+                    metrics.get('eval_idm/success_rate_mean', float('nan')),
+                )
+                for task_id in eval_task_ids:
+                    task_key = f'eval_idm/task_{task_id}/success_rate'
+                    if task_key in metrics:
+                        run_logger.info('idm task_%d=%.2f', task_id, metrics[task_key])
+                if actor_agent is not None:
+                    run_logger.info('[ACTOR POLICY]')
+                    run_logger.info(
+                        'actor success_rate_mean=%.2f',
+                        metrics.get('eval/success_rate_mean', float('nan')),
+                    )
+                    for task_id in eval_task_ids:
+                        task_key = f'eval/task_{task_id}/success_rate'
+                        if task_key in metrics:
+                            run_logger.info('actor task_%d=%.2f', task_id, metrics[task_key])
                 run_logger.info('=== EVAL END epoch=%d ===', epoch)
 
         if epoch % FLAGS.save_every_n_epochs == 0:

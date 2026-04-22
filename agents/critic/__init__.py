@@ -145,6 +145,7 @@ def get_config():
             spi_actor_layer_norm=True,
             spi_eval_use_actor=False,
             spi_dist_normalize_by_dim=True,
+            spi_q_norm_eps=1e-6,
             spi_warmstart_steps=0,
             action_dim=2,
             value_p_curgoal=0.2,

@@ -94,10 +94,7 @@ flags.DEFINE_string('eval_goal_dims', '0,1', 'Comma-separated observation dims u
 _SPI_ACTOR_KEYS = {
     'spi_tau',
     'spi_beta',
-    'spi_num_samples',
-    'spi_candidate_source',
     'spi_actor_layer_norm',
-    'spi_eval_use_actor',
     'spi_q_norm_eps',
 }
 
@@ -456,7 +453,8 @@ def _prepare_joint_configs(goub_updates: dict, critic_updates: dict, actor_updat
     actor_config = _merge_actor_updates(get_actor_config(), actor_updates)
     goub_config, critic_config = _apply_joint_horizon(goub_config, critic_config)
     actor_config['actor_chunk_horizon'] = int(critic_config['action_chunk_horizon'])
-    goub_config['subgoal_value_mode'] = 'dqc'
+    # Subgoal-value bonus net shares parameters with the critic value net, so its
+    # architecture must mirror the critic; force-sync here so users only configure it once.
     goub_config['subgoal_value_hidden_dims'] = tuple(int(x) for x in critic_config['value_hidden_dims'])
     goub_config['subgoal_value_layer_norm'] = bool(critic_config['layer_norm'])
     validate_joint_mode(critic_config, actor_config)

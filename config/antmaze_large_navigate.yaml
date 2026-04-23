@@ -13,7 +13,7 @@ use_tqdm: false
 
 batch_size: 1024
 joint_horizon: 25
-plan_candidates: 8
+plan_candidates: 1
 # Used only when plan_candidates > 1.
 plan_noise_scale: 0.01
 measure_timing: false

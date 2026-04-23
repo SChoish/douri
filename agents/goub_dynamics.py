@@ -164,10 +164,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             'phase1/xN_minus_1_norm': xNm1_norm,
             'phase1/bridge_step_mean': n.astype(jnp.float32).mean(),
         }
-        if train_sg and sg_w > 0.0:
-            info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg, axis=-1).mean()
-        else:
-            info['phase1/subgoal_pred_norm'] = jnp.array(0.0)
+        info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
         return loss, info
 
@@ -488,12 +485,9 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         critic_value_params: Any | None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         alpha = float(self.config.get('subgoal_value_alpha', 0.0))
-        mode = str(self.config.get('subgoal_value_mode', 'none')).lower()
         zeros = jnp.zeros((pred_subgoals.shape[0],), dtype=jnp.float32)
-        if alpha <= 0.0 or critic_value_params is None or mode == 'none':
+        if alpha <= 0.0 or critic_value_params is None:
             return zeros, zeros
-        if mode != 'dqc':
-            raise ValueError(f'Unsupported subgoal_value_mode={mode!r}.')
 
         value_def = ScalarValueNet(
             tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
@@ -614,10 +608,7 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
             'phase1/xN_minus_1_norm': xNm1_norm,
             'phase1/bridge_step_mean': n.astype(jnp.float32).mean(),
         }
-        if train_sg and sg_w > 0.0:
-            info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
-        else:
-            info['phase1/subgoal_pred_norm'] = jnp.array(0.0)
+        info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
 
         return loss, info
@@ -639,11 +630,9 @@ def _get_common_config():
             layer_norm=True,
             subgoal_loss_weight=1.0,
             subgoal_value_alpha=0.1,
-            subgoal_value_mode='none',
             subgoal_value_hidden_dims=(512, 512, 512),
             subgoal_value_layer_norm=True,
             subgoal_hidden_dims=(512, 512, 512),
-            dataset_class='PathHGCDataset',
             discount=0.99,
             subgoal_steps=25,
             idm_loss_weight=1.0,
@@ -659,7 +648,6 @@ def _get_common_config():
             gc_negative=True,
             p_aug=0.0,
             frame_stack=ml_collections.config_dict.placeholder(int),
-            encoder=ml_collections.config_dict.placeholder(str),
         )
     )
 

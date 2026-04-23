@@ -1,0 +1,40 @@
+# Joint GOUB + critic + separated actor offline training.
+
+env_name: antmaze-medium-navigate-v0
+seed: 0
+run_group: antmaze_navigate
+
+train_epochs: 200
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+
+use_wandb: false
+use_tqdm: false
+
+batch_size: 1024
+joint_horizon: 25
+plan_candidates: 8
+# Used only when plan_candidates > 1.
+plan_noise_scale: 0.01
+measure_timing: false
+eval_freq: 100
+eval_task_ids: "1,2,3,4,5"
+eval_episodes_per_task: 5
+eval_max_chunks: 200
+eval_goal_tol: 0.5
+eval_goal_dims: "0,1"
+
+# Only fields that override defaults from agents/goub_dynamics.get_dynamics_config()
+# and agents/critic.get_config(). Everything else uses the agent defaults.
+goub:
+  rollout_loss_weight: 1.0      # default 0.25
+  value_geom_sample: false      # default true; align with DQC-style relabeling
+
+critic_agent:
+  action_chunk_horizon: 5       # default 10
+
+actor:
+  # SPI actor overrides over agents/actor.get_actor_config().
+  spi_tau: 1.0
+  spi_beta: 1.0
+  spi_actor_layer_norm: true

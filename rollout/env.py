@@ -23,7 +23,7 @@ def configure_mujoco_gl(mujoco_gl: str) -> None:
     elif not (os.environ.get('DISPLAY') or '').strip():
         os.environ.setdefault('MUJOCO_GL', 'egl')
 
-from utils.maze_navigator import MazeNavigatorMap
+from rollout.maze_navigator import MazeNavigatorMap
 
 
 def sync_env_state_from_obs_vector(env, obs: np.ndarray, goal_obs: np.ndarray) -> np.ndarray:

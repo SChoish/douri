@@ -10,19 +10,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from agents.critic import get_config as get_critic_config, get_critic_class, normalize_critic_name
-from rollout_subgoal_goub import _list_checkpoint_suffixes, _load_checkpoint_pkl
+from agents.critic import DQCCriticAgent, get_config as get_critic_config
 from utils.datasets import Dataset
 from utils.dqc_sequence_dataset import DQCActionSeqDataset
-
-
-def resolve_critic_checkpoint_dir(run_dir: Path) -> Path:
-    d = run_dir / 'checkpoints' / 'critic'
-    if not d.is_dir():
-        raise FileNotFoundError(f'Missing critic checkpoints directory: {d}')
-    if not _list_checkpoint_suffixes(d):
-        raise FileNotFoundError(f'No params_*.pkl under {d}')
-    return d
+from utils.run_io import (
+    list_checkpoint_suffixes,
+    load_checkpoint_pkl,
+    pick_epoch,
+    resolve_critic_checkpoint_dir,
+)
 
 
 def load_dqc_critic_joint_run(
@@ -39,9 +35,6 @@ def load_dqc_critic_joint_run(
         raise FileNotFoundError(f'Missing {flags_path}')
     with open(flags_path, 'r', encoding='utf-8') as f:
         root = json.load(f)
-    critic_key = normalize_critic_name(root.get('flags', {}).get('critic', 'dqc'))
-    if critic_key != 'dqc':
-        raise NotImplementedError(f'Value heatmap supports critic=dqc only (got {critic_key!r}).')
     ca = root.get('critic_agent')
     if not isinstance(ca, dict):
         raise KeyError('flags.json must contain critic_agent for joint runs.')
@@ -56,8 +49,7 @@ def load_dqc_critic_joint_run(
         raise ValueError('DQCActionSeqDataset has no valid starts.')
     idx0 = int(cds.valid_starts[0])
     ex = cds.sample(1, idxs=np.asarray([idx0], dtype=np.int64), evaluation=True)
-    critic_cls = get_critic_class('dqc')
-    agent = critic_cls.create(
+    agent = DQCCriticAgent.create(
         int(seed),
         ex['observations'],
         ex['full_chunk_actions'],
@@ -66,13 +58,9 @@ def load_dqc_critic_joint_run(
         ex_goals=ex.get('value_goals'),
     )
     ckpt_dir = resolve_critic_checkpoint_dir(run_dir)
-    suf = _list_checkpoint_suffixes(ckpt_dir)
-    if critic_epoch not in suf:
-        nearest = min(suf, key=lambda x: abs(x - critic_epoch))
-        print(f'Warning: critic checkpoint {critic_epoch} not found; using {nearest}')
-        critic_epoch = nearest
+    critic_epoch = pick_epoch(int(critic_epoch), list_checkpoint_suffixes(ckpt_dir), label='critic checkpoint')
     pkl_path = ckpt_dir / f'params_{critic_epoch}.pkl'
-    return _load_checkpoint_pkl(agent, pkl_path)
+    return load_checkpoint_pkl(agent, pkl_path)
 
 
 def dqc_value_mesh_for_xy(

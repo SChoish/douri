@@ -7,9 +7,11 @@ walkable cell so rollouts match the grid (use ``--navigator none`` for the raw n
 When ``--goal_tol > 0`` and the snap rollout never satisfies that goal tolerance, the script retries
 once with ``navigator`` disabled so a difficult maze layout can still be visualized (xy may cross walls).
 
-1. Pick one episode from the compact offline dataset (``terminals`` boundaries).
-2. Fix a high-level goal ``s_g`` (default: last state of that episode, i.e. terminal).
-3. Starting from ``s_0`` of the episode, repeat up to ``max_steps`` (optionally **early-stop**
+1. Pick one episode from the compact offline dataset (``terminals`` boundaries), or reset an
+   OGBench eval task via ``env.reset(options=dict(task_id=..., render_goal=False))``.
+2. Fix a high-level goal ``s_g`` (default: last state of that episode, or ``info['goal']`` from
+   eval reset).
+3. Starting from ``s_0`` of the episode/task reset, repeat up to ``max_steps`` (optionally **early-stop**
    when distance to ``s_g`` is at most ``--goal_tol`` (``<=``, inclusive); see ``--goal_stop``).
 
    Each **chunk**: ``predict_subgoal(s, s_g)`` once → one ``plan`` / ``sample_plan`` → append
@@ -23,8 +25,8 @@ once with ``navigator`` disabled so a difficult maze layout can still be visuali
 
 4. Plot dataset vs rollout in 2D; writes **PNG** and optional **matplotlib MP4** at ``--fps``.
 
-**Real env + IDM** rollouts live in ``rollout_idm_goub.py``. **Joint chunk actor** rollouts:
-``rollout_actor_goub.py``.
+**Real env + IDM** rollouts live in ``rollout/idm.py``. **Joint chunk actor** rollouts:
+``rollout/actor.py``.
 
 ``loss_sub_mean`` in training logs is the batch-mean of ``phase1/loss_subgoal``,
 i.e. MSE between ``subgoal_net(s, g)`` and teacher ``high_actor_targets``,
@@ -33,7 +35,7 @@ averaged over an epoch (``training/phase1/loss_subgoal_epoch_mean``).
 Example::
 
     cd <douri repo root>
-    python rollout_subgoal_goub.py \\
+    python rollout/subgoal.py \\
         --run_dir=runs/20260416_235557_seed0_antmaze-large-navigate-v0 \\
         --checkpoint_epoch=1000 \\
         --traj_idx=0 \\
@@ -51,107 +53,36 @@ Writes ``rollout_plot.png`` and ``rollout_plot.mp4`` (unless ``--no_mp4``).
 from __future__ import annotations
 
 import argparse
-import json
-import pickle
-import re
 from pathlib import Path
 
-import flax
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import numpy as np
-from ml_collections import ConfigDict
 
-from agents.goub_dynamics import GOUBDynamicsAgent, get_dynamics_config
+from agents.goub_dynamics import GOUBDynamicsAgent
 from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
-from utils.flax_utils import merge_checkpoint_state_dict
-from utils.goub_rollout_env import format_maze_navigator_log, load_maze_navigator_snap, make_xy_clamper
-from utils.goub_rollout_plot import (
+from rollout.env import format_maze_navigator_log, load_maze_navigator_snap, make_xy_clamper
+from rollout.plot import (
     axis_limits,
     draw_dataset_background,
     maze_navigator_for_xy_plot,
     plot_maze_cell_tiles,
     write_rollout_mp4,
 )
-from utils.maze_navigator import MazeNavigatorMap
-
-
-def _load_checkpoint_pkl(agent, pkl_path: Path):
-    with open(pkl_path, 'rb') as f:
-        load_dict = pickle.load(f)
-    template = flax.serialization.to_state_dict(agent)
-    merged = merge_checkpoint_state_dict(template, load_dict['agent'])
-    return flax.serialization.from_state_dict(agent, merged)
-
-
-def _list_checkpoint_suffixes(checkpoints_dir: Path) -> list[int]:
-    """Integers ``n`` such that ``params_<n>.pkl`` exists (training epoch, or legacy global_step)."""
-    out = []
-    for p in checkpoints_dir.glob('params_*.pkl'):
-        m = re.search(r'params_(\d+)\.pkl$', p.name)
-        if m:
-            out.append(int(m.group(1)))
-    return sorted(out)
-
-
-def _resolve_goub_checkpoint_dir(run_dir: Path) -> Path:
-    """Return directory containing ``params_*.pkl`` for GOUB (joint runs use ``checkpoints/goub/``)."""
-    base = run_dir / 'checkpoints'
-    if not base.is_dir():
-        raise FileNotFoundError(f'No checkpoints/ under {run_dir}')
-    if _list_checkpoint_suffixes(base):
-        return base
-    nested = base / 'goub'
-    if nested.is_dir() and _list_checkpoint_suffixes(nested):
-        return nested
-    raise FileNotFoundError(
-        f'No params_*.pkl under {base} or {nested} (expected GOUB checkpoints for rollout).'
-    )
-
-
-def _load_run_flags(run_dir: Path) -> tuple[ConfigDict, str]:
-    """Return ``(merged agent config, env_name)`` from ``flags.json``."""
-    flags_path = run_dir / 'flags.json'
-    if not flags_path.is_file():
-        raise FileNotFoundError(f'Missing flags.json under {run_dir}')
-    with open(flags_path, 'r', encoding='utf-8') as f:
-        flags = json.load(f)
-    env_name = flags.get('env_name')
-    if not env_name and isinstance(flags.get('flags'), dict):
-        env_name = flags['flags'].get('env_name')
-    if not env_name:
-        raise KeyError('flags.json must contain env_name (top-level or flags.env_name)')
-    cfg = get_dynamics_config()
-    agent_updates = flags.get('agent')
-    if agent_updates:
-        for k, v in agent_updates.items():
-            cfg[k] = v
-    elif isinstance(flags.get('goub'), dict):
-        for k, v in flags['goub'].items():
-            cfg[k] = v
-    return cfg, env_name
-
-
-def _episode_slices(terminals: np.ndarray) -> list[tuple[int, int]]:
-    """Return (start, end) inclusive indices for each episode."""
-    terminals = np.asarray(terminals).reshape(-1)
-    ends = np.nonzero(terminals > 0)[0]
-    if len(ends) == 0:
-        raise ValueError('No terminal flags found; cannot split episodes.')
-    starts = np.concatenate([[0], ends[:-1] + 1])
-    return [(int(s), int(e)) for s, e in zip(starts, ends)]
-
-
-def _get_trajectory(dataset: Dataset, traj_idx: int) -> np.ndarray:
-    obs = np.asarray(dataset['observations'])
-    terms = np.asarray(dataset['terminals'])
-    slices = _episode_slices(terms)
-    if traj_idx < 0 or traj_idx >= len(slices):
-        raise IndexError(f'traj_idx={traj_idx} out of range [0, {len(slices) - 1}]')
-    s, e = slices[traj_idx]
-    return obs[s : e + 1].copy()
+from rollout.maze_navigator import MazeNavigatorMap
+from utils.run_io import (
+    get_trajectory,
+    goal_distance,
+    goal_within_tol,
+    list_checkpoint_suffixes,
+    load_checkpoint_pkl,
+    load_run_flags,
+    pick_epoch,
+    resolve_goub_checkpoint_dir,
+)
 
 
 def _sample_segment_start_k(traj_len: int, k: int, rng: np.random.Generator) -> int:
@@ -183,20 +114,43 @@ def _segment_alignment_errors(
     }
 
 
-def _goal_distance(s: np.ndarray, g: np.ndarray, stop_dims: tuple[int, ...] | None) -> float:
-    if stop_dims:
-        idx = np.asarray(stop_dims, dtype=np.int32)
-        return float(np.linalg.norm(s[idx] - g[idx]))
-    return float(np.linalg.norm(s - g))
-
-
-def _goal_within_tol(
-    s: np.ndarray, g: np.ndarray, stop_dims: tuple[int, ...] | None, goal_tol: float
-) -> bool:
-    """``goal_tol > 0``일 때만 사용. 거리가 ``goal_tol`` 이하(포함, ``<=``)이면 도달로 본다."""
-    if goal_tol is None or float(goal_tol) <= 0.0:
-        return False
-    return _goal_distance(s, g, stop_dims) <= float(goal_tol)
+def _draw_value_heatmap(
+    ax,
+    value_heatmap: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    value_heatmap_vmin: float | None,
+    value_heatmap_vmax: float | None,
+    *,
+    value_heatmap_alpha: float = 0.5,
+) -> None:
+    if value_heatmap is None:
+        return
+    XX, YY, ZZ = value_heatmap
+    zz_plot = np.asarray(ZZ, dtype=np.float32)
+    finite = zz_plot[np.isfinite(zz_plot)]
+    heat_norm = None
+    if finite.size > 0:
+        pos = finite[finite > 0.0]
+        if pos.size > 0:
+            log_floor = max(float(np.min(pos)), 1e-6)
+            if value_heatmap_vmin is not None:
+                log_floor = max(log_floor, float(value_heatmap_vmin), 1e-6)
+            log_ceil = float(np.max(finite))
+            if value_heatmap_vmax is not None:
+                log_ceil = min(log_ceil, float(value_heatmap_vmax))
+            log_ceil = max(log_ceil, log_floor * 1.001)
+            zz_plot = np.maximum(zz_plot, log_floor)
+            heat_norm = mcolors.LogNorm(vmin=log_floor, vmax=log_ceil)
+    ax.pcolormesh(
+        XX,
+        YY,
+        zz_plot,
+        shading='auto',
+        cmap='magma',
+        alpha=float(value_heatmap_alpha),
+        norm=heat_norm,
+        zorder=1,
+        rasterized=True,
+    )
 
 
 def bridge_trajectory(
@@ -233,7 +187,7 @@ def bridge_trajectory(
     return resampled
 
 
-def rollout_subgoal_goub(
+def rollout_subgoal(
     agent: GOUBDynamicsAgent,
     s0: np.ndarray,
     s_g: np.ndarray,
@@ -288,7 +242,7 @@ def rollout_subgoal_goub(
 
     sch = max(1, int(action_chunk_horizon))
 
-    if _goal_within_tol(s0f, g_np, goal_stop_dims, float(goal_tol)):
+    if goal_within_tol(s0f, g_np, goal_stop_dims, float(goal_tol)):
         roll = np.stack(states, axis=0)
         hats = np.zeros((0, d), dtype=np.float32)
         return roll, hats, 0, True
@@ -322,7 +276,7 @@ def rollout_subgoal_goub(
             states.append(sn)
             total += 1
             s = jnp.asarray(sn, dtype=jnp.float32)
-            if _goal_within_tol(sn, g_np, goal_stop_dims, float(goal_tol)):
+            if goal_within_tol(sn, g_np, goal_stop_dims, float(goal_tol)):
                 roll = np.stack(states, axis=0)
                 hats = np.stack(hats_list, axis=0) if hats_list else np.zeros((0, d), dtype=np.float32)
                 return roll, hats, total, True
@@ -347,7 +301,13 @@ def main():
         default=None,
         help=argparse.SUPPRESS,
     )
-    p.add_argument('--traj_idx', type=int, default=0, help='Which offline episode index to compare against.')
+    p.add_argument('--traj_idx', type=int, default=0, help='Offline episode index when --task_id=0.')
+    p.add_argument(
+        '--task_id',
+        type=int,
+        default=0,
+        help='OGBench eval task id [1..num_tasks]; 0 uses offline traj start/goal.',
+    )
     p.add_argument(
         '--action_chunk_horizon',
         type=int,
@@ -380,10 +340,18 @@ def main():
     )
     p.add_argument('--plot_dim0', type=int, default=0, help='Observation index for x-axis.')
     p.add_argument('--plot_dim1', type=int, default=1, help='Observation index for y-axis.')
-    p.add_argument('--out_path', type=str, default='rollout_subgoal_goub.png', help='Output PNG path.')
+    p.add_argument('--out_path', type=str, default='rollout_subgoal.png', help='Output PNG path.')
     p.add_argument('--out_mp4', type=str, default='', help='Output MP4 path (default: same stem as --out_path).')
     p.add_argument('--fps', type=float, default=60.0, help='MP4 frame rate.')
     p.add_argument('--no_mp4', action='store_true', help='Skip MP4; write PNG only.')
+    p.add_argument(
+        '--value_heatmap',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Overlay DQC scalar value V(s, goal) on the plot.',
+    )
+    p.add_argument('--value_grid_n', type=int, default=56)
+    p.add_argument('--critic_epoch', type=int, default=-1, help='Critic checkpoint suffix; -1 = GOUB epoch used.')
     p.add_argument(
         '--navigator',
         type=str,
@@ -498,6 +466,8 @@ def main():
 
     if args.segment_compare and args.sample_seeds:
         p.error('--sample_seeds cannot be used with --segment_compare')
+    if int(args.task_id) != 0 and args.segment_compare:
+        p.error('--segment_compare requires offline trajectory mode (--task_id=0).')
     if int(args.action_chunk_horizon) < 0:
         p.error('--action_chunk_horizon must be >= 0 (0 = use goub_N)')
     if args.sample_overlay and not args.sample_seeds:
@@ -512,19 +482,11 @@ def main():
         ckpt_epoch = int(args.checkpoint_epoch)
 
     run_dir = Path(args.run_dir).resolve()
-    ckpt_dir = _resolve_goub_checkpoint_dir(run_dir)
+    ckpt_dir = resolve_goub_checkpoint_dir(run_dir)
+    suffixes = list_checkpoint_suffixes(ckpt_dir)
+    ckpt_epoch = pick_epoch(int(ckpt_epoch), suffixes)
 
-    suffixes = _list_checkpoint_suffixes(ckpt_dir)
-    if not suffixes:
-        raise FileNotFoundError(f'No params_*.pkl in {ckpt_dir}')
-    if ckpt_epoch < 0:
-        ckpt_epoch = suffixes[-1]
-    if ckpt_epoch not in suffixes:
-        nearest = min(suffixes, key=lambda x: abs(x - ckpt_epoch))
-        print(f'Warning: checkpoint suffix {ckpt_epoch} not found; using nearest {nearest}')
-        ckpt_epoch = nearest
-
-    cfg, env_name = _load_run_flags(run_dir)
+    cfg, env_name = load_run_flags(run_dir)
 
     navigator: MazeNavigatorMap | None = None
     if args.navigator == 'snap':
@@ -534,11 +496,28 @@ def main():
             p.error(str(ex))
         print(format_maze_navigator_log(navigator, str(args.navigator_clamp), float(args.navigator_edge_inset)))
 
-    _, train_raw, _ = make_env_and_datasets(env_name, frame_stack=cfg.get('frame_stack'))
+    env, train_raw, _ = make_env_and_datasets(env_name, frame_stack=cfg.get('frame_stack'))
     dataset = Dataset.create(**train_raw)
 
-    traj = _get_trajectory(dataset, args.traj_idx)
-    data_len = int(len(traj))
+    tid = int(args.task_id)
+    if tid != 0:
+        u = env.unwrapped
+        n_tasks = int(getattr(u, 'num_tasks', 5))
+        if not (1 <= tid <= n_tasks):
+            p.error(f'--task_id must be in [1, {n_tasks}] for {env_name!r} (got {tid})')
+        ob, info = env.reset(options=dict(task_id=tid, render_goal=False))
+        if 'goal' not in info:
+            raise RuntimeError(f'{env_name!r} reset(task_id=...) did not set info["goal"].')
+        s0_task = np.asarray(ob, dtype=np.float32).reshape(-1)
+        sg_task = np.asarray(info['goal'], dtype=np.float32).reshape(-1)
+        traj = np.stack([s0_task, sg_task], axis=0)
+        data_len = int(len(traj))
+        source_label = f'task={tid}'
+        print(f'OGBench eval reset: task_id={tid}  obs_dim={s0_task.shape[-1]}  goal_dim={sg_task.shape[-1]}')
+    else:
+        traj = get_trajectory(dataset, args.traj_idx)
+        data_len = int(len(traj))
+        source_label = f'traj={args.traj_idx}  data_len={data_len}'
     segment_t: int | None = None
     seg: np.ndarray | None = None
     max_steps_eff = int(args.max_steps)
@@ -588,7 +567,7 @@ def main():
     pkl_path = ckpt_dir / f'params_{ckpt_epoch}.pkl'
     if not pkl_path.is_file():
         raise FileNotFoundError(f'Missing checkpoint: {pkl_path}')
-    agent = _load_checkpoint_pkl(agent, pkl_path)
+    agent = load_checkpoint_pkl(agent, pkl_path)
     print(f'Loaded {pkl_path}')
 
     goub_N = int(agent.config['goub_N'])
@@ -630,7 +609,7 @@ def main():
             else:
                 skw['stochastic'] = False
                 skw['plan_key'] = None
-            roll, hats, n_planner_steps, reached = rollout_subgoal_goub(
+            roll, hats, n_planner_steps, reached = rollout_subgoal(
                 agent,
                 s0,
                 s_g,
@@ -647,7 +626,7 @@ def main():
                     'retrying once without navigator (raw xy, may cross walls).'
                 )
                 nav_kw_raw = {**nav_kw, 'navigator': None}
-                roll, hats, n_planner_steps, reached = rollout_subgoal_goub(
+                roll, hats, n_planner_steps, reached = rollout_subgoal(
                     agent,
                     s0,
                     s_g,
@@ -678,6 +657,42 @@ def main():
             'rollout xy not clamped unless --navigator snap.'
         )
 
+    heat_mesh = None
+    heat_vmin = heat_vmax = None
+    if bool(args.value_heatmap):
+        from rollout.value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
+
+        ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(ckpt_epoch)
+        env_heat, _, _ = make_env_and_datasets(env_name, frame_stack=cfg.get('frame_stack'))
+        critic_agent = load_dqc_critic_joint_run(
+            run_dir,
+            ce,
+            env_heat,
+            train_raw,
+            seed=int(args.seed),
+        )
+        print(f'Loaded critic for value heatmap (epoch suffix {ce})')
+        heat_roll = np.concatenate([r[0] for r in rollouts], axis=0) if rollouts else traj
+        heat_hats_pieces = [r[1] for r in rollouts if r[1].size > 0]
+        heat_hats = (
+            np.concatenate(heat_hats_pieces, axis=0)
+            if heat_hats_pieces
+            else np.zeros((0, heat_roll.shape[-1]), dtype=np.float32)
+        )
+        xlim_heat, ylim_heat = axis_limits(traj, heat_roll, heat_hats, d0, d1, s_g, s0, navigator=plot_nav, seg=seg)
+        tpl = np.asarray(s0, dtype=np.float32).reshape(-1)
+        XX, YY, ZZ, heat_vmin, heat_vmax = dqc_value_mesh_for_xy(
+            critic_agent,
+            tpl,
+            np.asarray(s_g, dtype=np.float32).reshape(-1),
+            int(d0),
+            int(d1),
+            xlim_heat,
+            ylim_heat,
+            grid_n=int(args.value_grid_n),
+        )
+        heat_mesh = (XX, YY, ZZ)
+
     if args.sample_overlay:
         roll_union = np.concatenate([r[0] for r in rollouts], axis=0)
         hat_pieces = [r[1] for r in rollouts if r[1].size > 0]
@@ -688,6 +703,7 @@ def main():
         )
         xlim, ylim = axis_limits(traj, roll_union, hats_union, d0, d1, s_g, s0, navigator=plot_nav, seg=seg)
         fig, ax = plt.subplots(figsize=(8, 6.5))
+        _draw_value_heatmap(ax, heat_mesh, heat_vmin, heat_vmax)
         plot_maze_cell_tiles(ax, plot_nav, d0, d1)
         draw_dataset_background(ax, traj, d0, d1)
         colors = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
@@ -697,7 +713,7 @@ def main():
         ]
         for idx, (roll, _hats, n_ps, reached, plan_seed, _stoch) in enumerate(rollouts):
             c = colors[idx % len(colors)]
-            fd = _goal_distance(
+            fd = goal_distance(
                 np.asarray(roll[-1], dtype=np.float32),
                 np.asarray(s_g, dtype=np.float32),
                 stop_dims,
@@ -763,7 +779,7 @@ def main():
         ax.set_xlabel(f'obs dim {d0}')
         ax.set_ylabel(f'obs dim {d1}')
         ax.set_title(
-            f'epoch={ckpt_epoch}  traj={args.traj_idx}  data_len={data_len}  state rollout  overlay  tol={tol:g}',
+            f'epoch={ckpt_epoch}  {source_label}  state rollout  overlay  tol={tol:g}',
             fontsize=10,
         )
         ax.text(
@@ -790,7 +806,7 @@ def main():
     else:
         for roll, hats, n_planner_steps, reached, plan_seed, stochastic_run in rollouts:
             n_trans = max(0, int(roll.shape[0]) - 1)
-            final_dist = _goal_distance(
+            final_dist = goal_distance(
                 np.asarray(roll[-1], dtype=np.float32),
                 np.asarray(s_g, dtype=np.float32),
                 stop_dims,
@@ -816,6 +832,7 @@ def main():
                 )
 
             fig, ax = plt.subplots(figsize=(7, 6))
+            _draw_value_heatmap(ax, heat_mesh, heat_vmin, heat_vmax)
             plot_maze_cell_tiles(ax, plot_nav, d0, d1)
             draw_dataset_background(ax, traj, d0, d1)
             if args.segment_compare and seg is not None:
@@ -871,12 +888,12 @@ def main():
                 _k = int(seg.shape[0])
                 if seg_mode == 'bridge':
                     title = (
-                        f'epoch={ckpt_epoch}  traj={args.traj_idx}  data_len={data_len}  true vs h-transform bridge  '
+                        f'epoch={ckpt_epoch}  {source_label}  true vs h-transform bridge  '
                         f'k={_k}, t={segment_t}..{segment_t + _k - 1}  (N={goub_N}→resample→{_k})'
                     )
                 else:
                     title = (
-                        f'epoch={ckpt_epoch}  traj={args.traj_idx}  data_len={data_len}  true vs state rollout  '
+                        f'epoch={ckpt_epoch}  {source_label}  true vs state rollout  '
                         f'k={_k}, t={segment_t}..{segment_t + _k - 1}, '
                         f'K={iter_state_chunk_h} from plan traj. / chunk'
                     )
@@ -887,13 +904,13 @@ def main():
                     reach_txt = f'not reached (dist={final_dist:.3f})'
                 metric = args.goal_stop
                 title = (
-                    f'epoch={ckpt_epoch}  traj={args.traj_idx}  data_len={data_len}  '
+                    f'epoch={ckpt_epoch}  {source_label}  '
                     f'planner steps={n_planner_steps}/{max_steps_eff} ({reach_txt}, {metric}, tol={tol:g})'
                     + (f'  sample_plan seed={plan_seed}' if stochastic_run and plan_seed is not None else '')
                 )
             else:
                 title = (
-                    f'epoch={ckpt_epoch}  traj={args.traj_idx}  data_len={data_len}  planner steps={n_planner_steps} (no early stop)'
+                    f'epoch={ckpt_epoch}  {source_label}  planner steps={n_planner_steps} (no early stop)'
                     + (f'  sample_plan seed={plan_seed}' if stochastic_run and plan_seed is not None else '')
                 )
             ax.set_title(title, fontsize=10)
@@ -958,7 +975,7 @@ def main():
     
             if (not args.no_mp4) and len(rollouts) == 1:
                 mp4_out = Path(args.out_mp4.strip()) if args.out_mp4.strip() else out.with_suffix('.mp4')
-                title_prefix = f'epoch={ckpt_epoch} traj={args.traj_idx} data_len={data_len}'
+                title_prefix = f'epoch={ckpt_epoch} {source_label}'
                 if args.segment_compare and segment_t is not None:
                     title_prefix += f' seg_t={segment_t}'
                 try:

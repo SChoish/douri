@@ -1,190 +1,222 @@
 # douri 프로젝트 구조 및 GOUB 실험 가이드
 
-이 저장소는 OGBench 기반 오프라인 실험 코드를 모아 둔 작업 디렉터리입니다. 현재 기준으로는 GOUB 계열 학습 경로가 가장 정리되어 있고, DQC / DEAS 계열 엔트리포인트도 함께 들어 있습니다.
+OGBench 기반 오프라인 실험 코드 모음입니다. 현재 메인 경로는 **GOUB dynamics + DQC critic + SPI actor**의 joint 학습이며, 본 문서는 그 기준으로 정리되어 있습니다.
 
-GOUB 구현은 특정 논문을 그대로 복제한 버전이라기보다, `utils/goub.py`와 `agents/goub_dynamics.py`에서 브리지 스케줄과 경계 \(n=N\) 처리를 실험 목적에 맞게 단순화한 변형입니다. 실험 비교 시 이 점을 전제로 보는 편이 안전합니다.
+GOUB 구현은 특정 논문을 그대로 복제한 버전이 아니라, `utils/goub.py`와 `agents/goub_dynamics.py`에서 브리지 스케줄과 경계 \(n=N\) 처리를 실험 목적에 맞게 단순화한 변형입니다. 비교 시 이 점을 전제로 보세요.
 
 ## 프로젝트 구조 한눈에
 
-작업 디렉터리는 항상 저장소 루트(`douri`)를 기준으로 사용하고, 실행 전 `PYTHONPATH=.` 를 설정하는 방식입니다.
+작업 디렉터리는 항상 저장소 루트(`douri`)이며, 실행 전 `PYTHONPATH=.`을 설정합니다.
 
 | 경로 | 역할 |
 |------|------|
-| `agents/` | Flax/JAX 에이전트 정의. GOUB, DQC, critic 계열 구현 |
-| `config/` | 실험별 YAML 설정 파일 |
-| `utils/` | 데이터셋, 환경 로더, 네트워크, 로깅, GOUB 수학 헬퍼 |
-| `docs/` | 구조 리뷰, 설계 메모 |
-| `main.py` | 단일 학습 엔트리포인트 (joint) |
-| `rollout_*.py` | 체크포인트 기반 평가/시각화 |
-| `smoke_test_goub.py` | GOUB 관련 빠른 검증 스크립트 |
+| `agents/` | Flax/JAX 에이전트 정의 (GOUB dynamics, DQC critic, SPI actor) |
+| `config/` | 실험별 YAML 설정 |
+| `utils/` | 데이터셋, 환경 로더, 네트워크, 로깅, GOUB 수학 헬퍼, 공용 run/checkpoint I/O |
+| `rollout/` | 체크포인트 기반 평가/시각화 패키지 (`subgoal`, `idm`, `actor` CLI + 공용 env/plot/value-field 헬퍼) |
+| `main.py` | joint 학습 단일 엔트리포인트 |
+| `eval_joint_checkpoint.py` | 학습된 체크포인트 평가 |
 
-### 학습 엔트리포인트
-
-| 파일 | 역할 |
-|------|------|
-| `main.py` | 단일 실행 경로. `--critic=dqc|deas` 선택 지원 |
-
-## GOUB 관련 코드 위치
-
-현재 기준으로 GOUB 구현의 핵심은 아래 파일에 모여 있습니다.
+### GOUB 핵심 구현 위치
 
 | 경로 | 역할 |
 |------|------|
 | `utils/goub.py` | `bridge_sample`, `posterior_mean`, `model_mean` 등 GOUB 수학 헬퍼 |
-| `agents/goub_dynamics.py` | `GOUBDynamicsAgent`와 GOUB planner 공통 로직을 담은 source of truth |
-| `agents/critic/` | DEAS / DQC critic 구현과 joint actor 모듈 |
+| `agents/goub_dynamics.py` | `GOUBDynamicsAgent` source of truth (loss, planning, IDM head 포함) |
+| `agents/critic.py` | DQC critic 구현 (chunk + partial critic, expectile/quantile backup) + 네트워크/헬퍼/기본 config |
+| `agents/actor.py` | `JointActorAgent` (SPI W₂² proximal actor) |
 | `main.py` | joint 학습 공식 엔트리포인트 |
-| `config/joint_train_antmaze.yaml` | 단일 엔트리포인트 기본 설정 |
-| `rollout_subgoal_goub.py` | 상태 기반 서브골 롤아웃 시각화 |
-| `rollout_idm_goub.py` | IDM 기반 롤아웃 평가 |
-| `smoke_test_goub.py` | GOUB dynamics 스모크 테스트 |
 
-학습 경로는 이제 `main.py` 단일 엔트리포인트 기준으로 사용합니다.
+## 설정 파일
+
+YAML은 **에이전트 default 위에 덮어쓰는 override만** 적는 슬림 구조입니다. 기본값은 다음 두 곳에서 옵니다.
+
+- `agents/goub_dynamics.get_dynamics_config()`
+- `agents/critic.get_config()` (DQC critic) / `agents/actor.get_actor_config()` (SPI actor)
+
+대표 설정:
+
+| 파일 | 환경 |
+|------|------|
+| `config/antmaze_large_navigate.yaml` | `antmaze-large-navigate-v0` |
+| `config/antmaze_medium_navigate.yaml` | `antmaze-medium-navigate-v0` |
+
+YAML top-level에서 자주 만지는 값:
+- `train_epochs`, `eval_freq`, `eval_max_chunks`, `eval_task_ids`
+- `batch_size`, `joint_horizon` (= `goub_N` = `subgoal_steps` = `full_chunk_horizon`)
+- `plan_candidates`, `plan_noise_scale` (`plan_candidates > 1`이면 stochastic GOUB sampling)
 
 ## 학습 실행
 
-### 단일 실행
-
 ```bash
 cd /path/to/douri
 export PYTHONPATH=.
-python main.py --critic=dqc
+python main.py --run_config=config/antmaze_large_navigate.yaml
 ```
 
-기본 YAML은 `config/joint_train_antmaze.yaml`이며, critic 선택은 top-level `critic: dqc | deas` 또는 CLI `--critic=...`로 제어합니다.
+`env_name`, `seed`, `train_epochs` 등은 YAML이나 CLI flag로 override할 수 있습니다.
+
+### resume
+
+```bash
+python main.py \
+  --run_config=config/antmaze_large_navigate.yaml \
+  --resume_run_dir=runs/<기존_run_dir> \
+  --resume_epoch=200
+```
+
+resume 시에는 `run_resume_from<E>_<ts>.log`라는 별도 로그 파일이 새로 생성됩니다.
 
 ### critic / actor 구조
 
-- `main.py` 는 GOUB + critic + separated actor 단일 경로입니다.
-  - `--critic=deas` -> GOUB + DEAS critic(critic-only)
-  - `--critic=dqc` -> GOUB + DQC critic + SPI actor
-- joint actor는 `agents/critic/actor.py`의 `JointActorAgent`가 담당합니다. 즉 joint에서는 critic과 actor가 항상 서로 다른 state / checkpoint 경계를 가집니다.
-- DQC joint actor는 GOUB가 만든 후보 chunk를 DQC critic으로 랭킹하고 학습합니다.
-- actor 사용 여부는 `config/joint_train_antmaze.yaml`의 `actor.use_spi_actor` 또는 CLI override로 제어합니다.
+- critic은 **DQC 단일**입니다. critic을 고르는 옵션(`--critic`, YAML `critic:`)은 더 이상 존재하지 않으며, `agents/critic`은 DQC를 직접 노출합니다.
+- SPI actor는 **항상 함께 학습**됩니다(끄는 옵션은 더 이상 없음). actor는 GOUB가 만든 후보 chunk를 DQC critic으로 랭킹해서 학습됩니다.
+- critic / actor / goub은 각자 별도 state·체크포인트를 가집니다.
+
+### SPI actor 손실 (참고)
+
+GOUB가 만든 후보 chunk `μ_k`(`proposal_partial_chunks`)와 critic 점수 `s_k = Q(s, g, μ_k)`로
+SPI target 분포 `ρ_k = softmax(β · s_k)`를 만들고, actor `π(s, g)`(Dirac)에 대해 **W₂² proximal**을 적용합니다.
+
+```
+ρ_k    = softmax(spi_beta · score_k)
+prox   = Σ_k ρ_k · ||π(s,g) - μ_k||²        # W₂²(δ_{π(s,g)}, Σ_k ρ_k δ_{μ_k})
+Q̂      = Q(s, g, π(s,g)) / (mean|Q| + eps)   # batch-mean Q normalize (TD3+BC식 분모)
+loss   = mean( -Q̂ + prox / (2 · spi_tau) )
+```
+
+- `prox`는 raw squared L2(차원 정규화 없음). actor 출력은 deterministic chunk이므로 Dirac → 이산 분포 W₂²의 closed form.
+- `spi_tau`로 W₂² 강도, `spi_beta`로 후보 softmax 온도, `spi_q_norm_eps`로 분모 안정화.
 
 ## 런 디렉터리 레이아웃
 
-실행 결과는 보통 다음 형태로 저장됩니다.
-
 ```text
-runs/<YYYYMMDD_HHMMSS>_joint_<critic>_seed<seed>_<env_name>/
+runs/<YYYYMMDD_HHMMSS>_joint_dqc_seed<seed>_<env_name>/
   config_used.yaml
   flags.json
   train.csv
-  run.log
+  run.log                       # 최초 run
+  run_resume_from<E>_<ts>.log   # resume마다 별도 파일
   checkpoints/
     goub/params_<epoch>.pkl
     critic/params_<epoch>.pkl
-    actor/params_<epoch>.pkl   # actor.use_spi_actor=true 일 때
+    actor/params_<epoch>.pkl
 ```
 
-- 에포크당 스텝 수는 `ceil(dataset_size / batch_size)` 입니다
-- `global_step`은 `epoch * steps_per_epoch` 기준 누적 업데이트 수입니다
-- 체크포인트 파일명 `params_<epoch>.pkl` 의 숫자는 optimizer step이 아니라 epoch 번호입니다
-- resume 시에는 `--resume_pkl` 과 `--resume_start_epoch` 를 함께 넘깁니다
+- 에포크당 스텝 수 = `ceil(dataset_size / batch_size)`.
+- `global_step = epoch * steps_per_epoch`.
+- 체크포인트 파일명의 숫자는 optimizer step이 아니라 **epoch 번호**입니다.
 
-## 손실과 로깅
+## 손실 / 로깅 요약
 
-GOUB는 기본적으로 아래 항을 함께 학습합니다.
+`GOUBDynamicsAgent.update`는 다음을 한 번에 갱신합니다.
 
-- GOUB 항: ε 네트워크에 대한 가중 L1 평균 매칭
-- 서브골 항: `subgoal_net(observations, high_actor_goals)` 와 `high_actor_targets` 사이 MSE
-- IDM 항: `idm_net(s_t, s_{t+1}) -> a_t` MSE, `agent.idm_loss_weight` 로 가중
-
-즉 한 번의 `agent.update(batch)` 안에서 GOUB, 서브골, IDM 헤드가 함께 갱신됩니다. 저장되는 `checkpoints/params_<epoch>.pkl` 안에도 IDM 관련 파라미터가 포함됩니다.
+- **GOUB 항**: ε 네트워크 가중 L1 매칭
+- **path 항**: step-aligned reverse-mean 손실
+- **rollout consistency 항**: short rollout 누적 오차
+- **subgoal 항**: `MSE(subgoal_net(s,g), target) − α·E[V(subgoal, g)]`
+- **IDM 항**: `idm_net(s_t, s_{t+1}) → a_t` MSE
 
 주요 로깅 키:
 
-- `phase1/loss`
-- `phase1/loss_goub`
-- `phase1/loss_subgoal`
-- `phase1/loss_idm`
-- `phase1/eps_norm`
-- `phase1/mu_true_norm`
-- `phase1/mu_pred_norm`
-- `phase1/xN_minus_1_norm`
+- `phase1/loss`, `phase1/loss_goub`, `phase1/loss_path_step`, `phase1/loss_roll`
+- `phase1/loss_subgoal`, `phase1/loss_idm`
+- `phase1/eps_norm`, `phase1/mu_true_norm`, `phase1/mu_pred_norm`, `phase1/xN_minus_1_norm`
+- `phase1/first_step_l1`, `phase1/first_step_xy_l2`, `phase1/roll_h_l1`
 
-에포크 집계 로그는 `train.csv`와 `run.log`, 필요 시 W&B에 함께 남습니다.
+DQC critic / SPI actor / coupling 관련:
 
-### dynamics 고유 항목
+- `action_critic/value_loss`, `action_critic/distill_loss`, `chunk_critic/critic_loss`
+- `spi_actor/actor_loss`, `spi_actor/q_mean`, `spi_actor/prox_mean`
+- `coupling/critic_score_*`: critic이 GOUB 후보 chunk에 매기는 평균 점수
 
-`GOUBDynamicsAgent`는 GOUB bridge 항 위에 아래 손실을 더합니다.
+에포크 집계는 `train.csv` / `run.log` (옵션으로 W&B)에 기록됩니다. eval 키는 `eval/...`(actor)와 `eval_idm/...`(IDM 폴백) 두 계열이 있습니다.
 
-- step-aligned path loss
-- short rollout consistency
+## 평가 / 롤아웃 스크립트
 
-추가 로깅 키 예시:
-
-- `phase1/loss_path_step`
-- `phase1/loss_roll`
-- `phase1/first_step_l1`
-- `phase1/first_step_xy_l2`
-- `phase1/roll_h_l1`
-
-## 추론 스택 개념
-
-학습 시 브리지의 깨끗한 끝점 \(x_0\) 은 배치의 `high_actor_targets` 입니다. 사용 시에는 보통 아래 흐름을 따릅니다.
-
-1. `predict_subgoal(s, g)` 로 현재 상태 `s` 와 상위 목표 `g` 에서 서브골을 추정합니다.
-2. `plan(s, hat_w)` 로 역방향 체인을 전개합니다.
-3. 이때 첫 역스텝 출력인 `next_step` 을 한 스텝 플래너 타깃처럼 사용할 수 있습니다.
-
-경계 \(n=N\) 에서는 `bridge_var[N]=0` 특이성을 피하기 위해 `agents/goub_dynamics.py` 에서 `x_T + epsilon` 형태의 경계 매개변수를 사용합니다.
-
-## 롤아웃과 보조 스크립트
-
-상태 롤아웃 시각화 예시는 다음과 같습니다.
+### 학습된 체크포인트 평가
 
 ```bash
-cd /path/to/douri
-export PYTHONPATH=.
-python rollout_subgoal_goub.py \
-  --run_dir=runs/<your_run_folder> \
-  --checkpoint_epoch=-1 \
-  --traj_idx=0 \
-  --max_steps=50 \
-  --out_path=rollout_plot.png
+python eval_joint_checkpoint.py \
+  --run_dir=runs/<run_dir> \
+  --epoch=200 \
+  --eval_task_ids="1,2,3,4,5" \
+  --eval_episodes_per_task=10
 ```
 
-- `--checkpoint_epoch=-1` 이면 `checkpoints/` 안에서 가장 큰 번호의 `params_<n>.pkl` 을 자동 선택합니다
-- 기본적으로 데이터셋에서 자른 한 에피소드의 시작 상태에서 반복 계획을 수행하고, 관측 2차원 기준으로 궤적을 그립니다
-## 스모크 테스트
-
-긴 학습 전에 GOUB dynamics 경로를 빠르게 점검하려면:
+### 서브골 plot (정적 PNG, value heatmap 포함 가능)
 
 ```bash
-cd /path/to/douri
-export PYTHONPATH=.
+python -m rollout.subgoal \
+  --run_dir=runs/<run_dir> \
+  --checkpoint_epoch=-1 \
+  --task_id=1 \
+  --max_steps=50 \
+  --out_path=rollout_state.png
+```
+
+### IDM 기반 환경 롤아웃 (mp4)
+
+```bash
+python -m rollout.idm \
+  --run_dir=runs/<run_dir> \
+  --checkpoint_epoch=200 \
+  --task_id=1 \
+  --action_chunk_horizon=5 \
+  --navigator=snap \
+  --out_mp4=rollout_inv_task1.mp4
+```
+
+### Actor 기반 환경 롤아웃 (mp4)
+
+```bash
+python -m rollout.actor \
+  --run_dir=runs/<run_dir> \
+  --checkpoint_epoch=200 \
+  --task_id=1 \
+  --out_mp4=rollout_actor_task1.mp4
+```
+
+## AntMaze Large 실험 메모
+
+`runs/antmaze_large_200plus_summary.{md,csv}` 기준 현재까지 해석:
+
+- `action_chunk_h=5`가 `10`보다 안정적.
+- `plan_candidates=8`은 조합에 따라 분산이 크지만, 현재까지 best run에서는 유효.
+- `subgoal_value_alpha=0.1`이 가장 유망.
+- DQC default 정렬(`discount=0.999`, `quantile` backup, `kappa_b=kappa_d=0.7`, `value_geom_sample=false`)을 기본값으로 채택. 더 큰 `value_hidden_dims=(512,512,512)`도 default 반영됨.
+- 대표 베스트 run: `runs/20260423_175301_joint_dqc_seed0_antmaze-large-navigate-v0`.
+
+## 스모크 테스트
+
+긴 학습 전에 GOUB dynamics 경로를 빠르게 점검:
+
+```bash
 python smoke_test_goub.py
 ```
 
-이 스크립트는 대략 아래 항목을 확인합니다.
+확인 항목:
 
 1. 실제 배치에서 `trajectory_segment` 정합성
 2. reverse index mapping
-3. boundary-step supervision의 finite / non-zero gradient / tiny overfit 감소
+3. 경계 step supervision의 finite / non-zero gradient / tiny overfit 감소
 4. rollout consistency 감소
 5. synthetic held-out prefix fidelity 점검
 
 ## 의존성
 
-`requirements.txt` 기준 핵심 패키지는 다음과 같습니다.
+`requirements.txt` 기준 핵심 패키지:
 
-- `ogbench`
-- `jax[cuda12]`
-- `flax`
-- `distrax`
-- `ml_collections`
-- `pyyaml`
-- `wandb`
-- `absl-py`
-- `tqdm`
-- `matplotlib`
+- `ogbench`, `jax[cuda12]`, `flax`, `ml_collections`, `pyyaml`, `wandb`, `absl-py`, `tqdm`, `matplotlib`
 
-JAX CUDA12 빌드를 사용하므로, 실제 실행 환경은 GPU / CUDA 세팅과 맞춰 두는 편이 좋습니다.
+JAX CUDA12 빌드 사용 → 실행 환경의 GPU/CUDA 버전과 맞춰야 합니다. GPU 메모리가 부족하면:
 
-## 현재 구조 기준 주의사항
+```bash
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+```
 
-- 문서에서 예전 파일명인 `agents/goub_phase1.py` 를 기준으로 보면 현재 트리와 어긋납니다. 최신 구현 기준 파일은 `agents/goub_dynamics.py` 입니다.
+## 주의사항
+
 - 저장소 루트에서 `PYTHONPATH=.` 없이 실행하면 상대 import가 깨질 수 있습니다.
-- critic 선택은 YAML의 top-level `critic`과 CLI `--critic`이 함께 결정하며, CLI가 우선합니다.
+- `config_used.yaml`의 `env_name`이 일부 옛 large run에서 medium으로 잘못 저장되어 있으니, large/medium 구분은 run 디렉터리명과 `run.log`로 확인하세요.
+- 옛 문서가 가리키는 `agents/goub_phase1.py`는 더 이상 존재하지 않습니다 → 최신은 `agents/goub_dynamics.py`.

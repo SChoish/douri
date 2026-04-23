@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 
+from agents.critic import ScalarValueNet
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.goub import (
     bridge_sample,
@@ -25,7 +26,7 @@ from utils.goub import (
     posterior_mean,
     sample_from_reverse_mean,
 )
-from utils.inverse_dynamics_train import InverseDynamicsMLP, parse_hidden_dims
+from utils.inverse_dynamics import InverseDynamicsMLP, parse_hidden_dims
 from utils.networks import MLP
 
 
@@ -116,12 +117,11 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         return idm_w * mse, mse
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, rng=None, critic_value_params=None):
         x_T = batch['observations']
         x_0 = batch['high_actor_targets']
         batch_size = x_T.shape[0]
         n_total = self.config['goub_N']
-        train_sg = bool(self.config.get('train_subgoal_estimator', True))
         sg_w = float(self.config.get('subgoal_loss_weight', 1.0))
 
         rng1, rng2 = jax.random.split(rng)
@@ -138,18 +138,13 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
         loss_goub = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
 
-        if train_sg and sg_w > 0.0:
-            pred_sg = self.network.select('subgoal_net')(
-                batch['observations'],
-                batch['high_actor_goals'],
-                params=grad_params,
-            )
-            loss_sub = jnp.mean((pred_sg - batch['high_actor_targets']) ** 2)
-            loss = loss_goub + sg_w * loss_sub
-        else:
-            loss_sub = jnp.array(0.0)
-            loss = loss_goub
-            pred_sg = jnp.zeros_like(x_0)
+        pred_sg = self.network.select('subgoal_net')(
+            batch['observations'],
+            batch['high_actor_goals'],
+            params=grad_params,
+        )
+        loss_sub = jnp.mean((pred_sg - batch['high_actor_targets']) ** 2)
+        loss = loss_goub + sg_w * loss_sub
 
         idm_term, loss_idm_unw = self._idm_loss_term(batch, grad_params)
         loss = loss + idm_term
@@ -177,16 +172,16 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         return loss, info
 
     @jax.jit
-    def update(self, batch):
+    def update(self, batch, critic_value_params=None):
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, rng=rng, critic_value_params=critic_value_params)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         return self.replace(network=new_network, rng=new_rng), info
 
-    @jax.jit
+    @partial(jax.jit, static_argnames=('num_steps',))
     def plan(self, current_state, desired_endpoint, *, num_steps: int | None = None):
         squeeze = current_state.ndim == 1
         if squeeze:
@@ -330,6 +325,17 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         return out
 
     @jax.jit
+    def infer_subgoal(self, observations, high_actor_goals):
+        squeeze = observations.ndim == 1
+        if squeeze:
+            observations = observations[None]
+            high_actor_goals = high_actor_goals[None]
+        pred = self.network.select('subgoal_net')(observations, high_actor_goals)
+        if squeeze:
+            pred = pred[0]
+        return pred
+
+    @jax.jit
     def plan_from_high_goal(self, current_state, high_actor_goals):
         endpoint = self.predict_subgoal(current_state, high_actor_goals)
         return self.plan(current_state, endpoint)
@@ -355,7 +361,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
     ):
         obs = jnp.asarray(observations, dtype=jnp.float32)
         goals = jnp.asarray(high_actor_goals, dtype=jnp.float32)
-        predicted_subgoals = self.predict_subgoal(obs, goals)
+        predicted_subgoals = self.infer_subgoal(obs, goals)
 
         if plan_candidates == 1:
             sampled = self.sample_plan(
@@ -368,18 +374,16 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             new_rng, _ = jax.random.split(rng)
             candidate_trajectories = sampled['trajectory'][:, None, ...]
         else:
-            det_plan = self.plan(obs, predicted_subgoals, num_steps=proposal_horizon)['trajectory']
             new_rng, sample_rng = jax.random.split(rng)
-            sampled = self.sample_plan_candidates(
+            candidate_trajectories = self.sample_plan_candidates(
                 obs,
                 predicted_subgoals,
                 sample_rng,
-                num_candidates=plan_candidates - 1,
+                num_candidates=plan_candidates,
                 noise_scale=sample_noise_scale,
-                include_mean=False,
+                include_mean=True,
                 num_steps=proposal_horizon,
             )
-            candidate_trajectories = jnp.concatenate([det_plan[:, None, ...], sampled], axis=1)
 
         flat_trajectories = candidate_trajectories.reshape(
             -1, candidate_trajectories.shape[2], candidate_trajectories.shape[3]
@@ -464,14 +468,6 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
 class GOUBDynamicsAgent(_GOUBAgentCore):
     """GOUB dynamics agent with path supervision and rollout consistency."""
 
-    def _select_loss_slice(self, values, targets, cfg_key: str):
-        """Apply an optional static config slice to ``values`` and ``targets``."""
-        sel = self.config.get(cfg_key)
-        if sel is None or (isinstance(sel, (list, tuple)) and len(sel) == 0):
-            return values, targets
-        idx = jnp.asarray(tuple(int(x) for x in sel), dtype=jnp.int32)
-        return values[:, idx], targets[:, idx]
-
     @classmethod
     def create(cls, seed, ex_observations, config, ex_actions=None):
         if bool(config.get('require_matching_horizon', True)):
@@ -485,8 +481,30 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
                 )
         return super().create(seed, ex_observations, config, ex_actions=ex_actions)
 
+    def _subgoal_value_bonus(
+        self,
+        pred_subgoals: jnp.ndarray,
+        high_actor_goals: jnp.ndarray,
+        critic_value_params: Any | None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        alpha = float(self.config.get('subgoal_value_alpha', 0.0))
+        mode = str(self.config.get('subgoal_value_mode', 'none')).lower()
+        zeros = jnp.zeros((pred_subgoals.shape[0],), dtype=jnp.float32)
+        if alpha <= 0.0 or critic_value_params is None or mode == 'none':
+            return zeros, zeros
+        if mode != 'dqc':
+            raise ValueError(f'Unsupported subgoal_value_mode={mode!r}.')
+
+        value_def = ScalarValueNet(
+            tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
+            layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
+        )
+        value_logits = value_def.apply({'params': critic_value_params}, pred_subgoals, high_actor_goals)
+        value = jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
+        return value, jnp.asarray(alpha, dtype=jnp.float32) * value
+
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, rng=None, critic_value_params=None):
         """GOUB mean-matching + path-aligned reverse + short rollout + subgoal MSE."""
         x_T = batch['observations']
         x_0 = batch['high_actor_targets']
@@ -495,7 +513,6 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         N = int(self.config['goub_N'])
         K = int(segment.shape[1]) - 1
         # With PathHGCDataset, K should match N; avoid hard assert inside jit for speed.
-        train_sg = bool(self.config.get('train_subgoal_estimator', True))
         sg_w = float(self.config.get('subgoal_loss_weight', 1.0))
         w_g = float(self.config.get('goub_loss_weight', 1.0))
         w_p = float(self.config.get('path_loss_weight', 1.0))
@@ -525,7 +542,6 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         mu_pred_path, _ = self._learned_reverse_mean(
             x_n_real, x_T, x_0, n, self.schedule, params=grad_params,
         )
-        mu_pred_path, x_prev_real = self._select_loss_slice(mu_pred_path, x_prev_real, 'path_loss_slice')
         diff_p = mu_pred_path - x_prev_real
         loss_path = jnp.abs(diff_p).sum(axis=-1).mean()
 
@@ -541,28 +557,23 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
                 x, x_T, x_0, n_b, self.schedule, params=grad_params,
             )
             tgt = segment[row, h, :]
-            mu_r_eval, tgt_eval = self._select_loss_slice(mu_r, tgt, 'rollout_loss_slice')
-            err = jnp.abs(mu_r_eval - tgt_eval).sum(axis=-1)
+            err = jnp.abs(mu_r - tgt).sum(axis=-1)
             return mu_r, err
 
         _, errs = jax.lax.scan(roll_body, segment[:, 0, :], hs)
         loss_roll = jnp.mean(errs)
 
         # --- L_subgoal ---
-        if train_sg and sg_w > 0.0:
-            s = batch['observations']
-            g_high = batch['high_actor_goals']
-            target = batch['high_actor_targets']
-            pred_sg = self.network.select('subgoal_net')(s, g_high, params=grad_params)
-            loss_sub = jnp.mean((pred_sg - target) ** 2)
-            pred_sg_out = pred_sg
-        else:
-            loss_sub = jnp.array(0.0)
-            pred_sg_out = jnp.zeros_like(x_0)
+        s = batch['observations']
+        g_high = batch['high_actor_goals']
+        target = batch['high_actor_targets']
+        pred_sg = self.network.select('subgoal_net')(s, g_high, params=grad_params)
+        subgoal_mse = jnp.mean((pred_sg - target) ** 2, axis=-1)
+        subgoal_value, subgoal_value_bonus = self._subgoal_value_bonus(pred_sg, g_high, critic_value_params)
+        loss_sub = jnp.mean(subgoal_mse) - jnp.mean(subgoal_value_bonus)
+        pred_sg_out = pred_sg
 
-        loss = w_g * loss_goub + w_p * loss_path + w_r * loss_roll
-        if train_sg and sg_w > 0.0:
-            loss = loss + sg_w * loss_sub
+        loss = w_g * loss_goub + w_p * loss_path + w_r * loss_roll + sg_w * loss_sub
 
         idm_term, loss_idm_unw = self._idm_loss_term(batch, grad_params)
         loss = loss + idm_term
@@ -590,6 +601,9 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
             'phase1/loss_path_step': loss_path,
             'phase1/loss_roll': loss_roll,
             'phase1/loss_subgoal': loss_sub,
+            'phase1/loss_subgoal_mse': subgoal_mse.mean(),
+            'phase1/subgoal_value_mean': subgoal_value.mean(),
+            'phase1/subgoal_value_bonus_mean': subgoal_value_bonus.mean(),
             'phase1/loss_idm': loss_idm_unw,
             'phase1/first_step_l1': first_step_l1,
             'phase1/first_step_xy_l2': first_step_xy_l2,
@@ -623,8 +637,11 @@ def _get_common_config():
             eps_hidden_dims=(512, 512, 512),
             time_embed_dim=64,
             layer_norm=True,
-            train_subgoal_estimator=True,
             subgoal_loss_weight=1.0,
+            subgoal_value_alpha=0.1,
+            subgoal_value_mode='none',
+            subgoal_value_hidden_dims=(512, 512, 512),
+            subgoal_value_layer_norm=True,
             subgoal_hidden_dims=(512, 512, 512),
             dataset_class='PathHGCDataset',
             discount=0.99,
@@ -655,8 +672,6 @@ def get_dynamics_config():
     c.path_loss_weight = 1.0
     c.rollout_loss_weight = 0.25
     c.rollout_horizon = 5
-    c.path_loss_slice = None  # optional list of observation indices; None = full state
-    c.rollout_loss_slice = None  # optional list of observation indices; None = full state
     c.path_eval_slice = [0, 1]
     c.idm_loss_weight = 1.0
     c.idm_hidden_dims = (512, 512, 512)

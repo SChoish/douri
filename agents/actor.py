@@ -101,18 +101,17 @@ class JointActorAgent(flax.struct.PyTreeNode):
             goals,
             actor_chunk,
             network_params=critic_agent.network.params,
-            use_partial_critic=bool(self.config.get('spi_use_partial_critic', True)),
+            use_partial_critic=True,
         )[:, 0]
 
         dim_mask = self._dim_mask(batch, proposal_chunks.shape[-1])
         diff = (actor_chunk[:, None, :] - proposal_chunks) * dim_mask[:, None, :]
         sqdist = jnp.sum(diff**2, axis=-1)
-        if bool(self.config['spi_dist_normalize_by_dim']):
-            sqdist = sqdist / float(proposal_chunks.shape[-1])
         prox = jnp.sum(rho * sqdist, axis=1)
-        # Scale critic Q so the SPI term is ``-Q / (|Q| + eps)`` instead of raw ``-Q`` (per batch row).
+        # Scale critic Q by batch-mean |Q| so the SPI term is ``-Q / (mean|Q| + eps)``.
         q_eps = jnp.asarray(float(self.config.get('spi_q_norm_eps', 1e-6)), dtype=jnp.float32)
-        actor_q_scaled = actor_q / (jnp.abs(actor_q) + q_eps)
+        q_scale = jax.lax.stop_gradient(jnp.mean(jnp.abs(actor_q)) + q_eps)
+        actor_q_scaled = actor_q / q_scale
         actor_loss = jnp.mean(-actor_q_scaled + prox / (2.0 * float(self.config['spi_tau'])))
 
         rho_eps = 1e-8
@@ -133,15 +132,9 @@ class JointActorAgent(flax.struct.PyTreeNode):
     def update(self, batch: dict, critic_agent: Any):
         new_rng, _ = jax.random.split(self.rng)
         batch = jax.tree_util.tree_map(lambda x: jnp.asarray(x), batch)
-        use_actor = jnp.asarray(bool(self.config.get('use_spi_actor', False)), dtype=jnp.bool_)
-        warm = jnp.asarray(int(self.config.get('spi_warmstart_steps', 0)), dtype=jnp.int32)
-        apply_update = jnp.logical_and(use_actor, critic_agent.network.step > warm)
 
         def loss_fn(actor_params):
-            loss, info = self.actor_loss(batch, actor_params=actor_params, critic_agent=critic_agent)
-            mask = apply_update.astype(jnp.float32)
-            info = {k: v * mask for k, v in info.items()}
-            return loss * mask, info
+            return self.actor_loss(batch, actor_params=actor_params, critic_agent=critic_agent)
 
         new_actor, info = self.actor.apply_loss_fn(loss_fn=loss_fn)
         return self.replace(rng=new_rng, actor=new_actor), info
@@ -171,7 +164,7 @@ class JointActorAgent(flax.struct.PyTreeNode):
         ex_goal = None if ex_goals is None else jnp.asarray(ex_goals, dtype=jnp.float32)
 
         actor_def = DeterministicChunkActor(
-            hidden_dims=tuple(config['spi_actor_hidden_dims']),
+            hidden_dims=(512, 512, 512),
             action_dim=int(config['actor_chunk_horizon']) * int(config['action_dim']),
             layer_norm=bool(config['spi_actor_layer_norm']),
         )
@@ -185,18 +178,13 @@ def get_actor_config():
         dict(
             agent_name='joint_actor',
             lr=3e-4,
-            use_spi_actor=False,
             spi_tau=0.5,
             spi_beta=10.0,
             spi_num_samples=32,
             spi_candidate_source='external',
-            spi_use_partial_critic=True,
-            spi_actor_hidden_dims=(256, 256, 256),
             spi_actor_layer_norm=True,
             spi_eval_use_actor=False,
-            spi_dist_normalize_by_dim=True,
             spi_q_norm_eps=1e-6,
-            spi_warmstart_steps=0,
             actor_chunk_horizon=ml_collections.config_dict.placeholder(int),
             action_dim=2,
         )

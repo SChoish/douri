@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real-environment rollout: GOUB planner + inverse dynamics (IDM).
 
-This script is **separate** from ``rollout_subgoal_goub.py`` (pure state-space trajectory plots).
+This script is **separate** from ``rollout/subgoal.py`` (pure state-space trajectory plots).
 Each replan: ``predict_subgoal`` → ``plan`` or stochastic ``sample_plan`` (see
 ``--planner_noise_scale``) → IDM actions for up to ``--action_chunk_horizon`` env steps
 (capped at ``goub_N``), then repeat.
@@ -11,7 +11,7 @@ Headless RGB: if ``DISPLAY`` is unset, ``MUJOCO_GL`` defaults to ``egl`` (see ``
 Example::
 
     cd <douri repo root>
-    python rollout_idm_goub.py \\
+    python rollout/idm.py \\
         --run_dir=runs/... \\
         --checkpoint_epoch=1000 \\
         --max_steps=1000 \\
@@ -38,15 +38,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from agents.goub_dynamics import GOUBDynamicsAgent
-from rollout_subgoal_goub import (
-    _goal_within_tol,
-    _list_checkpoint_suffixes,
-    _load_checkpoint_pkl,
-    _load_run_flags,
-    _resolve_goub_checkpoint_dir,
-)
 from utils.env_utils import make_env_and_datasets
-from utils.goub_rollout_env import (
+from utils.run_io import (
+    goal_within_tol,
+    list_checkpoint_suffixes,
+    load_checkpoint_pkl,
+    load_run_flags,
+    pick_epoch,
+    resolve_goub_checkpoint_dir,
+)
+from rollout.env import (
     configure_mujoco_gl,
     env_render_rgb_u8,
     format_maze_navigator_log,
@@ -54,14 +55,14 @@ from utils.goub_rollout_env import (
     make_xy_clamper,
     sync_env_state_from_obs_vector_aligned,
 )
-from utils.goub_rollout_plot import (
+from rollout.plot import (
     axis_limits,
     maze_navigator_for_xy_plot,
     overlay_rgb_frames_obs2d_panel,
     write_rgb_array_mp4,
 )
-from utils.inverse_dynamics_train import InverseDynamicsMLP
-from utils.maze_navigator import MazeNavigatorMap
+from utils.inverse_dynamics import InverseDynamicsMLP
+from rollout.maze_navigator import MazeNavigatorMap
 
 
 def rollout_goub_idm_env(
@@ -122,7 +123,7 @@ def rollout_goub_idm_env(
 
     _maybe_record()
 
-    if _goal_within_tol(cur, g_np, goal_stop_dims, float(goal_tol)):
+    if goal_within_tol(cur, g_np, goal_stop_dims, float(goal_tol)):
         hats = np.zeros((0, d), dtype=np.float32)
         env_rgb = np.stack(rgb_frames, axis=0) if rgb_frames else None
         return np.stack(states, axis=0), hats, 0, True, env_rgb, _pack_frame_plan_trajs()
@@ -138,7 +139,7 @@ def rollout_goub_idm_env(
         s_np = np.asarray(states[-1], dtype=np.float32).reshape(-1)
         s = jnp.asarray(s_np, dtype=jnp.float32)
         g = jnp.asarray(s_g, dtype=jnp.float32)
-        hat = agent.predict_subgoal(s, g)
+        hat = agent.infer_subgoal(s, g)
         hat_np = np.asarray(jax.device_get(hat), dtype=np.float32).reshape(-1)
         hat_plot_np = xy_clamper(hat_np.copy())
 
@@ -160,7 +161,7 @@ def rollout_goub_idm_env(
 
         n_exec = min(int(actions.shape[0]), max(1, int(action_chunk_horizon)))
         for i in range(n_exec):
-            # One hat row per env transition (same as ``rollout_subgoal_goub``) so
+            # One hat row per env transition (same as ``rollout.subgoal``) so
             # ``overlay_rgb_frames_obs2d_panel(..., chunk_hat_stride=inv_dyn_freq)`` stays aligned.
             hats_list.append(hat_plot_np.copy())
             a = np.clip(actions[i], low, high)
@@ -169,7 +170,7 @@ def rollout_goub_idm_env(
             states.append(ob_f)
             frame_plan_trajs.append(plan_seg.copy())
             _maybe_record()
-            if _goal_within_tol(ob_f, g_np, goal_stop_dims, float(goal_tol)):
+            if goal_within_tol(ob_f, g_np, goal_stop_dims, float(goal_tol)):
                 hats = np.stack(hats_list, axis=0) if hats_list else np.zeros((0, d), dtype=np.float32)
                 env_rgb = np.stack(rgb_frames, axis=0) if rgb_frames else None
                 return np.stack(states, axis=0), hats, chunk_i + 1, True, env_rgb, _pack_frame_plan_trajs()
@@ -230,13 +231,14 @@ def main() -> None:
     p.add_argument('--clamp_dim0', type=int, default=-1)
     p.add_argument('--clamp_dim1', type=int, default=-1)
     p.add_argument('--seed', type=int, default=0)
-    p.add_argument('--out_path', type=str, default='rollout_idm_goub.png')
+    p.add_argument('--out_path', type=str, default='rollout_idm.png')
     p.add_argument('--out_mp4', type=str, default='')
     p.add_argument('--fps', type=float, default=60.0)
     p.add_argument('--no_mp4', action='store_true')
     p.add_argument(
         '--value_heatmap',
-        action='store_true',
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help='Overlay DQC scalar value V(s, goal) on the right XY panel (requires joint checkpoints/critic/).',
     )
     p.add_argument('--value_grid_n', type=int, default=56, help='Square grid resolution for value heatmap.')
@@ -257,20 +259,11 @@ def main() -> None:
         p.error('--action_chunk_horizon must be >= 1')
     planner_seed = int(args.seed) if int(args.planner_seed) < 0 else int(args.planner_seed)
 
-    ckpt_epoch = int(args.checkpoint_epoch)
     run_dir = Path(args.run_dir).resolve()
-    ckpt_dir = _resolve_goub_checkpoint_dir(run_dir)
-    suffixes = _list_checkpoint_suffixes(ckpt_dir)
-    if not suffixes:
-        raise FileNotFoundError(f'No params_*.pkl in {ckpt_dir}')
-    if ckpt_epoch < 0:
-        ckpt_epoch = suffixes[-1]
-    if ckpt_epoch not in suffixes:
-        nearest = min(suffixes, key=lambda x: abs(x - ckpt_epoch))
-        print(f'Warning: checkpoint {ckpt_epoch} not found; using {nearest}')
-        ckpt_epoch = nearest
+    ckpt_dir = resolve_goub_checkpoint_dir(run_dir)
+    ckpt_epoch = pick_epoch(int(args.checkpoint_epoch), list_checkpoint_suffixes(ckpt_dir))
 
-    cfg, env_name = _load_run_flags(run_dir)
+    cfg, env_name = load_run_flags(run_dir)
     navigator: MazeNavigatorMap | None = None
     if args.navigator == 'snap':
         navigator = load_maze_navigator_snap(args.maze_type, env_name)
@@ -306,7 +299,7 @@ def main() -> None:
     ex_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
     agent = GOUBDynamicsAgent.create(args.seed, ex, cfg, ex_actions=ex_act)
     pkl_path = ckpt_dir / f'params_{ckpt_epoch}.pkl'
-    agent = _load_checkpoint_pkl(agent, pkl_path)
+    agent = load_checkpoint_pkl(agent, pkl_path)
     goub_N = int(agent.config['goub_N'])
     print(
         f'Loaded GOUB {pkl_path}  goub_N={goub_N}  '
@@ -360,6 +353,19 @@ def main() -> None:
         navigator_edge_inset=float(args.navigator_edge_inset),
     )
 
+    from rollout.value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
+
+    ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(ckpt_epoch)
+    critic_agent = load_dqc_critic_joint_run(
+        run_dir,
+        ce,
+        env,
+        train_raw,
+        seed=int(args.seed),
+    )
+    critic_value_params = critic_agent.network.params.get('modules_value', None)
+    print(f'Loaded critic for IDM inference/value heatmap (epoch suffix {ce})')
+
     roll, hats, n_chunks, reached, env_frames, frame_plan_trajs = rollout_goub_idm_env(
         env,
         agent,
@@ -391,17 +397,6 @@ def main() -> None:
     heat_mesh = None
     heat_vmin = heat_vmax = None
     if bool(args.value_heatmap):
-        from utils.rollout_value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
-
-        ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(ckpt_epoch)
-        critic_agent = load_dqc_critic_joint_run(
-            run_dir,
-            ce,
-            env,
-            train_raw,
-            seed=int(args.seed),
-        )
-        print(f'Loaded critic for value heatmap (epoch suffix {ce})')
         xlim, ylim = axis_limits(traj, roll, hats, d0, d1, s_g, s0, navigator=plot_nav, seg=None)
         tpl = np.asarray(roll[0], dtype=np.float32).reshape(-1)
         XX, YY, ZZ, heat_vmin, heat_vmax = dqc_value_mesh_for_xy(

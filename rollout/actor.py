@@ -5,7 +5,7 @@ Loads ``checkpoints/goub/params_<epoch>.pkl`` and ``checkpoints/actor/params_<ep
 
 Example::
 
-    MUJOCO_GL=egl python rollout_actor_goub.py \\
+    MUJOCO_GL=egl python rollout/actor.py \\
         --run_dir=runs/... \\
         --checkpoint_epoch=1000 \\
         --task_id=1 \\
@@ -18,48 +18,39 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
 from pathlib import Path
 
-import flax
 import jax.numpy as jnp
 import numpy as np
 
-from agents.critic.actor import JointActorAgent, get_actor_config
+from agents.actor import JointActorAgent, get_actor_config
 from agents.goub_dynamics import GOUBDynamicsAgent
-from rollout_subgoal_goub import (
-    _get_trajectory,
-    _list_checkpoint_suffixes,
-    _load_checkpoint_pkl,
-    _load_run_flags,
-    _resolve_goub_checkpoint_dir,
-)
 from utils.datasets import Dataset
 from utils.env_utils import make_env_and_datasets
-from utils.flax_utils import merge_checkpoint_state_dict
-from utils.goub_rollout_env import (
+from rollout.env import (
     configure_mujoco_gl,
     env_render_rgb_u8,
     format_maze_navigator_log,
     load_maze_navigator_snap,
     sync_env_state_from_obs_vector_aligned,
 )
-from utils.goub_rollout_plot import (
+from rollout.plot import (
     axis_limits,
     maze_navigator_for_xy_plot,
     overlay_rgb_frames_obs2d_panel,
     write_rgb_array_mp4,
 )
-from utils.maze_navigator import MazeNavigatorMap
-
-
-def _resolve_actor_checkpoint_dir(run_dir: Path) -> Path:
-    d = run_dir / 'checkpoints' / 'actor'
-    if not d.is_dir():
-        raise FileNotFoundError(f'Missing actor checkpoints directory: {d}')
-    if not _list_checkpoint_suffixes(d):
-        raise FileNotFoundError(f'No params_*.pkl under {d}')
-    return d
+from rollout.maze_navigator import MazeNavigatorMap
+from utils.run_io import (
+    get_trajectory,
+    goal_within_tol,
+    list_checkpoint_suffixes,
+    load_checkpoint_pkl,
+    load_run_flags,
+    pick_epoch,
+    resolve_actor_checkpoint_dir,
+    resolve_goub_checkpoint_dir,
+)
 
 
 def _load_actor_config_from_flags(flags_path: Path) -> dict:
@@ -68,20 +59,10 @@ def _load_actor_config_from_flags(flags_path: Path) -> dict:
     act = root.get('actor')
     if not isinstance(act, dict):
         raise KeyError(f'{flags_path} must contain an "actor" object (joint run flags).')
-    if not bool(act.get('use_spi_actor', False)):
-        raise ValueError('This run has use_spi_actor=false; no joint actor to rollout.')
     base = get_actor_config()
     for k, v in act.items():
         base[k] = v
     return dict(base)
-
-
-def _load_actor_pkl(agent: JointActorAgent, pkl_path: Path) -> JointActorAgent:
-    with open(pkl_path, 'rb') as f:
-        load_dict = pickle.load(f)
-    template = flax.serialization.to_state_dict(agent)
-    merged = merge_checkpoint_state_dict(template, load_dict['agent'])
-    return flax.serialization.from_state_dict(agent, merged)
 
 
 def _align_action_to_env(a: np.ndarray, env_dim: int) -> np.ndarray:
@@ -127,9 +108,7 @@ def rollout_goub_actor_env(
 
     _maybe_record()
 
-    from rollout_subgoal_goub import _goal_within_tol
-
-    if _goal_within_tol(cur, goal, goal_stop_dims, float(goal_tol)):
+    if goal_within_tol(cur, goal, goal_stop_dims, float(goal_tol)):
         return np.stack(states, axis=0), np.zeros((0, cur.shape[-1]), dtype=np.float32), 0, True, (
             np.stack(rgb_frames, axis=0) if rgb_frames else None
         )
@@ -140,10 +119,10 @@ def rollout_goub_actor_env(
     n_chunks_used = 0
     for _ in range(max(1, int(max_chunks))):
         obs = states[-1]
-        if _goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol)):
+        if goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol)):
             reached = True
             break
-        pred = np.asarray(goub_agent.predict_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+        pred = np.asarray(goub_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
         chunk = np.asarray(actor_agent.sample_actions(obs, pred), dtype=np.float32).reshape(actor_horizon, -1)
         chunk_done = False
         for _i in range(int(chunk.shape[0])):
@@ -155,7 +134,7 @@ def rollout_goub_actor_env(
             hats_list.append(pred.copy())
             _maybe_record()
             succ_flag = bool(info.get('success', False)) if isinstance(info, dict) else False
-            reached = succ_flag or _goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol))
+            reached = succ_flag or goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol))
             terminated = bool(term)
             truncated = bool(trunc)
             if reached or terminated or truncated:
@@ -193,14 +172,15 @@ def main() -> None:
     p.add_argument('--navigator_edge_inset', type=float, default=0.08)
     p.add_argument('--maze_type', type=str, default='')
     p.add_argument('--seed', type=int, default=0)
-    p.add_argument('--out_path', type=str, default='rollout_actor_goub.png')
+    p.add_argument('--out_path', type=str, default='rollout_actor.png')
     p.add_argument('--out_mp4', type=str, default='')
     p.add_argument('--fps', type=float, default=60.0)
     p.add_argument('--no_mp4', action='store_true')
     p.add_argument('--mujoco_gl', type=str, default='', metavar='BACKEND')
     p.add_argument(
         '--value_heatmap',
-        action='store_true',
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help='Overlay DQC scalar value V(s, goal) on the right XY panel (joint checkpoints/critic/).',
     )
     p.add_argument('--value_grid_n', type=int, default=56)
@@ -214,27 +194,16 @@ def main() -> None:
 
     run_dir = Path(args.run_dir).resolve()
     flags_path = run_dir / 'flags.json'
-    goub_ckpt_dir = _resolve_goub_checkpoint_dir(run_dir)
-    actor_ckpt_dir = _resolve_actor_checkpoint_dir(run_dir)
+    goub_ckpt_dir = resolve_goub_checkpoint_dir(run_dir)
+    actor_ckpt_dir = resolve_actor_checkpoint_dir(run_dir, required=True)
 
-    def _pick_epoch(requested: int, suffixes: list[int]) -> int:
-        if requested < 0:
-            return suffixes[-1]
-        if requested not in suffixes:
-            nearest = min(suffixes, key=lambda x: abs(x - requested))
-            print(f'Warning: checkpoint {requested} not found; using {nearest}')
-            return nearest
-        return requested
-
-    goub_suf = _list_checkpoint_suffixes(goub_ckpt_dir)
-    actor_suf = _list_checkpoint_suffixes(actor_ckpt_dir)
     base_ep = int(args.checkpoint_epoch)
     goub_ep = int(args.goub_epoch) if int(args.goub_epoch) >= 0 else base_ep
     actor_ep = int(args.actor_epoch) if int(args.actor_epoch) >= 0 else base_ep
-    goub_ep = _pick_epoch(goub_ep, goub_suf)
-    actor_ep = _pick_epoch(actor_ep, actor_suf)
+    goub_ep = pick_epoch(goub_ep, list_checkpoint_suffixes(goub_ckpt_dir))
+    actor_ep = pick_epoch(actor_ep, list_checkpoint_suffixes(actor_ckpt_dir))
 
-    goub_cfg, env_name = _load_run_flags(run_dir)
+    goub_cfg, env_name = load_run_flags(run_dir)
     actor_cfg = _load_actor_config_from_flags(flags_path)
 
     navigator: MazeNavigatorMap | None = None
@@ -260,7 +229,7 @@ def main() -> None:
         print(f'OGBench eval reset: task_id={tid}  obs_dim={s0.shape[-1]}')
     else:
         dataset = Dataset.create(**train_raw)
-        traj = _get_trajectory(dataset, int(args.traj_idx))
+        traj = get_trajectory(dataset, int(args.traj_idx))
         s0 = np.asarray(traj[0], dtype=np.float32).reshape(-1)
         s_g = np.asarray(traj[-1], dtype=np.float32).reshape(-1)
 
@@ -279,14 +248,27 @@ def main() -> None:
     ex_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
     goub_agent = GOUBDynamicsAgent.create(int(args.seed), ex, goub_cfg, ex_actions=ex_act)
     goub_pkl = goub_ckpt_dir / f'params_{goub_ep}.pkl'
-    goub_agent = _load_checkpoint_pkl(goub_agent, goub_pkl)
+    goub_agent = load_checkpoint_pkl(goub_agent, goub_pkl)
     print(f'Loaded GOUB {goub_pkl}')
 
     ex_goal = jnp.asarray(s_g.reshape(1, -1), dtype=jnp.float32)
     actor_agent = JointActorAgent.create(int(args.seed), ex, actor_cfg, ex_goals=ex_goal)
     actor_pkl = actor_ckpt_dir / f'params_{actor_ep}.pkl'
-    actor_agent = _load_actor_pkl(actor_agent, actor_pkl)
+    actor_agent = load_checkpoint_pkl(actor_agent, actor_pkl)
     print(f'Loaded actor {actor_pkl}')
+
+    from rollout.value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
+
+    ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(goub_ep)
+    critic_agent = load_dqc_critic_joint_run(
+        run_dir,
+        ce,
+        env,
+        train_raw,
+        seed=int(args.seed),
+    )
+    critic_value_params = critic_agent.network.params.get('modules_value', None)
+    print(f'Loaded critic for actor inference/value heatmap (epoch suffix {ce})')
 
     low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
@@ -325,17 +307,6 @@ def main() -> None:
     heat_mesh = None
     heat_vmin = heat_vmax = None
     if bool(args.value_heatmap):
-        from utils.rollout_value_field import dqc_value_mesh_for_xy, load_dqc_critic_joint_run
-
-        ce = int(args.critic_epoch) if int(args.critic_epoch) >= 0 else int(goub_ep)
-        critic_agent = load_dqc_critic_joint_run(
-            run_dir,
-            ce,
-            env,
-            train_raw,
-            seed=int(args.seed),
-        )
-        print(f'Loaded critic for value heatmap (epoch suffix {ce})')
         xlim, ylim = axis_limits(traj, roll, hats, d0, d1, s_g, s0, navigator=plot_nav, seg=None)
         tpl = np.asarray(roll[0], dtype=np.float32).reshape(-1)
         XX, YY, ZZ, heat_vmin, heat_vmax = dqc_value_mesh_for_xy(

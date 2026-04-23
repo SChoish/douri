@@ -1,16 +1,65 @@
+"""DQC critic agent (chunk critic + partial critic + scalar value).
+
+Single-file critic module. Networks, agent, helpers, and default config live here.
+"""
+
 from __future__ import annotations
 
-from typing import Any
+from functools import partial
+import math
+from typing import Any, Sequence
 
 import flax
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import ml_collections
 import numpy as np
 import optax
 
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
+from utils.networks import MLP
 
-from .common import BinaryChunkCritic, ScalarValueNet, _safe_logit
+
+def _safe_logit(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    x = jnp.clip(x, eps, 1.0 - eps)
+    return jnp.log(x) - jnp.log1p(-x)
+
+
+class ScalarValueNet(nn.Module):
+    hidden_dims: Sequence[int]
+    layer_norm: bool = True
+
+    @nn.compact
+    def __call__(self, observations: jnp.ndarray, goals: jnp.ndarray | None = None) -> jnp.ndarray:
+        xs = [observations]
+        if goals is not None:
+            xs.append(goals)
+        x = jnp.concatenate(xs, axis=-1)
+        return MLP((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)(x).squeeze(-1)
+
+
+class BinaryChunkCritic(nn.Module):
+    hidden_dims: Sequence[int]
+    num_qs: int
+    layer_norm: bool = True
+
+    @nn.compact
+    def __call__(
+        self,
+        observations: jnp.ndarray,
+        goals: jnp.ndarray | None = None,
+        actions_flat: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        xs = [observations]
+        if goals is not None:
+            xs.append(goals)
+        if actions_flat is not None:
+            xs.append(actions_flat)
+        x = jnp.concatenate(xs, axis=-1)
+        h = MLP(tuple(self.hidden_dims), activate_final=True, layer_norm=self.layer_norm)(x)
+        logits = [nn.Dense(1, name=f'q_head_{i}')(h).squeeze(-1) for i in range(int(self.num_qs))]
+        return jnp.stack(logits, axis=0)
 
 
 class DQCCriticAgent(flax.struct.PyTreeNode):
@@ -145,6 +194,7 @@ class DQCCriticAgent(flax.struct.PyTreeNode):
             return actions[:, None, :], 1
         raise ValueError(f'action_chunk_actions must be rank-2/3/4, got shape={actions.shape}')
 
+    @partial(jax.jit, static_argnames=('use_partial_critic',))
     def score_action_chunks(
         self,
         observations: jnp.ndarray,
@@ -170,7 +220,7 @@ class DQCCriticAgent(flax.struct.PyTreeNode):
             elif flat_actions.shape[-1] == full_dim and partial_dim != full_dim:
                 use_partial_critic = False
             else:
-                use_partial_critic = bool(self.config.get('spi_use_partial_critic', True))
+                use_partial_critic = True
 
         if bool(use_partial_critic) or not bool(self.config['use_chunk_critic']):
             logits = self.network.select('action_critic')(obs_rep, goal_rep, flat_actions, params=network_params)
@@ -241,15 +291,14 @@ class DQCCriticAgent(flax.struct.PyTreeNode):
         ex_part = jnp.asarray(ex_action_chunk_actions, dtype=jnp.float32)
         ex_goal = jnp.asarray(ex_observations if ex_goals is None else ex_goals, dtype=jnp.float32)
 
-        value_def = ScalarValueNet(tuple(config['value_hidden_dims']), layer_norm=bool(config['layer_norm']))
-        chunk_critic_def = BinaryChunkCritic(tuple(config['value_hidden_dims']), int(config['num_qs']), bool(config['layer_norm']))
-        action_critic_def = BinaryChunkCritic(tuple(config['value_hidden_dims']), int(config['num_qs']), bool(config['layer_norm']))
-        target_action_critic_def = BinaryChunkCritic(
-            tuple(config['value_hidden_dims']), int(config['num_qs']), bool(config['layer_norm'])
-        )
-        target_chunk_critic_def = BinaryChunkCritic(
-            tuple(config['value_hidden_dims']), int(config['num_qs']), bool(config['layer_norm'])
-        )
+        hdims = tuple(config['value_hidden_dims'])
+        ln = bool(config['layer_norm'])
+        nq = int(config['num_qs'])
+        value_def = ScalarValueNet(hdims, layer_norm=ln)
+        chunk_critic_def = BinaryChunkCritic(hdims, nq, ln)
+        action_critic_def = BinaryChunkCritic(hdims, nq, ln)
+        target_action_critic_def = BinaryChunkCritic(hdims, nq, ln)
+        target_chunk_critic_def = BinaryChunkCritic(hdims, nq, ln)
 
         network_info = {
             'chunk_critic': (chunk_critic_def, (ex_obs, ex_goal, ex_full)),
@@ -266,3 +315,83 @@ class DQCCriticAgent(flax.struct.PyTreeNode):
         network_params['modules_target_action_critic'] = network_params['modules_action_critic']
         network = TrainState.create(network_def, network_params, tx=optax.adam(float(config['lr'])))
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(**config))
+
+
+def validate_joint_mode(critic_config, actor_config=None) -> None:
+    action_chunk_horizon = int(critic_config.get('action_chunk_horizon', 0))
+    full_chunk_horizon = int(critic_config.get('full_chunk_horizon', 0))
+    if action_chunk_horizon < 1:
+        raise ValueError('DQC joint mode requires action_chunk_horizon >= 1.')
+    if full_chunk_horizon < action_chunk_horizon:
+        raise ValueError(
+            f'DQC joint mode requires full_chunk_horizon >= action_chunk_horizon, '
+            f'got full_chunk_horizon={full_chunk_horizon}, action_chunk_horizon={action_chunk_horizon}.'
+        )
+    if actor_config is None:
+        return
+    if int(actor_config.get('actor_chunk_horizon', 0)) < 1:
+        raise ValueError('Joint training requires actor_chunk_horizon >= 1.')
+
+
+def extract_value_loss(info: dict) -> float:
+    return float(info['action_critic/value_loss'])
+
+
+def extract_critic_total_loss(info: dict) -> float:
+    return float(info['dqc_critic/total_loss'])
+
+
+def extract_critic_primary_score(info: dict) -> float:
+    if 'chunk_critic/q_mean' in info:
+        return float(info['chunk_critic/q_mean'])
+    return float(info['action_critic/q_part_mean'])
+
+
+def extract_actor_loss(info: dict | None) -> float:
+    if info is None or 'spi_actor/actor_loss' not in info:
+        return math.nan
+    return float(info['spi_actor/actor_loss'])
+
+
+def get_config():
+    return ml_collections.ConfigDict(
+        dict(
+            agent_name='critic',
+            lr=3e-4,
+            batch_size=256,
+            tau=0.005,
+            layer_norm=True,
+            frame_stack=None,
+            p_aug=0.0,
+            q_agg='mean',
+            full_chunk_horizon=25,
+            action_chunk_horizon=10,
+            value_hidden_dims=(512, 512, 512),
+            discount=0.999,
+            num_qs=2,
+            use_chunk_critic=True,
+            distill_method='expectile',
+            kappa_d=0.7,
+            implicit_backup_type='quantile',
+            kappa_b=0.7,
+            action_dim=2,
+            value_p_curgoal=0.2,
+            value_p_trajgoal=0.5,
+            value_p_randomgoal=0.3,
+            value_geom_sample=False,
+            gc_negative=False,
+        )
+    )
+
+
+__all__ = [
+    'BinaryChunkCritic',
+    'ScalarValueNet',
+    'DQCCriticAgent',
+    'validate_joint_mode',
+    'extract_value_loss',
+    'extract_critic_total_loss',
+    'extract_critic_primary_score',
+    'extract_actor_loss',
+    'get_config',
+]

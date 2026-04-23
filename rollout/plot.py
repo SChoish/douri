@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 
-from utils.maze_navigator import MazeNavigatorMap
+from rollout.maze_navigator import MazeNavigatorMap
 
 
 def axis_limits(
@@ -188,7 +189,7 @@ def _draw_rollout_step_frame(
     hk = None
     if hats.shape[0] > 0:
         if chunk_hat_stride is not None and chunk_hat_stride > 0:
-            # ``hats`` in rollout_subgoal_goub already stores one repeated row per executed step,
+            # ``hats`` in ``rollout.subgoal`` already stores one repeated row per executed step,
             # so pick the first row of the current chunk rather than re-compressing by chunk index.
             hi = min((k // chunk_hat_stride) * int(chunk_hat_stride), int(hats.shape[0]) - 1)
             hk = hats[hi]
@@ -259,7 +260,9 @@ def overlay_rgb_frames_obs2d_panel(
     navigator: MazeNavigatorMap | None = None,
     *,
     env_name: str | None = None,
-    panel_width: int = 300,
+    panel_width: int = 360,
+    panel_max_frac_of_env: float = 0.72,
+    output_scale: float = 1.1,
     dpi: int = 120,
     chunk_hat_stride: int | None = None,
     traj_line_alpha: float = 0.98,
@@ -285,6 +288,8 @@ def overlay_rgb_frames_obs2d_panel(
 
     Optional ``value_heatmap=(XX, YY, ZZ)`` draws a goal-conditioned scalar value field (e.g. DQC
     ``sigmoid(V)``) under trajectories using ``pcolormesh`` (same ``xlim``/``ylim`` as the panel).
+    The colormap uses log normalization so low-value regions remain visually separable.
+    ``output_scale`` upsamples the final combined frame slightly for a larger MP4.
     """
     if frames.ndim != 4 or frames.shape[-1] != 3:
         raise ValueError(f'Expected uint8 frames (T,H,W,3), got {frames.shape}')
@@ -303,7 +308,8 @@ def overlay_rgb_frames_obs2d_panel(
     xlim, ylim = axis_limits(traj, roll, hats, d0, d1, s_g, s0, navigator=nav_panel, seg=None)
     base_frames = np.asarray(frames, dtype=np.uint8)
     out_frames: list[np.ndarray] = []
-    pw = max(int(panel_width), 160)
+    panel_cap = int(round(float(panel_max_frac_of_env) * float(W)))
+    pw = max(min(int(panel_width), max(panel_cap, 160)), 160)
 
     for t in range(T):
         fig, ax = plt.subplots(figsize=(pw / float(dpi), H / float(dpi)), dpi=int(dpi))
@@ -311,15 +317,29 @@ def overlay_rgb_frames_obs2d_panel(
         ax.set_facecolor('white')
         if value_heatmap is not None:
             XX, YY, ZZ = value_heatmap
+            zz_plot = np.asarray(ZZ, dtype=np.float32)
+            finite = zz_plot[np.isfinite(zz_plot)]
+            heat_norm = None
+            if finite.size > 0:
+                pos = finite[finite > 0.0]
+                if pos.size > 0:
+                    log_floor = max(float(np.min(pos)), 1e-6)
+                    if value_heatmap_vmin is not None:
+                        log_floor = max(log_floor, float(value_heatmap_vmin), 1e-6)
+                    log_ceil = float(np.max(finite))
+                    if value_heatmap_vmax is not None:
+                        log_ceil = min(log_ceil, float(value_heatmap_vmax))
+                    log_ceil = max(log_ceil, log_floor * 1.001)
+                    zz_plot = np.maximum(zz_plot, log_floor)
+                    heat_norm = mcolors.LogNorm(vmin=log_floor, vmax=log_ceil)
             ax.pcolormesh(
                 XX,
                 YY,
-                ZZ,
+                zz_plot,
                 shading='auto',
                 cmap='magma',
                 alpha=float(value_heatmap_alpha),
-                vmin=value_heatmap_vmin,
-                vmax=value_heatmap_vmax,
+                norm=heat_norm,
                 zorder=1,
                 rasterized=True,
             )
@@ -433,7 +453,17 @@ def overlay_rgb_frames_obs2d_panel(
         panel = buf[:, :, :3].copy()
         plt.close(fig)
         panel = np.asarray(Image.fromarray(panel).resize((pw, H), Image.Resampling.LANCZOS))
-        out_frames.append(_hstack_env_panel(base_frames[t], panel))
+        combined = _hstack_env_panel(base_frames[t], panel)
+        if float(output_scale) > 1.0:
+            ch, cw, _ = combined.shape
+            up_w = max(int(round(cw * float(output_scale))), cw)
+            up_h = max(int(round(ch * float(output_scale))), ch)
+            if up_w % 2 == 1:
+                up_w += 1
+            if up_h % 2 == 1:
+                up_h += 1
+            combined = np.asarray(Image.fromarray(combined).resize((up_w, up_h), Image.Resampling.LANCZOS))
+        out_frames.append(combined)
     return np.stack(out_frames, axis=0)
 
 

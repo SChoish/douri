@@ -6,7 +6,6 @@ Single-file critic module. Networks, agent, helpers, and default config live her
 from __future__ import annotations
 
 from functools import partial
-import math
 from typing import Any, Sequence
 
 import flax
@@ -333,24 +332,10 @@ def validate_joint_mode(critic_config, actor_config=None) -> None:
         raise ValueError('Joint training requires actor_chunk_horizon >= 1.')
 
 
-def extract_value_loss(info: dict) -> float:
-    return float(info['action_critic/value_loss'])
-
-
-def extract_critic_total_loss(info: dict) -> float:
-    return float(info['dqc_critic/total_loss'])
-
-
 def extract_critic_primary_score(info: dict) -> float:
     if 'chunk_critic/q_mean' in info:
         return float(info['chunk_critic/q_mean'])
     return float(info['action_critic/q_part_mean'])
-
-
-def extract_actor_loss(info: dict | None) -> float:
-    if info is None or 'spi_actor/actor_loss' not in info:
-        return math.nan
-    return float(info['spi_actor/actor_loss'])
 
 
 def get_config():
@@ -389,9 +374,6 @@ __all__ = [
     'ScalarValueNet',
     'DQCCriticAgent',
     'validate_joint_mode',
-    'extract_value_loss',
-    'extract_critic_total_loss',
     'extract_critic_primary_score',
-    'extract_actor_loss',
     'get_config',
 ]

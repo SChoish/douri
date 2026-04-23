@@ -23,10 +23,7 @@ from absl import app, flags
 
 from agents.critic import (
     DQCCriticAgent,
-    extract_actor_loss,
     extract_critic_primary_score,
-    extract_critic_total_loss,
-    extract_value_loss,
     get_config as get_critic_config,
     validate_joint_mode,
 )
@@ -157,18 +154,34 @@ def _update_config(config: Any, updates: dict) -> Any:
     return config
 
 
-def _accumulate_metric_sums(metric_sums: dict[str, float], info: dict | None) -> None:
+def _accumulate_metric_sums(metric_sums: dict, info: dict | None) -> None:
+    """Accumulate scalars *on device*; ``float()`` is deferred to log-emit time.
+
+    Avoids one host sync per metric per step (~30 syncs/step otherwise), which
+    serialised the GPU pipeline against the Python loop.
+    """
     if info is None:
         return
     for key, value in info.items():
-        metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+        prev = metric_sums.get(key)
+        metric_sums[key] = value if prev is None else prev + value
 
 
-def _emit_metric_means(metrics: dict[str, float], prefix: str, metric_sums: dict[str, float], count: int) -> None:
-    if count < 1:
+def _emit_metric_means(metrics: dict[str, float], prefix: str, metric_sums: dict, count: int) -> None:
+    if count < 1 or not metric_sums:
         return
-    for key, total in metric_sums.items():
-        metrics[f'{prefix}/{key}_epoch_mean'] = float(total / count)
+    inv = 1.0 / float(count)
+    # Single device→host transfer for the whole tree avoids one sync per key.
+    host_sums = jax.device_get(metric_sums)
+    for key, total in host_sums.items():
+        metrics[f'{prefix}/{key}_epoch_mean'] = float(total) * inv
+
+
+def _to_host_metrics(prefix: str, info: dict | None) -> dict[str, float]:
+    if not info:
+        return {}
+    host = jax.device_get(info)
+    return {f'{prefix}/{k}': float(v) for k, v in host.items()}
 
 
 def _accumulate_time_sums(time_sums: dict[str, float], values: dict[str, float] | None) -> None:
@@ -367,12 +380,13 @@ def _build_actor_batch_from_goub(
         'valids': jnp.ones((obs.shape[0], proposal_horizon), dtype=jnp.float32),
     }
 
+    nan = jnp.full((), jnp.nan, dtype=jnp.float32)
     coupling_info = {
-        'coupling/predicted_subgoal_norm': float(jnp.linalg.norm(predicted_subgoals, axis=-1).mean()),
-        'coupling/critic_score_mean': float('nan'),
-        'coupling/critic_score_max': float('nan'),
-        'coupling/critic_score_min': float('nan'),
-        'coupling/proposal_count': float(candidate_actions.shape[1]),
+        'coupling/predicted_subgoal_norm': jnp.linalg.norm(predicted_subgoals, axis=-1).mean(),
+        'coupling/critic_score_mean': nan,
+        'coupling/critic_score_max': nan,
+        'coupling/critic_score_min': nan,
+        'coupling/proposal_count': jnp.asarray(float(candidate_actions.shape[1]), dtype=jnp.float32),
     }
     return goub_agent, actor_batch, coupling_info, timing
 
@@ -382,19 +396,19 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
     goals = jnp.asarray(actor_batch['spi_goals'], dtype=jnp.float32)
     candidates = jnp.asarray(actor_batch['candidate_partial_chunks'], dtype=jnp.float32)  # [B, N, ha, A]
     if candidates.shape[1] == 1:
-        zeros = jnp.zeros((obs.shape[0], 1), dtype=jnp.float32)
+        zero = jnp.zeros((), dtype=jnp.float32)
         return (
             {
                 'observations': obs,
                 'spi_goals': goals,
                 'proposal_partial_chunks': candidates,
-                'proposal_scores': zeros,
+                'proposal_scores': jnp.zeros((obs.shape[0], 1), dtype=jnp.float32),
                 'valids': jnp.asarray(actor_batch['valids'], dtype=jnp.float32),
             },
             {
-                'coupling/critic_score_mean': float(zeros.mean()),
-                'coupling/critic_score_max': float(zeros.max()),
-                'coupling/critic_score_min': float(zeros.min()),
+                'coupling/critic_score_mean': zero,
+                'coupling/critic_score_max': zero,
+                'coupling/critic_score_min': zero,
             },
         )
     proposal_chunks, proposal_scores = _score_and_rank_candidate_actions(
@@ -417,9 +431,9 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
             'valids': jnp.asarray(actor_batch['valids'], dtype=jnp.float32),
         },
         {
-            'coupling/critic_score_mean': float(proposal_scores.mean()),
-            'coupling/critic_score_max': float(proposal_scores.max()),
-            'coupling/critic_score_min': float(proposal_scores.min()),
+            'coupling/critic_score_mean': proposal_scores.mean(),
+            'coupling/critic_score_max': proposal_scores.max(),
+            'coupling/critic_score_min': proposal_scores.min(),
         },
     )
 
@@ -754,11 +768,6 @@ def main(_):
     for epoch in epoch_iter:
         if measure_timing:
             epoch_start = time.perf_counter()
-        goub_losses = []
-        critic_losses = []
-        value_losses = []
-        actor_losses = []
-        critic_scores = []
         data_time = 0.0
         build_time = 0.0
         build_detail_times = {}
@@ -843,29 +852,30 @@ def main(_):
             _accumulate_metric_sums(actor_metric_sums, actor_info)
             _accumulate_metric_sums(coupling_metric_sums, coupling_info)
 
-            goub_losses.append(float(goub_info['phase1/loss']))
-            critic_losses.append(extract_critic_total_loss(critic_info))
-            value_losses.append(extract_value_loss(critic_info))
-            actor_losses.append(extract_actor_loss(actor_info))
-            critic_scores.append(float(coupling_info['coupling/critic_score_mean']))
-
         gstep = epoch * spe
+        steps_done = spe
         if epoch % FLAGS.log_every_n_epochs == 0 and last_goub_info is not None:
             metrics = {}
-            metrics.update({f'train/goub/{k}': float(v) for k, v in last_goub_info.items()})
-            metrics.update({f'train/critic/{k}': float(v) for k, v in last_critic_info.items()})
-            metrics.update({f'train/actor/{k}': float(v) for k, v in last_actor_info.items()})
-            metrics.update({f'train/{k}': float(v) for k, v in last_coupling_info.items()})
-            metrics['train/goub/loss_epoch_mean'] = float(np.mean(goub_losses))
-            metrics['train/critic/loss_epoch_mean'] = float(np.mean(critic_losses))
-            metrics['train/value/loss_epoch_mean'] = float(np.mean(value_losses))
-            metrics['train/actor/loss_epoch_mean'] = float(np.mean(actor_losses))
-            metrics['train/coupling/critic_score_epoch_mean'] = float(np.mean(critic_scores))
+            metrics.update(_to_host_metrics('train/goub', last_goub_info))
+            metrics.update(_to_host_metrics('train/critic', last_critic_info))
+            metrics.update(_to_host_metrics('train/actor', last_actor_info))
+            metrics.update(_to_host_metrics('train', last_coupling_info))
             metrics['train/critic/primary_score'] = extract_critic_primary_score(last_critic_info)
-            _emit_metric_means(metrics, 'train/goub', goub_metric_sums, len(goub_losses))
-            _emit_metric_means(metrics, 'train/critic', critic_metric_sums, len(critic_losses))
-            _emit_metric_means(metrics, 'train/actor', actor_metric_sums, len(actor_losses))
-            _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, len(critic_scores))
+            _emit_metric_means(metrics, 'train/goub', goub_metric_sums, steps_done)
+            _emit_metric_means(metrics, 'train/critic', critic_metric_sums, steps_done)
+            _emit_metric_means(metrics, 'train/actor', actor_metric_sums, steps_done)
+            _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, steps_done)
+            # Backward-compatible aliases for legacy log/dashboard consumers.
+            _alias = {
+                'train/goub/loss_epoch_mean': 'train/goub/phase1/loss_epoch_mean',
+                'train/critic/loss_epoch_mean': 'train/critic/dqc_critic/total_loss_epoch_mean',
+                'train/value/loss_epoch_mean': 'train/critic/action_critic/value_loss_epoch_mean',
+                'train/actor/loss_epoch_mean': 'train/actor/spi_actor/actor_loss_epoch_mean',
+                'train/coupling/critic_score_epoch_mean': 'train/coupling/coupling/critic_score_mean_epoch_mean',
+            }
+            for dst, src in _alias.items():
+                if src in metrics:
+                    metrics[dst] = metrics[src]
             metrics['train/epoch'] = float(epoch)
             if eval_freq > 0 and epoch % eval_freq == 0:
                 metrics.update(

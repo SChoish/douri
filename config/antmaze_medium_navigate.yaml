@@ -19,7 +19,7 @@ plan_noise_scale: 0.01
 measure_timing: false
 eval_freq: 100
 eval_task_ids: "1,2,3,4,5"
-eval_episodes_per_task: 5
+eval_episodes_per_task: 10
 eval_max_chunks: 200
 eval_goal_tol: 0.5
 eval_goal_dims: "0,1"
@@ -29,6 +29,7 @@ eval_goal_dims: "0,1"
 goub:
   rollout_loss_weight: 1.0      # default 0.25
   value_geom_sample: false      # default true; align with DQC-style relabeling
+  subgoal_value_alpha: 0.1      # weight on V(ŝ_g, g) in subgoal loss; 0 disables
 
 critic_agent:
   action_chunk_horizon: 5       # default 10

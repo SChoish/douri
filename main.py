@@ -83,7 +83,7 @@ flags.DEFINE_float('plan_noise_scale', 1.0, 'Noise scale used for stochastic GOU
 flags.DEFINE_boolean('measure_timing', False, 'Whether to measure and log per-phase wall-clock timings.')
 flags.DEFINE_integer('eval_freq', 0, 'Run validation loss and env evaluation every N epochs; <= 0 disables.')
 flags.DEFINE_string('eval_task_ids', '1,2,3,4,5', 'Comma-separated OGBench task ids for env evaluation.')
-flags.DEFINE_integer('eval_episodes_per_task', 5, 'Number of env evaluation episodes to run for each task id.')
+flags.DEFINE_integer('eval_episodes_per_task', 10, 'Number of env evaluation episodes to run for each task id.')
 flags.DEFINE_integer('eval_max_chunks', 50, 'Maximum action chunks to execute per evaluation episode.')
 flags.DEFINE_float('eval_goal_tol', 0.5, 'Goal tolerance for marking env evaluation success.')
 flags.DEFINE_string('eval_goal_dims', '0,1', 'Comma-separated observation dims used for env goal distance.')

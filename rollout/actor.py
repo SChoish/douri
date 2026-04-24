@@ -62,7 +62,13 @@ def _load_actor_config_from_flags(flags_path: Path) -> dict:
     base = get_actor_config()
     for k, v in act.items():
         base[k] = v
-    return dict(base)
+    d = dict(base)
+    # Saved runs may only have legacy ``spi_goal_conditioning``; defaults still set
+    # ``spi_conditioned='subgoal'`` from ``get_actor_config()``, so merge ``spi_conditioned``
+    # from legacy when the run did not write the canonical key.
+    if 'spi_conditioned' not in act and 'spi_goal_conditioning' in act:
+        d['spi_conditioned'] = str(act['spi_goal_conditioning']).strip().lower()
+    return d
 
 
 def _align_action_to_env(a: np.ndarray, env_dim: int) -> np.ndarray:
@@ -291,6 +297,13 @@ def main() -> None:
     print(f'Actor conditioning at inference: spi_conditioned={spi_conditioned!r} '
           f"(actor sees {'predicted subgoal' if spi_conditioned == 'subgoal' else 'global goal'})")
 
+    spi_conditioned = str(
+        actor_cfg.get('spi_conditioned', actor_cfg.get('spi_goal_conditioning', 'subgoal'))
+    ).strip().lower()
+    print(
+        f'Actor conditioning at inference: spi_conditioned={spi_conditioned!r} '
+        f"(actor sees {'predicted subgoal' if spi_conditioned == 'subgoal' else 'global goal'})"
+    )
     roll, hats, n_chunks, reached, env_frames = rollout_goub_actor_env(
         env,
         goub_agent,

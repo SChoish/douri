@@ -1,6 +1,6 @@
 # Joint GOUB + critic + SPI actor (global-goal conditioning) — short 200-epoch run.
 # Same as config/antmaze_large_navigate.yaml except:
-#   - actor.spi_conditioned: goal   (π and Q are conditioned on the global high_actor_goals
+#   - actor.spi_conditioned: goal   (pi and Q are conditioned on the global high_actor_goals
 #                                    instead of GOUB predict_subgoal(s, g_global))
 #   - train_epochs: 200             (sanity-length sweep)
 
@@ -33,7 +33,19 @@ eval_goal_dims: "0,1"
 goub:
   rollout_loss_weight: 1.0      # default 0.25
   value_geom_sample: false      # default true; align with DQC-style relabeling
-  subgoal_value_alpha: 0.1      # weight on V(ŝ_g, g) in subgoal loss; 0 disables
+  subgoal_value_alpha: 0.1      # weight on V(s_g, g) in subgoal loss; 0 disables
+  bridge_type: unidb_gou
+  bridge_gamma: 1.0e+7
+  subgoal_distribution: diag_gaussian
+  subgoal_log_std_min: -5.0
+  subgoal_log_std_max: 1.0
+  subgoal_temperature: 1.0
+  subgoal_use_mean_for_actor_goal: true
+  subgoal_nll_weight: 1.0
+  subgoal_mse_weight: 0.25
+  subgoal_var_reg_weight: 0.0001
+  subgoal_fr_spi_weight: 0.0
+  subgoal_fr_spi_tau: 1.0
 
 critic_agent:
   action_chunk_horizon: 5       # default 10
@@ -44,4 +56,4 @@ actor:
   spi_tau: 5.0
   spi_beta: 1.0
   spi_actor_layer_norm: false
-  spi_conditioned: goal         # default 'subgoal'; 'goal' = π/Q both see global goal
+  spi_conditioned: goal         # default 'subgoal'; 'goal' = pi/Q both see global goal

@@ -14,6 +14,25 @@ from utils.flax_utils import TrainState, nonpytree_field
 from utils.networks import MLP
 
 
+SPI_CONDITIONED_CHOICES = ('subgoal', 'goal')
+# Backward-compat alias for the old key name (`spi_goal_conditioning`); kept so
+# already-saved checkpoints / external imports do not break.
+SPI_GOAL_CONDITIONING_CHOICES = SPI_CONDITIONED_CHOICES
+
+
+def validate_spi_conditioned(value: str) -> str:
+    v = str(value).strip().lower()
+    if v not in SPI_CONDITIONED_CHOICES:
+        raise ValueError(
+            f"actor.spi_conditioned must be one of {SPI_CONDITIONED_CHOICES}, got {value!r}."
+        )
+    return v
+
+
+# Legacy name preserved for any external callers; same semantics.
+validate_spi_goal_conditioning = validate_spi_conditioned
+
+
 class DeterministicChunkActor(nn.Module):
     """Deterministic actor that outputs a flattened action chunk."""
 
@@ -167,6 +186,17 @@ class JointActorAgent(flax.struct.PyTreeNode):
         ex_obs = jnp.asarray(ex_observations, dtype=jnp.float32)
         ex_goal = None if ex_goals is None else jnp.asarray(ex_goals, dtype=jnp.float32)
 
+        config = dict(config)
+        # Accept the legacy key ``spi_goal_conditioning`` from older checkpoints / configs
+        # and migrate it to the canonical ``spi_conditioned`` so the rest of the agent only
+        # has to look at one key. If both are set, the canonical name wins.
+        if 'spi_conditioned' not in config and 'spi_goal_conditioning' in config:
+            config['spi_conditioned'] = config['spi_goal_conditioning']
+        config['spi_conditioned'] = validate_spi_conditioned(
+            config.get('spi_conditioned', 'subgoal')
+        )
+        config.pop('spi_goal_conditioning', None)
+
         actor_def = DeterministicChunkActor(
             hidden_dims=(512, 512, 512),
             action_dim=int(config['actor_chunk_horizon']) * int(config['action_dim']),
@@ -196,6 +226,7 @@ def get_actor_config():
             #     → π/Q both see the final goal; SPI prox still pulls toward GOUB
             #       proposal chunks (which were planned to subgoals).
             # Set in ``main._build_actor_batch_from_goub`` via ``spi_goals``.
+            # Legacy alias accepted from saved checkpoints: ``spi_goal_conditioning``.
             spi_conditioned='subgoal',
             actor_chunk_horizon=ml_collections.config_dict.placeholder(int),
             action_dim=2,

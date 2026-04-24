@@ -46,6 +46,18 @@ YAML top-level에서 자주 만지는 값:
 - `batch_size`, `joint_horizon` (= `goub_N` = `subgoal_steps` = `full_chunk_horizon`)
 - `plan_candidates`, `plan_noise_scale` (`plan_candidates > 1`이면 stochastic GOUB sampling)
 
+`goub:` 블록에서 새로 추가된 옵션 (모두 opt-in, 기본값은 기존 동작과 동일):
+
+| 키 | 의미 |
+|----|------|
+| `bridge_type` | `"goub"`(기본, 종전과 동일) 또는 `"unidb_gou"`(아래 UniDB-GOU 절 참고) |
+| `bridge_gamma` | UniDB-GOU 소프트 브릿지의 유한 γ. γ가 클수록 GOUB와 같아짐 |
+| `subgoal_distribution` | `"deterministic"`(기본) 또는 `"diag_gaussian"`. 분포형 서브골 학습 활성화 |
+| `subgoal_log_std_min` / `subgoal_log_std_max` | log std 클리핑 범위 |
+| `subgoal_use_mean_for_actor_goal` | true이면 SPI actor의 `spi_goals`로 분포의 평균을 사용 |
+| `subgoal_nll_weight`, `subgoal_mse_weight`, `subgoal_var_reg_weight` | NLL / 평균 MSE / 분산 정규화 가중치 |
+| `subgoal_fr_spi_weight`, `subgoal_fr_spi_tau` | (선택) FR/SPI 스타일 작은 서브골 정규화. 기본 0 |
+
 ## 학습 실행
 
 ```bash
@@ -106,6 +118,32 @@ loss   = mean( -Q̂ + prox / (2 · spi_tau) )
   - Random goal 샘플은 영향 없음 (`t_g = T_final`, `t+K ≤ T_episode`라 어차피 `t+K`로 클립).
   - `validate_sample_batch`는 `clip_path_to_goal=true`일 때 `trajectory_indices`의 step 0을 허용하며, 0은 한 행의 contiguous 접미사로만 나타나야 합니다.
 
+#### `actor.spi_conditioned`
+
+SPI에서 actor MLP 입력과 critic Q (proposal rescoring + actor loss의 `Q(s,g,π)`)에 어떤 goal을 조건으로 줄지 선택합니다. (이전 이름 `spi_goal_conditioning`은 alias로 그대로 받습니다.)
+
+| 값 | 의미 |
+|----|------|
+| `subgoal` (기본) | GOUB가 후보별로 만든 sub-goal (`candidate_goals`)을 critic Q에, `spi_goals`(=GOUB 평균 sub-goal 또는 `high_actor_goals` ― `goub.subgoal_use_mean_for_actor_goal` 플래그에 따름)을 actor MLP에 사용. 기존 동작 그대로. |
+| `goal` | actor MLP와 critic Q **둘 다** 항상 전역 goal `high_actor_goals`로 conditioning. `candidate_goals`은 rescoring에서 사용하지 않으며, `subgoal_use_mean_for_actor_goal`은 무시됩니다. |
+
+`main._build_actor_batch_from_goub`이 위 선택에 따라 `spi_goals` 키만 바꿔서 actor batch에 넣고, `_evaluate_env_tasks` / `rollout/actor.py`도 같은 conditioning을 inference에서 mirror하므로 train/eval이 일관됩니다.
+
+### `goub.clip_path_to_goal` (subgoal/bridge 끝점 정합)
+
+`PathHGCDataset`은 길이 `K = subgoal_steps`의 `trajectory_segment = (s_t, ..., s_{t+K})`를
+샘플링합니다. `clip_path_to_goal`로 가까운 goal 처리 방식을 선택합니다 (default `false`).
+
+- `false` (legacy): bridge 끝점 `x_0 = s_{t+K}`, subgoal_net 교사도 `s_{t+K}`. Goal이 `K`보다
+  가까워도 항상 `K` 스텝 앞 상태를 가르치므로, 추론 시 가까운 goal 근처에서 subgoal이
+  goal을 "넘어" 예측되며 bridge가 OOD 영역으로 들어가 정책이 goal 근처를 헤매는 현상을 유도할 수 있습니다.
+- `true` (clip + pad): per-row 끝점 `x_0 = s_{min(t+K, t_g)}`, segment 꼬리는 `s_{t_g}`로 패딩.
+  Bridge / subgoal_net 모두 "도달 후 머무르기" 신호를 학습합니다.
+  - `L_goub`, `L_path`, `L_roll`은 식 변경 없음 (`x_0`/`segment` 키만 의미가 바뀜).
+  - `L_subgoal`의 교사 `target = batch['high_actor_targets']`도 자동으로 클립 값을 받습니다.
+  - Random goal 샘플은 영향 없음 (`t_g = T_final`, `t+K ≤ T_episode`라 어차피 `t+K`로 클립).
+  - `validate_sample_batch`는 `clip_path_to_goal=true`일 때 `trajectory_indices`의 step 0을 허용하며, 0은 한 행의 contiguous 접미사로만 나타나야 합니다.
+
 ## 런 디렉터리 레이아웃
 
 ```text
@@ -138,15 +176,22 @@ runs/<YYYYMMDD_HHMMSS>_joint_dqc_seed<seed>_<env_name>/
 주요 로깅 키:
 
 - `phase1/loss`, `phase1/loss_goub`, `phase1/loss_path_step`, `phase1/loss_roll`
-- `phase1/loss_subgoal`, `phase1/loss_idm`
+- `phase1/loss_subgoal`, `phase1/loss_subgoal_mse`, `phase1/loss_idm`
+- `phase1/subgoal_value_mean`, `phase1/subgoal_value_bonus_mean`
 - `phase1/eps_norm`, `phase1/mu_true_norm`, `phase1/mu_pred_norm`, `phase1/xN_minus_1_norm`
 - `phase1/first_step_l1`, `phase1/first_step_xy_l2`, `phase1/roll_h_l1`
+- (분포형 서브골 모드 추가) `phase1/subgoal_nll`, `phase1/subgoal_std_mean`, `phase1/subgoal_std_max`, `phase1/subgoal_fr_spi`, `phase1/subgoal_mode`
+- (브릿지 식별) `bridge/bridge_type` (0=goub, 1=unidb_gou), `bridge/bridge_gamma`
 
 DQC critic / SPI actor / coupling 관련:
 
 - `action_critic/value_loss`, `action_critic/distill_loss`, `chunk_critic/critic_loss`
 - `spi_actor/actor_loss`, `spi_actor/q_mean`, `spi_actor/prox_mean`
 - `coupling/critic_score_*`: critic이 GOUB 후보 chunk에 매기는 평균 점수
+- `coupling/critic_score_gap_top1_top2`: top-1과 top-2 후보 점수 차 (margin 모니터링)
+- `coupling/proposal_count`: 후보 수 (= `plan_candidates`)
+- `coupling/proposal_goal_norm_mean`, `coupling/proposal_goal_std_mean`: 분포형 서브골에서
+  샘플된 endpoint들의 norm 평균과 후보 간 표준편차 평균
 
 에포크 집계는 `train.csv` / `run.log` (옵션으로 W&B)에 기록됩니다. eval 키는 `eval/...`(actor)와 `eval_idm/...`(IDM 폴백) 두 계열이 있습니다.
 
@@ -194,6 +239,78 @@ python -m rollout.actor \
   --task_id=1 \
   --out_mp4=rollout_actor_task1.mp4
 ```
+
+## 분포형 서브골 / UniDB-GOU 소프트 브릿지 (옵트인)
+
+기본 파이프라인은 **GOUB dynamics → DQC critic rescoring → SPI actor**이며 그대로 유지됩니다.
+이번에 추가된 것은 (1) 서브골 인터페이스의 **확률화**와 (2) 브릿지의 **finite-γ 소프트화**
+두 가지뿐이며, 둘 다 `goub:` 블록의 한두 줄로 켜고 끌 수 있습니다.
+
+### 1) 결정론적 점 서브골 vs 분포형 서브골
+
+기존(default, `subgoal_distribution: "deterministic"`):
+
+- `SubgoalEstimatorNet(s, g_high) → ŝ_g`(점 추정)
+- 손실: `MSE(ŝ_g, target) − α · V(ŝ_g, g_high)`
+- `build_actor_proposals`는 이 점 `ŝ_g`로 GOUB 브릿지를 굴려 `plan_candidates`개의 trajectory를 만든 뒤
+  IDM으로 chunk를 디코드.  stochasticity는 `plan_noise_scale`(브릿지 노이즈)로만 들어옴.
+
+신규(`subgoal_distribution: "diag_gaussian"`):
+
+- `DistributionalSubgoalEstimatorNet(s, g_high) → (μ, log_std)` (대각 Gaussian)
+- 손실 (가산적):
+  ```
+  loss_sub = w_nll · NLL(target | μ, log_std)
+           + w_mse · ||μ − target||²
+           + w_var · mean(log_std²)
+           − E[V(μ, g_high)]                # 기존 value bonus 그대로 유지 (μ 사용)
+           + w_fr  · fr_term                # 선택, 기본 0
+  ```
+- `build_actor_proposals`는 먼저 `q(g_sub | s, g_high)`에서 endpoint를 N개 샘플하고,
+  각 endpoint에 대해 별도로 GOUB 브릿지를 굴려 chunk를 디코드.  그래서 stochasticity가
+  **subgoal 분포**에서도 흘러 들어옴.
+- DQC critic은 후보별 **per-candidate goal**(`[B, N, D]`)로 rescore되며, SPI actor는
+  `subgoal_use_mean_for_actor_goal=true`일 때 `μ`를 `spi_goals`로 사용.
+
+`plan_candidates` / `plan_noise_scale`의 의미는 **그대로**입니다:
+
+- `plan_candidates`: 최종 후보(=action chunk) 개수.
+- `plan_noise_scale`: 각 endpoint 주변 GOUB 브릿지 샘플링 노이즈.
+- 본 변경은 *value-filter centric* 재설계가 아닙니다.  단지 endpoint를 샘플 가능한 분포로 바꾼 것뿐.
+
+### 2) UniDB-GOU 소프트 브릿지
+
+기존 GOUB는 Doob h-transform 관점에서 γ→∞ 극한에 해당합니다.  `bridge_type: "unidb_gou"`로 바꾸면
+유한 γ를 사용하는 소프트 브릿지가 켜집니다 (`utils/goub.py`):
+
+- 브릿지 보간 가중치:
+  `bridge_w_gamma ~ exp(−bar_theta_t) · (γ⁻¹ + σ²_{t:T}) / (γ⁻¹ + σ²_T)`
+- 역방향 drift 분모:
+  `drift_gamma ~ θ_t + g² · exp(−2·bar_theta_{t:T}) / (γ⁻¹ + σ²_{t:T})`
+
+조건부 분산 `bridge_var`은 안정성을 위해 기존(γ=∞) 형태를 유지합니다.  γ가 매우 크면
+`unidb_gou`는 수치적으로 `goub`와 같은 결과가 나오므로 backward-compatible합니다.
+(예: `bridge_gamma: 1.0e7` → 사실상 GOUB.  `bridge_gamma: 1.0e2` → 분명한 소프트화.)
+
+### 3) 예시 YAML 스니펫
+
+```yaml
+goub:
+  bridge_type: unidb_gou
+  bridge_gamma: 1.0e7
+  subgoal_distribution: diag_gaussian
+  subgoal_log_std_min: -5.0
+  subgoal_log_std_max: 1.0
+  subgoal_temperature: 1.0
+  subgoal_use_mean_for_actor_goal: true
+  subgoal_nll_weight: 1.0
+  subgoal_mse_weight: 0.25
+  subgoal_var_reg_weight: 1.0e-4
+  subgoal_fr_spi_weight: 0.0     # 끄려면 0
+```
+
+기존 YAML은 그대로 유효합니다.  `bridge_type` / `subgoal_distribution`을 명시하지 않으면
+각각 `"goub"` / `"deterministic"`이 적용되어 종전 동작을 그대로 재현합니다.
 
 ## AntMaze Large 실험 메모
 

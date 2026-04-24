@@ -1,8 +1,8 @@
 # Joint GOUB + critic + SPI actor — global-goal SPI + bridge/subgoal clip-and-pad
 # with stronger SPI proximal (smaller tau).
 # Same as antmaze_large_navigate_spi_goal_clip.yaml except actor.spi_tau: 0.1 (was 5.0).
-# Smaller tau ⇒ heavier W²-proximal pull toward GOUB proposal chunks (which target
-# subgoals); π should imitate proposals more closely even when conditioned on g_global.
+# Smaller tau => heavier W^2-proximal pull toward GOUB proposal chunks (which target
+# subgoals); pi should imitate proposals more closely even when conditioned on g_global.
 
 env_name: antmaze-large-navigate-v0
 seed: 0
@@ -31,6 +31,18 @@ goub:
   rollout_loss_weight: 1.0
   value_geom_sample: false
   subgoal_value_alpha: 0.1
+  bridge_type: unidb_gou
+  bridge_gamma: 1.0e+7
+  subgoal_distribution: diag_gaussian
+  subgoal_log_std_min: -5.0
+  subgoal_log_std_max: 1.0
+  subgoal_temperature: 1.0
+  subgoal_use_mean_for_actor_goal: true
+  subgoal_nll_weight: 1.0
+  subgoal_mse_weight: 0.25
+  subgoal_var_reg_weight: 0.0001
+  subgoal_fr_spi_weight: 0.0
+  subgoal_fr_spi_tau: 1.0
   clip_path_to_goal: true
 
 critic_agent:

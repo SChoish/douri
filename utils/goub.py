@@ -22,14 +22,64 @@ Indexing conventions
 * Cumulative arrays ``bar_theta``, ``bar_sigma2``, ``bar_theta_nN``,
   ``bar_sigma2_nN``, ``bridge_var``, ``bridge_w``:
   shape (N+1,), index n corresponds to step n.
+
+UniDB-GOU soft bridge
+---------------------
+Vanilla GOUB corresponds to the Doob h-transform limit ``gamma -> infinity``
+of the UniDB family.  Setting ``bridge_type='unidb_gou'`` with a finite
+``bridge_gamma`` switches to the soft-bridge variant by replacing every
+``bar_sigma_{n:N}^2`` denominator with ``gamma^{-1} + bar_sigma_{n:N}^2``
+(and similarly for ``bar_sigma_N^2`` in the bridge interpolation weight).
+Per the design note, only the *means* (``bridge_w`` and the drift coefficient
+in ``model_mean``) absorb the soft-bridge denominator; the conditional
+``bridge_var`` keeps the gamma=infinity expression for sampling stability.
+With ``bridge_type='goub'`` (default) the schedule reproduces the original
+behaviour bit-for-bit.
 """
 
 import jax
 import jax.numpy as jnp
 
 
-def make_goub_schedule(N: int, beta_min: float = 0.1, beta_max: float = 20.0, lambda_: float = 1.0):
-    """Precompute all GOUB-inspired schedule quantities."""
+_VALID_BRIDGE_TYPES = ('goub', 'unidb_gou')
+
+
+def _resolve_gamma_inv(bridge_type: str, bridge_gamma: float) -> float:
+    """Map (bridge_type, bridge_gamma) to the soft-bridge denominator offset."""
+    if bridge_type not in _VALID_BRIDGE_TYPES:
+        raise ValueError(
+            f"bridge_type must be one of {_VALID_BRIDGE_TYPES}, got {bridge_type!r}."
+        )
+    if bridge_type == 'goub':
+        return 0.0
+    gamma = float(bridge_gamma)
+    if not (gamma > 0.0):
+        raise ValueError(
+            f'bridge_gamma must be > 0 for unidb_gou, got {bridge_gamma!r}.'
+        )
+    return 1.0 / gamma
+
+
+def make_goub_schedule(
+    N: int,
+    beta_min: float = 0.1,
+    beta_max: float = 20.0,
+    lambda_: float = 1.0,
+    bridge_type: str = 'goub',
+    bridge_gamma: float = 1.0e7,
+):
+    """Precompute all GOUB-inspired schedule quantities.
+
+    Args:
+        N: number of diffusion steps.
+        beta_min, beta_max, lambda_: linear-beta OU schedule parameters.
+        bridge_type: ``'goub'`` (Doob h-transform, ``gamma -> infinity``) or
+            ``'unidb_gou'`` (UniDB-GOU soft bridge with finite ``gamma``).
+        bridge_gamma: finite gamma for ``'unidb_gou'``; ignored when
+            ``bridge_type='goub'``.
+    """
+    gamma_inv = _resolve_gamma_inv(bridge_type, bridge_gamma)
+
     steps = jnp.arange(1, N + 1, dtype=jnp.float32)
 
     # Per-step OU rate (linear schedule)
@@ -52,17 +102,25 @@ def make_goub_schedule(N: int, beta_min: float = 0.1, beta_max: float = 20.0, la
     bar_sigma2_nN = lambda_ ** 2 * (1.0 - jnp.exp(-2.0 * bar_theta_nN))  # (N+1,)
     bar_sigma2_N = bar_sigma2[-1]  # scalar
 
-    # Bridge variance and interpolation weight (indexed by step n)
-    denom = jnp.maximum(bar_sigma2_N, 1e-12)
-    bridge_var = bar_sigma2 * bar_sigma2_nN / denom  # (N+1,)
-    bridge_w = bar_sigma2_nN * jnp.exp(-bar_theta) / denom  # (N+1,)
+    # Soft-bridge denominators: gamma_inv == 0 reproduces vanilla GOUB.
+    gamma_inv_arr = jnp.asarray(gamma_inv, dtype=jnp.float32)
+    bar_sigma2_nN_gamma = gamma_inv_arr + bar_sigma2_nN  # (N+1,)
+    bar_sigma2_N_gamma = gamma_inv_arr + bar_sigma2_N    # scalar
+
+    # Bridge variance kept at the gamma=infinity form for sampling stability.
+    bridge_var = bar_sigma2 * bar_sigma2_nN / jnp.maximum(bar_sigma2_N, 1e-12)  # (N+1,)
+    # Bridge interpolation weight uses the soft-bridge denominator.
+    bridge_w = bar_sigma2_nN_gamma * jnp.exp(-bar_theta) / jnp.maximum(bar_sigma2_N_gamma, 1e-12)  # (N+1,)
 
     return dict(
         theta=theta, g2=g2, step_var=step_var,
         bar_theta=bar_theta, bar_sigma2=bar_sigma2,
         bar_theta_nN=bar_theta_nN, bar_sigma2_nN=bar_sigma2_nN,
+        bar_sigma2_nN_gamma=bar_sigma2_nN_gamma,
         bar_sigma2_N=bar_sigma2_N,
+        bar_sigma2_N_gamma=bar_sigma2_N_gamma,
         bridge_var=bridge_var, bridge_w=bridge_w,
+        gamma_inv=gamma_inv_arr,
     )
 
 
@@ -121,13 +179,19 @@ def posterior_mean(x_n, x_0, x_T, n, schedule):
 
 
 def model_mean(x_n, x_T, eps_pred, n, schedule):
-    """Parameterised posterior mean  mu_theta_{n-1}  (GOUB-inspired).
+    """Parameterised posterior mean  mu_theta_{n-1}  (GOUB / UniDB-GOU).
 
     ::
 
         mu_theta = x_n
-                 - (theta_n + g_n^2 exp(-2 bar_theta_{n:N}) / bar_sigma_{n:N}^2) (x_T - x_n)
+                 - (theta_n + g_n^2 exp(-2 bar_theta_{n:N})
+                              / (gamma^{-1} + bar_sigma_{n:N}^2)) (x_T - x_n)
                  - (g_n^2 / sqrt(bridge_var_n)) eps_theta
+
+    With ``gamma^{-1} = 0`` (i.e. ``bridge_type='goub'``) this collapses to the
+    vanilla GOUB drift; with finite ``gamma`` it implements the UniDB-GOU
+    soft-bridge drift.  ``bridge_var`` itself is kept at the gamma=infinity
+    expression for sampling stability.
 
     **Valid for n in {1, ..., N-1} only.**  At n = N the bridge variance is
     zero, making the eps coefficient singular.  The agent handles that
@@ -148,11 +212,11 @@ def model_mean(x_n, x_T, eps_pred, n, schedule):
     g2_n = schedule['g2'][k][..., None]
 
     bt_nN = schedule['bar_theta_nN'][n][..., None]
-    bs2_nN = schedule['bar_sigma2_nN'][n][..., None]
+    bs2_nN_gamma = schedule['bar_sigma2_nN_gamma'][n][..., None]
     bsp2 = schedule['bridge_var'][n][..., None]
     bsp = jnp.sqrt(jnp.maximum(bsp2, 1e-12))
 
-    drift = theta_n + g2_n * jnp.exp(-2.0 * bt_nN) / jnp.maximum(bs2_nN, 1e-12)
+    drift = theta_n + g2_n * jnp.exp(-2.0 * bt_nN) / jnp.maximum(bs2_nN_gamma, 1e-12)
     return x_n - drift * (x_T - x_n) - (g2_n / bsp) * eps_pred
 
 

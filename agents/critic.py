@@ -207,7 +207,20 @@ class DQCCriticAgent(flax.struct.PyTreeNode):
         obs_rep = jnp.repeat(obs[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
         if goals is not None:
             goals = jnp.asarray(goals, dtype=jnp.float32)
-            goal_rep = jnp.repeat(goals[:, None, :], num_candidates, axis=1).reshape(goals.shape[0] * num_candidates, -1)
+            if goals.ndim == 3:
+                # Per-candidate goals [B, N, D] -> directly flatten.
+                if goals.shape[1] != num_candidates:
+                    raise ValueError(
+                        f'score_action_chunks: per-candidate goals shape {goals.shape} does not '
+                        f'match num_candidates={num_candidates}.'
+                    )
+                goal_rep = goals.reshape(goals.shape[0] * num_candidates, -1)
+            elif goals.ndim == 2:
+                goal_rep = jnp.repeat(goals[:, None, :], num_candidates, axis=1).reshape(
+                    goals.shape[0] * num_candidates, -1
+                )
+            else:
+                raise ValueError(f'score_action_chunks: goals must be rank-2/3, got shape={goals.shape}')
         else:
             goal_rep = None
         flat_actions = actions.reshape(obs.shape[0] * num_candidates, -1)
@@ -330,7 +343,10 @@ def validate_joint_mode(critic_config, actor_config=None) -> None:
         return
     if int(actor_config.get('actor_chunk_horizon', 0)) < 1:
         raise ValueError('Joint training requires actor_chunk_horizon >= 1.')
-    spi_cond = str(actor_config.get('spi_conditioned', 'subgoal')).lower()
+    # Accept canonical ``spi_conditioned`` and legacy alias ``spi_goal_conditioning``.
+    spi_cond = str(
+        actor_config.get('spi_conditioned', actor_config.get('spi_goal_conditioning', 'subgoal'))
+    ).strip().lower()
     # Lazy import to avoid circular dependency between agents.actor and agents.critic.
     from agents.actor import SPI_CONDITIONED_CHOICES
 

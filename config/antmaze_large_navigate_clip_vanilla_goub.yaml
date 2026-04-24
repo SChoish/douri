@@ -1,0 +1,44 @@
+# AntMaze large: same *intent* as a medium "navigate + clip" stack (env_name only differs),
+# but **vanilla GOUB bridge** (no UniDB). `clip_path_to_goal: true` on the dataset/bridge path.
+# SPI defaults to subgoal-conditioned (`spi_conditioned: subgoal`).
+
+env_name: antmaze-large-navigate-v0
+seed: 0
+run_group: antmaze_navigate
+
+train_epochs: 500
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+
+use_wandb: false
+use_tqdm: false
+
+batch_size: 1024
+joint_horizon: 25
+plan_candidates: 1
+plan_noise_scale: 0.01
+measure_timing: false
+eval_freq: 100
+eval_task_ids: "1,2,3,4,5"
+eval_episodes_per_task: 10
+eval_max_chunks: 200
+eval_goal_tol: 0.5
+eval_goal_dims: "0,1"
+
+goub:
+  rollout_loss_weight: 1.0
+  value_geom_sample: false
+  subgoal_value_alpha: 0.1
+  # Explicit vanilla bridge (default); do **not** set `unidb_gou` here.
+  bridge_type: goub
+  clip_path_to_goal: true
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.99
+
+actor:
+  spi_tau: 1.0
+  spi_beta: 1.0
+  spi_actor_layer_norm: true
+  spi_conditioned: subgoal

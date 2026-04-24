@@ -59,6 +59,8 @@ class GOUBEpsilonNet(nn.Module):
 
 
 class SubgoalEstimatorNet(nn.Module):
+    """Deterministic point subgoal estimator (legacy, ``subgoal_distribution='deterministic'``)."""
+
     hidden_dims: Sequence[int]
     state_dim: int
     layer_norm: bool = True
@@ -71,6 +73,39 @@ class SubgoalEstimatorNet(nn.Module):
             activate_final=False,
             layer_norm=self.layer_norm,
         )(inp)
+
+
+class DistributionalSubgoalEstimatorNet(nn.Module):
+    """Diagonal-Gaussian subgoal estimator (``subgoal_distribution='diag_gaussian'``).
+
+    Returns ``(mu, log_std)`` so the GOUB phase1 loss can mix NLL, mean MSE,
+    a small log-std regulariser, and the existing critic-V subgoal bonus.
+    Stochasticity for actor proposals is sampled from this distribution
+    in :meth:`_GOUBAgentCore.sample_subgoal_candidates`.
+    """
+
+    hidden_dims: Sequence[int]
+    state_dim: int
+    layer_norm: bool = True
+    log_std_min: float = -5.0
+    log_std_max: float = 1.0
+
+    @nn.compact
+    def __call__(self, observations, high_actor_goals):
+        inp = jnp.concatenate([observations, high_actor_goals], axis=-1)
+        trunk = MLP(
+            hidden_dims=tuple(self.hidden_dims),
+            activate_final=True,
+            layer_norm=self.layer_norm,
+        )(inp)
+        mu = nn.Dense(self.state_dim, name='mu_head')(trunk)
+        log_std_raw = nn.Dense(self.state_dim, name='log_std_head')(trunk)
+        log_std = jnp.clip(log_std_raw, self.log_std_min, self.log_std_max)
+        return mu, log_std
+
+
+def _subgoal_mode(config) -> str:
+    return str(config.get('subgoal_distribution', 'deterministic')).lower()
 
 
 class _GOUBAgentCore(flax.struct.PyTreeNode):
@@ -138,11 +173,12 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
         loss_goub = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
 
-        pred_sg = self.network.select('subgoal_net')(
+        sg_out = self.network.select('subgoal_net')(
             batch['observations'],
             batch['high_actor_goals'],
             params=grad_params,
         )
+        pred_sg = sg_out[0] if isinstance(sg_out, tuple) else sg_out
         loss_sub = jnp.mean((pred_sg - batch['high_actor_targets']) ** 2)
         loss = loss_goub + sg_w * loss_sub
 
@@ -166,6 +202,13 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         }
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
+        info['bridge/bridge_type'] = jnp.asarray(
+            1.0 if str(self.config.get('bridge_type', 'goub')).lower() == 'unidb_gou' else 0.0,
+            dtype=jnp.float32,
+        )
+        info['bridge/bridge_gamma'] = jnp.asarray(
+            float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
+        )
         return loss, info
 
     @jax.jit
@@ -310,27 +353,115 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             out = out[0]
         return out
 
+    def _subgoal_forward(self, observations, high_actor_goals, params=None):
+        """Raw subgoal-net forward.
+
+        Returns either a single tensor (deterministic mode) or a ``(mu, log_std)``
+        tuple (diag_gaussian mode).  Used internally; external callers should
+        prefer ``infer_subgoal`` / ``infer_subgoal_distribution``.
+        """
+        return self.network.select('subgoal_net')(observations, high_actor_goals, params=params)
+
     @jax.jit
     def predict_subgoal(self, observations, high_actor_goals):
+        """Backward-compatible: returns the deterministic / mean subgoal point."""
         squeeze = observations.ndim == 1
         if squeeze:
             observations = observations[None]
             high_actor_goals = high_actor_goals[None]
-        out = self.network.select('subgoal_net')(observations, high_actor_goals)
+        out = self._subgoal_forward(observations, high_actor_goals)
+        if isinstance(out, tuple):
+            out = out[0]
         if squeeze:
             out = out[0]
         return out
 
     @jax.jit
     def infer_subgoal(self, observations, high_actor_goals):
+        """Backward-compatible alias for :meth:`predict_subgoal`."""
+        return self.predict_subgoal(observations, high_actor_goals)
+
+    @jax.jit
+    def infer_subgoal_mean(self, observations, high_actor_goals):
+        """Distributional API: returns mu (== deterministic point in legacy mode)."""
+        return self.predict_subgoal(observations, high_actor_goals)
+
+    @jax.jit
+    def infer_subgoal_distribution(self, observations, high_actor_goals):
+        """Distributional API: returns ``(mu, log_std)``.
+
+        In deterministic mode ``log_std`` is filled with ``log_std_min`` so the
+        distribution degenerates to a point mass under any sampler.
+        """
         squeeze = observations.ndim == 1
         if squeeze:
             observations = observations[None]
             high_actor_goals = high_actor_goals[None]
-        pred = self.network.select('subgoal_net')(observations, high_actor_goals)
+        out = self._subgoal_forward(observations, high_actor_goals)
+        if isinstance(out, tuple):
+            mu, log_std = out
+        else:
+            mu = out
+            log_std_min = float(self.config.get('subgoal_log_std_min', -5.0))
+            log_std = jnp.full_like(mu, log_std_min)
         if squeeze:
-            pred = pred[0]
-        return pred
+            mu = mu[0]
+            log_std = log_std[0]
+        return mu, log_std
+
+    @partial(jax.jit, static_argnames=('num_candidates', 'include_mean'))
+    def sample_subgoal_candidates(
+        self,
+        observations,
+        high_actor_goals,
+        rng,
+        *,
+        num_candidates: int,
+        include_mean: bool = True,
+    ):
+        """Sample ``num_candidates`` subgoal endpoints.
+
+        - In ``diag_gaussian`` mode this draws from ``q(g_sub | s, g_high)``
+          with optional ``subgoal_temperature`` scaling and optionally pins
+          the first sample to ``mu``.
+        - In ``deterministic`` mode every candidate equals the predicted
+          point (subgoal-distribution sampling is a no-op there; trajectory
+          stochasticity still flows through ``plan_noise_scale``).
+
+        Returns ``(candidate_goals [B, N, D], mu [B, D])``.
+        """
+        squeeze = observations.ndim == 1
+        if squeeze:
+            observations = observations[None]
+            high_actor_goals = high_actor_goals[None]
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        goals = jnp.asarray(high_actor_goals, dtype=jnp.float32)
+        if num_candidates < 1:
+            raise ValueError(f'num_candidates must be >= 1, got {num_candidates}.')
+
+        out = self._subgoal_forward(obs, goals)
+        if isinstance(out, tuple):
+            mu, log_std = out
+            std = jnp.exp(log_std) * float(self.config.get('subgoal_temperature', 1.0))
+            n_sample = num_candidates - 1 if include_mean else num_candidates
+            if n_sample > 0:
+                eps = jax.random.normal(rng, (n_sample, mu.shape[0], mu.shape[-1]))
+                sampled = mu[None, :, :] + eps * std[None, :, :]
+                sampled = jnp.swapaxes(sampled, 0, 1)  # [B, n_sample, D]
+            else:
+                sampled = jnp.zeros((mu.shape[0], 0, mu.shape[-1]), dtype=mu.dtype)
+            if include_mean:
+                candidates = jnp.concatenate([mu[:, None, :], sampled], axis=1)
+            else:
+                candidates = sampled
+        else:
+            mu = out
+            candidates = jnp.broadcast_to(mu[:, None, :], (mu.shape[0], num_candidates, mu.shape[-1]))
+
+        if squeeze:
+            mu = mu[0]
+            candidates = candidates[0]
+        return candidates, mu
 
     @jax.jit
     def plan_from_high_goal(self, current_state, high_actor_goals):
@@ -356,31 +487,71 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         plan_candidates: int,
         sample_noise_scale: float = 0.0,
     ):
+        """Build candidate action chunks for the SPI rescoring path.
+
+        Returns
+        -------
+        actor_goal_mean : ``[B, D]``
+            Mean subgoal point used as ``spi_goals`` for the actor when
+            ``subgoal_use_mean_for_actor_goal=True`` (default).
+        candidate_actions : ``[B, N, ha, A]``
+            Decoded action chunks for the ``N = plan_candidates`` proposals.
+        candidate_goals : ``[B, N, D]``
+            Per-candidate subgoal endpoints used both to drive bridge
+            sampling and to rescore each candidate with its own goal.  In
+            deterministic mode this is just the mean broadcast across ``N``.
+        new_rng : updated PRNG key.
+        """
         obs = jnp.asarray(observations, dtype=jnp.float32)
         goals = jnp.asarray(high_actor_goals, dtype=jnp.float32)
-        predicted_subgoals = self.infer_subgoal(obs, goals)
+        sub_mode = _subgoal_mode(self.config)
 
-        if plan_candidates == 1:
-            sampled = self.sample_plan(
+        if sub_mode == 'diag_gaussian':
+            sub_rng, plan_rng, new_rng = jax.random.split(rng, 3)
+            candidate_goals, mu = self.sample_subgoal_candidates(
                 obs,
-                predicted_subgoals,
-                rng,
-                noise_scale=0.0,
-                num_steps=proposal_horizon,
-            )
-            new_rng, _ = jax.random.split(rng)
-            candidate_trajectories = sampled['trajectory'][:, None, ...]
-        else:
-            new_rng, sample_rng = jax.random.split(rng)
-            candidate_trajectories = self.sample_plan_candidates(
-                obs,
-                predicted_subgoals,
-                sample_rng,
+                goals,
+                sub_rng,
                 num_candidates=plan_candidates,
-                noise_scale=sample_noise_scale,
                 include_mean=True,
-                num_steps=proposal_horizon,
             )
+            per_rngs = jax.random.split(plan_rng, plan_candidates)
+            cand_endpoints = jnp.swapaxes(candidate_goals, 0, 1)  # [N, B, D]
+            traj_noise = float(sample_noise_scale)
+
+            def _per_candidate(rng_k, endpoint_k):
+                return self._sample_plan_trajectory(
+                    obs, endpoint_k, rng_k, traj_noise, num_steps=proposal_horizon
+                )
+
+            candidate_trajectories = jax.vmap(_per_candidate, in_axes=(0, 0))(per_rngs, cand_endpoints)
+            candidate_trajectories = jnp.swapaxes(candidate_trajectories, 0, 1)  # [B, N, K+1, D]
+        else:
+            mu = self._subgoal_forward(obs, goals)
+            if isinstance(mu, tuple):  # safety net (shouldn't happen in deterministic mode)
+                mu = mu[0]
+            if plan_candidates == 1:
+                sampled = self.sample_plan(
+                    obs,
+                    mu,
+                    rng,
+                    noise_scale=0.0,
+                    num_steps=proposal_horizon,
+                )
+                new_rng, _ = jax.random.split(rng)
+                candidate_trajectories = sampled['trajectory'][:, None, ...]
+            else:
+                new_rng, sample_rng = jax.random.split(rng)
+                candidate_trajectories = self.sample_plan_candidates(
+                    obs,
+                    mu,
+                    sample_rng,
+                    num_candidates=plan_candidates,
+                    noise_scale=sample_noise_scale,
+                    include_mean=True,
+                    num_steps=proposal_horizon,
+                )
+            candidate_goals = jnp.broadcast_to(mu[:, None, :], (mu.shape[0], plan_candidates, mu.shape[-1]))
 
         flat_trajectories = candidate_trajectories.reshape(
             -1, candidate_trajectories.shape[2], candidate_trajectories.shape[3]
@@ -389,7 +560,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         candidate_actions = candidate_actions.reshape(
             candidate_trajectories.shape[0], candidate_trajectories.shape[1], proposal_horizon, -1
         )
-        return predicted_subgoals, candidate_actions, new_rng
+        return mu, candidate_actions, candidate_goals, new_rng
 
     @classmethod
     def create(cls, seed, ex_observations, config, ex_actions=None):
@@ -415,6 +586,8 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             beta_min=config['goub_beta_min'],
             beta_max=config['goub_beta_max'],
             lambda_=config['goub_lambda'],
+            bridge_type=str(config.get('bridge_type', 'goub')),
+            bridge_gamma=float(config.get('bridge_gamma', 1.0e7)),
         )
 
         eps_net_def = GOUBEpsilonNet(
@@ -423,11 +596,25 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             time_embed_dim=config['time_embed_dim'],
             layer_norm=config['layer_norm'],
         )
-        subgoal_def = SubgoalEstimatorNet(
-            hidden_dims=tuple(config['subgoal_hidden_dims']),
-            state_dim=state_dim,
-            layer_norm=config['layer_norm'],
-        )
+        sub_mode = _subgoal_mode(config)
+        if sub_mode == 'deterministic':
+            subgoal_def = SubgoalEstimatorNet(
+                hidden_dims=tuple(config['subgoal_hidden_dims']),
+                state_dim=state_dim,
+                layer_norm=config['layer_norm'],
+            )
+        elif sub_mode == 'diag_gaussian':
+            subgoal_def = DistributionalSubgoalEstimatorNet(
+                hidden_dims=tuple(config['subgoal_hidden_dims']),
+                state_dim=state_dim,
+                layer_norm=config['layer_norm'],
+                log_std_min=float(config.get('subgoal_log_std_min', -5.0)),
+                log_std_max=float(config.get('subgoal_log_std_max', 1.0)),
+            )
+        else:
+            raise ValueError(
+                f"subgoal_distribution must be 'deterministic' or 'diag_gaussian', got {sub_mode!r}."
+            )
         idm_def = InverseDynamicsMLP(
             obs_dim=state_dim,
             action_dim=action_dim,
@@ -512,7 +699,7 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         w_p = float(self.config.get('path_loss_weight', 1.0))
         w_r = float(self.config.get('rollout_loss_weight', 0.25))
 
-        rng1, rng2 = jax.random.split(rng)
+        rng1, rng2, rng_fr = jax.random.split(rng, 3)
         n = jax.random.randint(rng1, (B,), 1, N + 1)
 
         is_boundary = n == N
@@ -561,11 +748,84 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         s = batch['observations']
         g_high = batch['high_actor_goals']
         target = batch['high_actor_targets']
-        pred_sg = self.network.select('subgoal_net')(s, g_high, params=grad_params)
-        subgoal_mse = jnp.mean((pred_sg - target) ** 2, axis=-1)
-        subgoal_value, subgoal_value_bonus = self._subgoal_value_bonus(pred_sg, g_high, critic_value_params)
-        loss_sub = jnp.mean(subgoal_mse) - jnp.mean(subgoal_value_bonus)
-        pred_sg_out = pred_sg
+        sub_mode = _subgoal_mode(self.config)
+
+        if sub_mode == 'diag_gaussian':
+            pred_mu, pred_log_std = self.network.select('subgoal_net')(s, g_high, params=grad_params)
+            pred_std = jnp.exp(pred_log_std)
+            inv_var = jnp.exp(-2.0 * pred_log_std)
+            diff_sg = target - pred_mu
+            nll_per_sample = 0.5 * jnp.sum(
+                diff_sg ** 2 * inv_var + 2.0 * pred_log_std + jnp.log(2.0 * jnp.pi), axis=-1
+            )
+            subgoal_mse = jnp.mean(diff_sg ** 2, axis=-1)
+            var_reg_per_sample = jnp.mean(pred_log_std ** 2, axis=-1)
+
+            w_fr = float(self.config.get('subgoal_fr_spi_weight', 0.0))
+            if w_fr > 0.0 and critic_value_params is not None:
+                k_fr = 4
+                fr_eps = jax.random.normal(rng_fr, (s.shape[0], k_fr, target.shape[-1]))
+                cand = jax.lax.stop_gradient(
+                    pred_mu[:, None, :] + pred_std[:, None, :] * fr_eps
+                )
+                value_def = ScalarValueNet(
+                    tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
+                    layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
+                )
+                cand_flat = cand.reshape(-1, cand.shape[-1])
+                g_high_flat = jnp.repeat(g_high[:, None, :], k_fr, axis=1).reshape(-1, g_high.shape[-1])
+                v_logits = value_def.apply({'params': critic_value_params}, cand_flat, g_high_flat)
+                v_cand = jax.nn.sigmoid(jnp.asarray(v_logits, dtype=jnp.float32)).reshape(s.shape[0], k_fr)
+                tau_fr = float(self.config.get('subgoal_fr_spi_tau', 1.0))
+                rho_fr = jax.lax.stop_gradient(jax.nn.softmax(v_cand / jnp.maximum(tau_fr, 1e-6), axis=1))
+                log_q = -0.5 * jnp.sum(
+                    ((cand - pred_mu[:, None, :]) ** 2) * inv_var[:, None, :]
+                    + 2.0 * pred_log_std[:, None, :]
+                    + jnp.log(2.0 * jnp.pi),
+                    axis=-1,
+                )
+                fr_term = -jnp.mean(jnp.sum(rho_fr * log_q, axis=1))
+            else:
+                fr_term = jnp.asarray(0.0, dtype=jnp.float32)
+
+            subgoal_value, subgoal_value_bonus = self._subgoal_value_bonus(
+                pred_mu, g_high, critic_value_params
+            )
+
+            w_nll = float(self.config.get('subgoal_nll_weight', 1.0))
+            w_mse = float(self.config.get('subgoal_mse_weight', 0.25))
+            w_var = float(self.config.get('subgoal_var_reg_weight', 1.0e-4))
+            loss_sub = (
+                w_nll * jnp.mean(nll_per_sample)
+                + w_mse * jnp.mean(subgoal_mse)
+                + w_var * jnp.mean(var_reg_per_sample)
+                - jnp.mean(subgoal_value_bonus)
+                + w_fr * fr_term
+            )
+            pred_sg_out = pred_mu
+            subgoal_extra_info = {
+                'phase1/subgoal_nll': jnp.mean(nll_per_sample),
+                'phase1/subgoal_std_mean': jnp.mean(pred_std),
+                'phase1/subgoal_std_max': jnp.max(pred_std),
+                'phase1/subgoal_fr_spi': fr_term,
+                'phase1/subgoal_mode': jnp.asarray(1.0, dtype=jnp.float32),
+            }
+        else:
+            pred_sg = self.network.select('subgoal_net')(s, g_high, params=grad_params)
+            subgoal_mse = jnp.mean((pred_sg - target) ** 2, axis=-1)
+            subgoal_value, subgoal_value_bonus = self._subgoal_value_bonus(
+                pred_sg, g_high, critic_value_params
+            )
+            loss_sub = jnp.mean(subgoal_mse) - jnp.mean(subgoal_value_bonus)
+            pred_sg_out = pred_sg
+            zero = jnp.asarray(0.0, dtype=jnp.float32)
+            subgoal_extra_info = {
+                'phase1/subgoal_nll': zero,
+                'phase1/subgoal_std_mean': zero,
+                'phase1/subgoal_std_max': zero,
+                'phase1/subgoal_fr_spi': zero,
+                'phase1/subgoal_mode': zero,
+            }
 
         loss = w_g * loss_goub + w_p * loss_path + w_r * loss_roll + sg_w * loss_sub
 
@@ -610,6 +870,15 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         }
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
+        info.update(subgoal_extra_info)
+        # Bridge identifiers (constant per run; logged for run-trace clarity).
+        info['bridge/bridge_type'] = jnp.asarray(
+            1.0 if str(self.config.get('bridge_type', 'goub')).lower() == 'unidb_gou' else 0.0,
+            dtype=jnp.float32,
+        )
+        info['bridge/bridge_gamma'] = jnp.asarray(
+            float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
+        )
 
         return loss, info
 
@@ -625,6 +894,11 @@ def _get_common_config():
             goub_beta_min=0.1,
             goub_beta_max=20.0,
             goub_lambda=1.0,
+            # UniDB-GOU soft-bridge controls.
+            # bridge_type='goub' reproduces vanilla GOUB exactly.
+            # bridge_type='unidb_gou' activates the finite-gamma soft bridge.
+            bridge_type='goub',
+            bridge_gamma=1.0e7,
             eps_hidden_dims=(512, 512, 512),
             time_embed_dim=64,
             layer_norm=True,
@@ -633,6 +907,17 @@ def _get_common_config():
             subgoal_value_hidden_dims=(512, 512, 512),
             subgoal_value_layer_norm=True,
             subgoal_hidden_dims=(512, 512, 512),
+            # Distributional subgoal controls (default: legacy deterministic point).
+            subgoal_distribution='deterministic',
+            subgoal_log_std_min=-5.0,
+            subgoal_log_std_max=1.0,
+            subgoal_temperature=1.0,
+            subgoal_use_mean_for_actor_goal=True,
+            subgoal_nll_weight=1.0,
+            subgoal_mse_weight=0.25,
+            subgoal_var_reg_weight=1.0e-4,
+            subgoal_fr_spi_weight=0.0,
+            subgoal_fr_spi_tau=1.0,
             discount=0.99,
             subgoal_steps=25,
             # When False (default): PathHGCDataset overrides high_actor_targets with the

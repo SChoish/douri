@@ -1,15 +1,12 @@
-# Joint GOUB + critic + SPI actor — global-goal SPI + bridge/subgoal clip-and-pad.
-# Builds on config/antmaze_large_navigate_spi_goal.yaml by enabling
-#   - goub.clip_path_to_goal: true
-# Rationale: the spi_goal-only run hovered near the goal because the bridge / subgoal_net
-# were always trained with horizon-K endpoints (s_{t+K}), so close-goal scenarios at
-# inference fall out of distribution. Clip + pad teaches "arrive and stay" at s_{t_g}.
+# Joint GOUB + critic + SPI actor — subgoal-conditioned SPI + bridge/subgoal clip-and-pad.
+# Enables goub.clip_path_to_goal: true (same rationale as before).
+# Actor/Q use per-candidate GOUB subgoals (spi_conditioned: subgoal), not the global goal.
 
 env_name: antmaze-large-navigate-v0
 seed: 0
 run_group: antmaze_navigate
 
-train_epochs: 200
+train_epochs: 500
 log_every_n_epochs: 10
 save_every_n_epochs: 100
 
@@ -32,6 +29,20 @@ goub:
   rollout_loss_weight: 1.0
   value_geom_sample: false
   subgoal_value_alpha: 0.1
+  # Match config/antmaze_large_navigate.yaml (these sweeps do not inherit that file).
+  bridge_type: unidb_gou
+  bridge_gamma: 1.0e+7
+  # Same distributional subgoal stack as config/antmaze_large_navigate.yaml (sweeps do not inherit it).
+  subgoal_distribution: diag_gaussian
+  subgoal_log_std_min: -5.0
+  subgoal_log_std_max: 0.5
+  subgoal_temperature: 1.0
+  subgoal_use_mean_for_actor_goal: true
+  subgoal_nll_weight: 1.0
+  subgoal_mse_weight: 0.25
+  subgoal_var_reg_weight: 0.0001
+  subgoal_fr_spi_weight: 0.0
+  subgoal_fr_spi_tau: 1.0
   # Clip per-row segment endpoint to s_{min(t+K, t_g)} and pad trajectory_segment past
   # t_g with s_{t_g}. Both bridge endpoint and subgoal_net teacher reflect the actual
   # close goal; bridge learns identity at s_g.
@@ -42,7 +53,7 @@ critic_agent:
   discount: 0.99
 
 actor:
-  spi_tau: 5.0
+  spi_tau: 1.0
   spi_beta: 1.0
   spi_actor_layer_norm: false
-  spi_conditioned: goal
+  spi_conditioned: subgoal

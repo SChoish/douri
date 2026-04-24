@@ -103,6 +103,11 @@ _SPI_ACTOR_KEYS = {
     'spi_q_norm_eps',
     'spi_conditioned',
 }
+# Map legacy YAML keys -> canonical actor-config keys. Keeps old configs and
+# saved ``flags.json`` snapshots working after the rename.
+_ACTOR_KEY_ALIASES = {
+    'spi_goal_conditioning': 'spi_conditioned',
+}
 
 def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
     return max(1, math.ceil(dataset_size / batch_size))
@@ -169,6 +174,16 @@ def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
     for name, updates in [('goub', goub_updates), ('critic_agent', critic_updates), ('actor', actor_updates)]:
         if updates is not None and not isinstance(updates, dict):
             raise ValueError(f'YAML key "{name}" must be a mapping.')
+
+    # Migrate legacy actor key names to canonical ones (e.g., spi_goal_conditioning ->
+    # spi_conditioned) so older YAMLs and flags.json snapshots keep working.
+    if isinstance(actor_updates, dict):
+        for old, new in _ACTOR_KEY_ALIASES.items():
+            if old in actor_updates and new not in actor_updates:
+                actor_updates[new] = actor_updates.pop(old)
+            elif old in actor_updates:
+                # If both are present, drop the legacy one.
+                actor_updates.pop(old, None)
 
     for key, value in data.items():
         if not hasattr(FLAGS, key):
@@ -389,6 +404,70 @@ def _score_and_rank_candidate_actions(
     return _rank_candidate_actions(candidates, rescored, keep_topk=keep_topk)
 
 
+@partial(jax.jit, static_argnames=('keep_topk', 'use_partial_critic'))
+def _rescore_with_stats_jit(
+    critic_agent: Any,
+    obs: jnp.ndarray,
+    spi_goals: jnp.ndarray,
+    critic_goals: jnp.ndarray,
+    candidates: jnp.ndarray,
+    valids: jnp.ndarray,
+    network_params: Any,
+    *,
+    keep_topk: int,
+    use_partial_critic: bool,
+) -> tuple[dict, dict]:
+    """Single-graph rescore + ranking + score statistics.
+
+    Replaces a chain of separate dispatches (score → rank → mean/max/min/gap)
+    with one compiled function so that all stats live in the same XLA graph
+    as the critic forward.
+    """
+    proposal_chunks, proposal_scores = _score_and_rank_candidate_actions(
+        critic_agent,
+        obs,
+        critic_goals,
+        candidates,
+        network_params,
+        keep_topk=keep_topk,
+        use_partial_critic=use_partial_critic,
+    )
+    score_mean = proposal_scores.mean()
+    score_max = proposal_scores.max()
+    score_min = proposal_scores.min()
+    if proposal_scores.shape[1] >= 2:
+        gap = (proposal_scores[:, 0] - proposal_scores[:, 1]).mean()
+    else:
+        gap = jnp.zeros((), dtype=jnp.float32)
+    out_batch = {
+        'observations': obs,
+        'spi_goals': spi_goals,
+        'proposal_partial_chunks': proposal_chunks,
+        'proposal_scores': proposal_scores,
+        'valids': valids,
+    }
+    coupling_stats = {
+        'coupling/critic_score_mean': score_mean,
+        'coupling/critic_score_max': score_max,
+        'coupling/critic_score_min': score_min,
+        'coupling/critic_score_gap_top1_top2': gap,
+    }
+    return out_batch, coupling_stats
+
+
+@jax.jit
+def _proposal_goal_stats_jit(
+    actor_goal_mean: jnp.ndarray,
+    candidate_goals: jnp.ndarray,
+) -> dict:
+    """Compute proposal-goal coupling stats in a single fused dispatch."""
+    return {
+        'coupling/predicted_subgoal_norm': jnp.linalg.norm(actor_goal_mean, axis=-1).mean(),
+        'coupling/proposal_goal_norm_mean': jnp.linalg.norm(candidate_goals, axis=-1).mean(),
+        'coupling/proposal_goal_std_mean': candidate_goals.std(axis=1).mean(),
+    }
+
+
 def _build_actor_batch_from_goub(
     goub_agent: GOUBDynamicsAgent,
     critic_agent: Any,
@@ -405,7 +484,7 @@ def _build_actor_batch_from_goub(
     if measure_timing:
         t0 = time.perf_counter()
     sample_noise_scale = float(FLAGS.plan_noise_scale) if plan_candidates > 1 else 0.0
-    predicted_subgoals, candidate_actions, plan_rng = goub_agent.build_actor_proposals(
+    actor_goal_mean, candidate_actions, candidate_goals, plan_rng = goub_agent.build_actor_proposals(
         obs,
         high_goals,
         goub_agent.rng,
@@ -414,22 +493,26 @@ def _build_actor_batch_from_goub(
         sample_noise_scale=sample_noise_scale,
     )
     if measure_timing:
-        _block_until_ready((predicted_subgoals, candidate_actions, plan_rng))
+        _block_until_ready((actor_goal_mean, candidate_actions, candidate_goals, plan_rng))
         timing['proposal_build'] = time.perf_counter() - t0
     else:
         timing = {}
     goub_agent = goub_agent.replace(rng=plan_rng)
-    # ``spi_goals`` is the conditioning vector both π(s, g) and Q(s, g, a) see in
-    # ``JointActorAgent.actor_loss``. ``actor_config.spi_conditioned`` selects which:
-    #   'subgoal' (default): GOUB ``predict_subgoal(obs, high_goals)`` — local subgoal.
-    #   'goal'             : the global ``high_goals`` itself — π/Q targeted at final goal.
+    # ``spi_goals`` is the conditioning vector both pi(s, g) and Q(s, g, a) see in
+    # ``JointActorAgent.actor_loss``. ``actor_config.spi_conditioned`` selects which
+    # (legacy alias ``spi_goal_conditioning`` is still accepted):
+    #   'subgoal' (default): use the GOUB-predicted local subgoal mean (mirrors training).
+    #   'goal'             : use the global ``high_goals`` directly.
     # Candidate proposal chunks are unchanged in either mode (still planned to the
-    # subgoal); only the conditioning vector flips, keeping π/Q consistent.
-    spi_cond = str(actor_config.get('spi_conditioned', 'subgoal')).lower()
+    # subgoal); only the conditioning vector flips, keeping pi/Q consistent.
+    spi_cond = str(
+        actor_config.get('spi_conditioned', actor_config.get('spi_goal_conditioning', 'subgoal'))
+    ).strip().lower()
     if spi_cond == 'goal':
         spi_goals = high_goals
     elif spi_cond == 'subgoal':
-        spi_goals = predicted_subgoals
+        use_mean_for_actor = bool(goub_agent.config.get('subgoal_use_mean_for_actor_goal', True))
+        spi_goals = actor_goal_mean if use_mean_for_actor else high_goals
     else:
         raise ValueError(
             f"actor.spi_conditioned must be 'subgoal' or 'goal', got {spi_cond!r}."
@@ -442,13 +525,20 @@ def _build_actor_batch_from_goub(
         'candidate_partial_chunks': candidate_actions,
         'valids': jnp.ones((obs.shape[0], proposal_horizon), dtype=jnp.float32),
     }
+    if spi_cond != 'goal':
+        # Per-candidate sub-goal endpoints used for critic rescoring.  In deterministic
+        # subgoal mode this is just the mean broadcast across N candidates.
+        # Shape: [B, N, D]
+        actor_batch['candidate_goals'] = candidate_goals
 
     nan = jnp.full((), jnp.nan, dtype=jnp.float32)
+    proposal_goal_stats = _proposal_goal_stats_jit(actor_goal_mean, candidate_goals)
     coupling_info = {
-        'coupling/predicted_subgoal_norm': jnp.linalg.norm(predicted_subgoals, axis=-1).mean(),
+        **proposal_goal_stats,
         'coupling/critic_score_mean': nan,
         'coupling/critic_score_max': nan,
         'coupling/critic_score_min': nan,
+        'coupling/critic_score_gap_top1_top2': nan,
         'coupling/proposal_count': jnp.asarray(float(candidate_actions.shape[1]), dtype=jnp.float32),
     }
     return goub_agent, actor_batch, coupling_info, timing
@@ -458,6 +548,14 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
     obs = jnp.asarray(actor_batch['observations'], dtype=jnp.float32)
     goals = jnp.asarray(actor_batch['spi_goals'], dtype=jnp.float32)
     candidates = jnp.asarray(actor_batch['candidate_partial_chunks'], dtype=jnp.float32)  # [B, N, ha, A]
+    valids = jnp.asarray(actor_batch['valids'], dtype=jnp.float32)
+    # Optional per-candidate sub-goal endpoints (distributional subgoal mode).
+    cand_goals_in = actor_batch.get('candidate_goals', None)
+    if cand_goals_in is not None:
+        critic_goals = jnp.asarray(cand_goals_in, dtype=jnp.float32)  # [B, N, D]
+    else:
+        critic_goals = goals  # [B, D] - shared
+    # Fast path: single candidate -> skip critic call entirely.
     if candidates.shape[1] == 1:
         zero = jnp.zeros((), dtype=jnp.float32)
         return (
@@ -466,38 +564,26 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
                 'spi_goals': goals,
                 'proposal_partial_chunks': candidates,
                 'proposal_scores': jnp.zeros((obs.shape[0], 1), dtype=jnp.float32),
-                'valids': jnp.asarray(actor_batch['valids'], dtype=jnp.float32),
+                'valids': valids,
             },
             {
                 'coupling/critic_score_mean': zero,
                 'coupling/critic_score_max': zero,
                 'coupling/critic_score_min': zero,
+                'coupling/critic_score_gap_top1_top2': zero,
             },
         )
-    proposal_chunks, proposal_scores = _score_and_rank_candidate_actions(
+    # Multi-candidate path: fused score + rank + stats in one compiled graph.
+    return _rescore_with_stats_jit(
         critic_agent,
         obs,
         goals,
+        critic_goals,
         candidates,
+        valids,
         critic_agent.network.params,
         keep_topk=int(candidates.shape[1]),
         use_partial_critic=True,
-    )
-    return (
-        {
-            'observations': obs,
-            'spi_goals': goals,
-            # Shape: [B, K, ha, A]
-            'proposal_partial_chunks': proposal_chunks,
-            # Shape: [B, K]
-            'proposal_scores': proposal_scores,
-            'valids': jnp.asarray(actor_batch['valids'], dtype=jnp.float32),
-        },
-        {
-            'coupling/critic_score_mean': proposal_scores.mean(),
-            'coupling/critic_score_max': proposal_scores.max(),
-            'coupling/critic_score_min': proposal_scores.min(),
-        },
     )
 
 
@@ -630,10 +716,15 @@ def _evaluate_env_tasks(
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     actor_horizon = int(actor_config['actor_chunk_horizon'])
     idm_horizon = int(critic_config['action_chunk_horizon'])
-    # Mirror training-time conditioning: 'subgoal' → π sees GOUB predict_subgoal(obs, g);
-    # 'goal' → π sees the global goal directly. IDM eval below always uses predicted
+    # Mirror training-time conditioning: 'subgoal' -> pi sees GOUB predict_subgoal(obs, g);
+    # 'goal' -> pi sees the global goal directly. IDM eval below always uses predicted
     # subgoals because GOUB IDM is the chunk planner targeting subgoal endpoints.
-    actor_spi_cond = str(actor_config.get('spi_conditioned', 'subgoal')).lower()
+    # Accept both the canonical key and the legacy alias.
+    actor_uses_goal = (
+        str(
+            actor_config.get('spi_conditioned', actor_config.get('spi_goal_conditioning', 'subgoal'))
+        ).strip().lower() == 'goal'
+    )
     actor_task_successes = []
     idm_task_successes = []
     metrics = {}
@@ -655,8 +746,8 @@ def _evaluate_env_tasks(
                 if success or terminated or truncated:
                     break
                 predicted_subgoal = np.asarray(goub_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-                actor_cond = predicted_subgoal if actor_spi_cond == 'subgoal' else goal
-                action_chunk = np.asarray(actor_agent.sample_actions(obs, actor_cond), dtype=np.float32).reshape(
+                actor_goal_input = goal if actor_uses_goal else predicted_subgoal
+                action_chunk = np.asarray(actor_agent.sample_actions(obs, actor_goal_input), dtype=np.float32).reshape(
                     actor_horizon, -1
                 )
                 obs, success, terminated, truncated = _execute_action_chunk(

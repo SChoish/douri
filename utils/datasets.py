@@ -406,6 +406,10 @@ class HGCDataset(GCDataset):
 
         batch['high_actor_goals'] = self.get_observations(high_goal_idxs)
         batch['high_actor_targets'] = self.get_observations(high_target_idxs)
+        # Expose indices so subclasses (e.g. PathHGCDataset) can pad the trajectory
+        # segment past the (clipped) goal without re-sampling. Cheap to carry along.
+        batch['high_actor_goal_idxs'] = np.asarray(high_goal_idxs, dtype=np.int64)
+        batch['high_actor_target_idxs'] = np.asarray(high_target_idxs, dtype=np.int64)
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
@@ -431,8 +435,17 @@ class PathHGCDataset(HGCDataset):
     Used by GOUB Phase-1 path supervision: for horizon ``K = subgoal_steps``, each batch row
     includes ``s_t, s_{t+1}, ..., s_{t+K}`` as ``trajectory_segment`` of shape ``(B, K+1, D)``.
     When ``idxs`` is omitted, starts ``t`` are resampled until ``t+K`` lies in the same episode
-    (does not cross ``terminals``). ``high_actor_targets`` is overwritten to ``s_{t+K}`` so it
-    matches the segment endpoint (planner horizon aligns with offline states).
+    (does not cross ``terminals``). ``high_actor_targets`` is overwritten to match
+    ``trajectory_segment[:, -1]`` so the bridge endpoint and segment tail stay consistent.
+
+    The optional ``clip_path_to_goal`` config flag controls behaviour near the episode goal:
+
+    - ``False`` (default, legacy): segment endpoint is always ``s_{t+K}`` regardless of where
+      the sampled goal ``s_{t_g}`` is. Subgoal_net teacher is ``s_{t+K}`` so it may "overshoot"
+      past close goals.
+    - ``True``: per-row endpoint becomes ``s_{min(t+K, t_g)}``; segment tail past ``t_g`` is
+      padded with ``s_{t_g}``. Both the GOUB bridge and the subgoal_net teacher then learn
+      to "arrive and stay" at close goals, keeping inference subgoals in-distribution.
 
     Image ``p_aug`` is only consistent when augmentations do not reshape state vectors; for
     vector antmaze data the parent augment path is a no-op on 2D observations.
@@ -503,7 +516,23 @@ class PathHGCDataset(HGCDataset):
                 raise ValueError(
                     f'trajectory_indices shape must match trajectory_segment[:2], got {idxs.shape} vs {seg.shape[:2]}.'
                 )
-            if not np.all(np.diff(idxs, axis=1) == 1):
+            diffs = np.diff(idxs, axis=1)
+            if bool(self.config.get('clip_path_to_goal', False)):
+                # clip_path mode pads segment past t_g; allowed step sizes are 1 (real)
+                # or 0 (frozen at t_clip). 0-runs must be a contiguous suffix per row.
+                if not np.all((diffs == 1) | (diffs == 0)):
+                    raise ValueError(
+                        'trajectory_indices step size must be 0 or 1 under clip_path_to_goal.'
+                    )
+                # First 0 in a row (if any) must mark the start of an all-0 suffix.
+                first_zero = np.argmax(diffs == 0, axis=1)
+                has_zero = np.any(diffs == 0, axis=1)
+                for i in np.flatnonzero(has_zero):
+                    if not np.all(diffs[i, first_zero[i]:] == 0):
+                        raise ValueError(
+                            'trajectory_indices padding must be a contiguous suffix per row.'
+                        )
+            elif not np.all(diffs == 1):
                 raise ValueError('trajectory_indices must be contiguous with step size 1.')
             if 'trajectory_terminal_indices' in batch:
                 terms = np.asarray(batch['trajectory_terminal_indices'])
@@ -518,12 +547,31 @@ class PathHGCDataset(HGCDataset):
             idxs = self._validate_segment_starts(idxs, K)
         batch = super().sample(batch_size, idxs, evaluation)
         traj_indices = idxs[:, None] + self.path_offsets
-        traj = self.get_observations(traj_indices)
         finals = lookup_final_indices(self.terminal_locs, idxs)
+
+        clip_path = bool(self.config.get('clip_path_to_goal', False))
+        if clip_path:
+            # Per-row endpoint t_clip = min(t+K, t_g). Past t_clip we freeze the index so
+            # trajectory_segment is padded with s_{t_clip} (= clipped high_actor_targets),
+            # keeping bridge endpoint, subgoal_net teacher, and segment tail consistent.
+            target_idxs = batch.get('high_actor_target_idxs')
+            if target_idxs is None:
+                raise RuntimeError(
+                    'clip_path_to_goal=True requires HGCDataset.sample to expose '
+                    'high_actor_target_idxs in the batch.'
+                )
+            t_clip = np.asarray(target_idxs, dtype=np.int64)
+            seg_indices = np.minimum(traj_indices, t_clip[:, None])
+        else:
+            seg_indices = traj_indices
+
+        traj = self.get_observations(seg_indices)
         batch['trajectory_segment'] = np.asarray(traj, dtype=np.float32)
-        batch['trajectory_indices'] = np.asarray(traj_indices, dtype=np.int64)
+        batch['trajectory_indices'] = np.asarray(seg_indices, dtype=np.int64)
         batch['trajectory_start_indices'] = np.asarray(idxs, dtype=np.int64)
         batch['trajectory_terminal_indices'] = np.asarray(finals, dtype=np.int64)
+        # Override high_actor_targets to match segment endpoint. clip_path=False keeps
+        # the legacy s_{t+K}; clip_path=True yields s_{min(t+K, t_g)}.
         batch['high_actor_targets'] = np.asarray(traj[:, K], dtype=np.float32)
         return batch
 

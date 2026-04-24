@@ -92,6 +92,7 @@ def rollout_goub_actor_env(
     actor_horizon: int,
     env_action_dim: int,
     record_env_rgb: bool = True,
+    spi_conditioned: str = 'subgoal',
 ) -> tuple[np.ndarray, np.ndarray, int, bool, np.ndarray | None]:
     cur = sync_env_state_from_obs_vector_aligned(env, s0, s_g)
     goal = np.asarray(s_g, dtype=np.float32).reshape(-1)
@@ -122,8 +123,15 @@ def rollout_goub_actor_env(
         if goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol)):
             reached = True
             break
+        # ``pred`` (GOUB subgoal) is always computed for the optional plot overlay; the
+        # actor conditioning vector ``actor_cond`` follows ``spi_conditioned`` to mirror
+        # training so π sees the same input distribution it was trained on.
+        #   'subgoal' → actor sees predicted subgoal; hats = subgoal trail.
+        #   'goal'    → actor sees the global goal directly; hats = goal repeated so the
+        #              video honestly shows what the actor is conditioned on.
         pred = np.asarray(goub_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-        chunk = np.asarray(actor_agent.sample_actions(obs, pred), dtype=np.float32).reshape(actor_horizon, -1)
+        actor_cond = pred if str(spi_conditioned).lower() == 'subgoal' else goal
+        chunk = np.asarray(actor_agent.sample_actions(obs, actor_cond), dtype=np.float32).reshape(actor_horizon, -1)
         chunk_done = False
         for _i in range(int(chunk.shape[0])):
             a = _align_action_to_env(chunk[_i], env_action_dim)
@@ -131,7 +139,7 @@ def rollout_goub_actor_env(
             ob, _r, term, trunc, info = env.step(a)
             obs = np.asarray(ob, dtype=np.float32).reshape(-1)
             states.append(obs.copy())
-            hats_list.append(pred.copy())
+            hats_list.append(actor_cond.copy())
             _maybe_record()
             succ_flag = bool(info.get('success', False)) if isinstance(info, dict) else False
             reached = succ_flag or goal_within_tol(obs, goal, goal_stop_dims, float(goal_tol))
@@ -274,11 +282,14 @@ def main() -> None:
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     env_action_dim = int(low.shape[-1])
     actor_horizon = int(actor_cfg['actor_chunk_horizon'])
+    spi_conditioned = str(actor_cfg.get('spi_conditioned', 'subgoal')).lower()
     if saved_actor_dim != env_action_dim:
         print(
             f'Corrected flags actor action_dim={saved_actor_dim} to env action dim={env_action_dim} '
             'before loading the actor checkpoint.'
         )
+    print(f'Actor conditioning at inference: spi_conditioned={spi_conditioned!r} '
+          f"(actor sees {'predicted subgoal' if spi_conditioned == 'subgoal' else 'global goal'})")
 
     roll, hats, n_chunks, reached, env_frames = rollout_goub_actor_env(
         env,
@@ -294,6 +305,7 @@ def main() -> None:
         actor_horizon=actor_horizon,
         env_action_dim=env_action_dim,
         record_env_rgb=True,
+        spi_conditioned=spi_conditioned,
     )
     n_trans = max(0, int(roll.shape[0]) - 1)
     print(

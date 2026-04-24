@@ -87,6 +87,24 @@ loss   = mean( -Q̂ + prox / (2 · spi_tau) )
 
 - `prox`는 raw squared L2(차원 정규화 없음). actor 출력은 deterministic chunk이므로 Dirac → 이산 분포 W₂²의 closed form.
 - `spi_tau`로 W₂² 강도, `spi_beta`로 후보 softmax 온도, `spi_q_norm_eps`로 분모 안정화.
+- `spi_conditioned`로 위 식에서 쓰는 `g`를 선택합니다 (default `'subgoal'`):
+  - `'subgoal'` — `g = predict_subgoal(s, g_global)` (현재까지의 동작; π/Q 모두 GOUB 예측 subgoal에 컨디셔닝).
+  - `'goal'`    — `g = g_global` (HGC `high_actor_goals`); π/Q 모두 전역 goal에 컨디셔닝됩니다. 후보 chunk `μ_k`는 두 경우 모두 GOUB가 subgoal을 향해 만든 plan이므로, `'goal'` 모드에서는 prox가 "전역 goal로 가는 π"를 "subgoal로 가는 후보들"에 끌어당기는 형태가 됩니다.
+
+### `goub.clip_path_to_goal` (subgoal/bridge 끝점 정합)
+
+`PathHGCDataset`은 길이 `K = subgoal_steps`의 `trajectory_segment = (s_t, ..., s_{t+K})`를
+샘플링합니다. `clip_path_to_goal`로 가까운 goal 처리 방식을 선택합니다 (default `false`).
+
+- `false` (legacy): bridge 끝점 `x_0 = s_{t+K}`, subgoal_net 교사도 `s_{t+K}`. Goal이 `K`보다
+  가까워도 항상 `K` 스텝 앞 상태를 가르치므로, 추론 시 가까운 goal 근처에서 subgoal이
+  goal을 "넘어" 예측되며 bridge가 OOD 영역으로 들어가 정책이 goal 근처를 헤매는 현상을 유도할 수 있습니다.
+- `true` (clip + pad): per-row 끝점 `x_0 = s_{min(t+K, t_g)}`, segment 꼬리는 `s_{t_g}`로 패딩.
+  Bridge / subgoal_net 모두 "도달 후 머무르기" 신호를 학습합니다.
+  - `L_goub`, `L_path`, `L_roll`은 식 변경 없음 (`x_0`/`segment` 키만 의미가 바뀜).
+  - `L_subgoal`의 교사 `target = batch['high_actor_targets']`도 자동으로 클립 값을 받습니다.
+  - Random goal 샘플은 영향 없음 (`t_g = T_final`, `t+K ≤ T_episode`라 어차피 `t+K`로 클립).
+  - `validate_sample_batch`는 `clip_path_to_goal=true`일 때 `trajectory_indices`의 step 0을 허용하며, 0은 한 행의 contiguous 접미사로만 나타나야 합니다.
 
 ## 런 디렉터리 레이아웃
 

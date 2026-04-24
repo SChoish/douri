@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -66,6 +67,13 @@ flags.DEFINE_string('run_config', '', 'YAML config; empty uses config/antmaze_la
 flags.DEFINE_string('runs_root', '', 'Run root; default <repo>/runs.')
 flags.DEFINE_string('resume_run_dir', '', 'Existing run dir to resume in-place.')
 flags.DEFINE_integer('resume_epoch', 0, 'Checkpoint epoch to resume from; 0 disables resume.')
+flags.DEFINE_boolean(
+    'resume_use_run_snapshot_config',
+    True,
+    'When resuming: if --run_config is not set on argv, load hyperparameters from '
+    'resume_run_dir/flags.json (preferred; written as a temp YAML) or else config_used.yaml, '
+    'so checkpoints and hparams match the original run.',
+)
 flags.DEFINE_string('run_group', 'Debug', 'W&B group.')
 flags.DEFINE_integer('seed', 0, 'Seed.')
 flags.DEFINE_string('env_name', 'antmaze-medium-navigate-v0', 'OGBench env / dataset name.')
@@ -93,6 +101,7 @@ _SPI_ACTOR_KEYS = {
     'spi_beta',
     'spi_actor_layer_norm',
     'spi_q_norm_eps',
+    'spi_conditioned',
 }
 
 def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
@@ -102,6 +111,45 @@ def _steps_per_epoch(dataset_size: int, batch_size: int) -> int:
 def _load_yaml(path: str) -> dict:
     with open(path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f) or {}
+
+
+def _resolve_resume_snapshot_config_path(run_dir: str) -> str | None:
+    """Prefer flags.json (full merged hparams at run start); else config_used.yaml; else None."""
+    fj = os.path.join(run_dir, 'flags.json')
+    if not os.path.isfile(fj):
+        used = os.path.join(run_dir, 'config_used.yaml')
+        return used if os.path.isfile(used) else None
+    with open(fj, encoding='utf-8') as fp:
+        snap = json.load(fp)
+    fg = dict(snap.get('flags') or {})
+    skip = {
+        'resume_run_dir',
+        'resume_epoch',
+        'run_config',
+        'runs_root',
+        'help',
+        'helpshort',
+        'helpfull',
+        'helpxml',
+        '?',
+    }
+    root: dict[str, Any] = {}
+    for key, value in fg.items():
+        if key in skip:
+            continue
+        if hasattr(FLAGS, key):
+            root[key] = value
+    if snap.get('goub') is not None:
+        root['goub'] = snap['goub']
+    if snap.get('critic_agent') is not None:
+        root['critic_agent'] = snap['critic_agent']
+    if snap.get('actor') is not None:
+        root['actor'] = snap['actor']
+    fd, tmp_path = tempfile.mkstemp(prefix='resume_flags_', suffix='.yaml', text=True)
+    os.close(fd)
+    with open(tmp_path, 'w', encoding='utf-8') as out:
+        yaml.safe_dump(root, out, sort_keys=False, default_flow_style=False)
+    return tmp_path
 
 
 def _argv_sets_flag(flag_name: str) -> bool:
@@ -371,9 +419,24 @@ def _build_actor_batch_from_goub(
     else:
         timing = {}
     goub_agent = goub_agent.replace(rng=plan_rng)
+    # ``spi_goals`` is the conditioning vector both π(s, g) and Q(s, g, a) see in
+    # ``JointActorAgent.actor_loss``. ``actor_config.spi_conditioned`` selects which:
+    #   'subgoal' (default): GOUB ``predict_subgoal(obs, high_goals)`` — local subgoal.
+    #   'goal'             : the global ``high_goals`` itself — π/Q targeted at final goal.
+    # Candidate proposal chunks are unchanged in either mode (still planned to the
+    # subgoal); only the conditioning vector flips, keeping π/Q consistent.
+    spi_cond = str(actor_config.get('spi_conditioned', 'subgoal')).lower()
+    if spi_cond == 'goal':
+        spi_goals = high_goals
+    elif spi_cond == 'subgoal':
+        spi_goals = predicted_subgoals
+    else:
+        raise ValueError(
+            f"actor.spi_conditioned must be 'subgoal' or 'goal', got {spi_cond!r}."
+        )
     actor_batch = {
         'observations': obs,
-        'spi_goals': predicted_subgoals,
+        'spi_goals': spi_goals,
         # Candidate action chunks generated from GOUB proposals; rescored after critic update.
         # Shape: [B, N, ha, A]
         'candidate_partial_chunks': candidate_actions,
@@ -567,6 +630,10 @@ def _evaluate_env_tasks(
     high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     actor_horizon = int(actor_config['actor_chunk_horizon'])
     idm_horizon = int(critic_config['action_chunk_horizon'])
+    # Mirror training-time conditioning: 'subgoal' → π sees GOUB predict_subgoal(obs, g);
+    # 'goal' → π sees the global goal directly. IDM eval below always uses predicted
+    # subgoals because GOUB IDM is the chunk planner targeting subgoal endpoints.
+    actor_spi_cond = str(actor_config.get('spi_conditioned', 'subgoal')).lower()
     actor_task_successes = []
     idm_task_successes = []
     metrics = {}
@@ -588,7 +655,8 @@ def _evaluate_env_tasks(
                 if success or terminated or truncated:
                     break
                 predicted_subgoal = np.asarray(goub_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
-                action_chunk = np.asarray(actor_agent.sample_actions(obs, predicted_subgoal), dtype=np.float32).reshape(
+                actor_cond = predicted_subgoal if actor_spi_cond == 'subgoal' else goal
+                action_chunk = np.asarray(actor_agent.sample_actions(obs, actor_cond), dtype=np.float32).reshape(
                     actor_horizon, -1
                 )
                 obs, success, terminated, truncated = _execute_action_chunk(
@@ -646,11 +714,35 @@ def _evaluate_env_tasks(
 
 def main(_):
     impl = _impl_dir()
+    resume_run_dir = FLAGS.resume_run_dir.strip()
+    resume_epoch = int(FLAGS.resume_epoch)
+    if bool(resume_run_dir) != bool(resume_epoch > 0):
+        raise ValueError('resume_run_dir and resume_epoch must be provided together.')
+
     cfg_path = FLAGS.run_config.strip() or _default_yaml_path()
+    resume_snapshot_path: str | None = None
+    if (
+        resume_run_dir
+        and resume_epoch > 0
+        and FLAGS.resume_use_run_snapshot_config
+        and not _argv_sets_flag('run_config')
+    ):
+        resume_snapshot_path = _resolve_resume_snapshot_config_path(os.path.abspath(resume_run_dir))
+        if resume_snapshot_path is not None:
+            cfg_path = resume_snapshot_path
+        else:
+            print(
+                f'[joint] WARN resume_use_run_snapshot_config but no flags.json or config_used.yaml '
+                f'in {resume_run_dir!r}; using default run_config: {cfg_path}',
+                file=sys.stderr,
+            )
+
     goub_updates, critic_updates, actor_updates = {}, {}, {}
     if os.path.isfile(cfg_path):
         goub_updates, critic_updates, actor_updates = _apply_yaml_to_flags(_load_yaml(cfg_path))
     elif FLAGS.run_config.strip():
+        raise FileNotFoundError(f'run_config YAML not found: {cfg_path}')
+    else:
         raise FileNotFoundError(f'run_config YAML not found: {cfg_path}')
 
     goub_config, critic_config, actor_config = _prepare_joint_configs(
@@ -658,11 +750,6 @@ def main(_):
         critic_updates,
         actor_updates,
     )
-
-    resume_run_dir = FLAGS.resume_run_dir.strip()
-    resume_epoch = int(FLAGS.resume_epoch)
-    if bool(resume_run_dir) != bool(resume_epoch > 0):
-        raise ValueError('resume_run_dir and resume_epoch must be provided together.')
 
     runs_root = FLAGS.runs_root.strip() or os.path.join(impl, 'runs')
     if resume_run_dir:
@@ -691,6 +778,8 @@ def main(_):
     run_logger, run_log_path = _setup_file_logger(run_dir, resume_epoch=resume_epoch if resume_run_dir else 0)
     run_logger.info('run_dir=%s critic=dqc', run_dir)
     run_logger.info('log_path=%s', run_log_path)
+    if resume_snapshot_path is not None:
+        run_logger.info('resume hyperparameters from snapshot file: %s', resume_snapshot_path)
 
     env, train_plain, _ = make_env_and_datasets(FLAGS.env_name, frame_stack=critic_config['frame_stack'])
     action_dim = int(np.asarray(env.action_space.shape).prod())

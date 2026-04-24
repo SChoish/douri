@@ -330,6 +330,14 @@ def validate_joint_mode(critic_config, actor_config=None) -> None:
         return
     if int(actor_config.get('actor_chunk_horizon', 0)) < 1:
         raise ValueError('Joint training requires actor_chunk_horizon >= 1.')
+    spi_cond = str(actor_config.get('spi_conditioned', 'subgoal')).lower()
+    # Lazy import to avoid circular dependency between agents.actor and agents.critic.
+    from agents.actor import SPI_CONDITIONED_CHOICES
+
+    if spi_cond not in SPI_CONDITIONED_CHOICES:
+        raise ValueError(
+            f"actor.spi_conditioned must be one of {SPI_CONDITIONED_CHOICES}, got {spi_cond!r}."
+        )
 
 
 def extract_critic_primary_score(info: dict) -> float:
@@ -352,7 +360,7 @@ def get_config():
             full_chunk_horizon=25,
             action_chunk_horizon=10,
             value_hidden_dims=(512, 512, 512),
-            discount=0.999,
+            discount=0.99,
             num_qs=2,
             use_chunk_critic=True,
             distill_method='expectile',

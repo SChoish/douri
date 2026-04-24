@@ -39,6 +39,10 @@ class JointActorAgent(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def _goals(self, batch: dict) -> jnp.ndarray | None:
+        # ``spi_goals`` carries whatever conditioning vector the joint loop chose for
+        # this update (predicted subgoal or global goal); see ``config.spi_conditioned``
+        # and ``main._build_actor_batch_from_goub``. Both π and the critic scorer in
+        # ``actor_loss`` share this same vector so Q stays consistent with π.
         goals = batch.get('spi_goals', None)
         if goals is None:
             goals = batch.get('value_goals', None)
@@ -173,6 +177,9 @@ class JointActorAgent(flax.struct.PyTreeNode):
         return cls(rng=rng, actor=actor, config=flax.core.FrozenDict(**config))
 
 
+SPI_CONDITIONED_CHOICES = ('subgoal', 'goal')
+
+
 def get_actor_config():
     return ml_collections.ConfigDict(
         dict(
@@ -182,6 +189,14 @@ def get_actor_config():
             spi_beta=10.0,
             spi_actor_layer_norm=True,
             spi_q_norm_eps=1e-6,
+            # Conditioning vector for both ``π(s, g)`` and ``Q(s, g, a)`` in the SPI loss.
+            #   'subgoal' (default): use GOUB ``predict_subgoal(s, g_global)``
+            #     → matches training-time subgoal teacher; π/Q see local subgoal.
+            #   'goal'   : use the (global) ``high_actor_goals`` directly
+            #     → π/Q both see the final goal; SPI prox still pulls toward GOUB
+            #       proposal chunks (which were planned to subgoals).
+            # Set in ``main._build_actor_batch_from_goub`` via ``spi_goals``.
+            spi_conditioned='subgoal',
             actor_chunk_horizon=ml_collections.config_dict.placeholder(int),
             action_dim=2,
         )

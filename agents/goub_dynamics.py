@@ -635,6 +635,15 @@ def _get_common_config():
             subgoal_hidden_dims=(512, 512, 512),
             discount=0.99,
             subgoal_steps=25,
+            # When False (default): PathHGCDataset overrides high_actor_targets with the
+            # K-step horizon endpoint s_{t+K}, so the GOUB bridge / subgoal_net teacher is
+            # always K steps ahead even if the episode goal s_{t_g} is closer than K.
+            # When True: clip per-row to s_{min(t+K, t_g)} for both the bridge endpoint
+            # (high_actor_targets) and the subgoal_net teacher, and pad trajectory_segment
+            # tail with s_{t_g} for steps beyond t_g. This trains the bridge to "arrive
+            # and stay" at close goals so subgoal predictions near the goal stay
+            # in-distribution and reduces hovering near the goal.
+            clip_path_to_goal=False,
             idm_loss_weight=1.0,
             idm_hidden_dims=(512, 512, 512),
             value_p_curgoal=0.2,

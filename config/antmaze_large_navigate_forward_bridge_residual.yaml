@@ -1,0 +1,60 @@
+# AntMaze large with the **forward-bridge + endpoint-preserving residual**
+# planner (GOUB Proposition 3.1 closed-form mean + learned per-step
+# residual `r_theta(z_0, z_K, i)`).
+#
+# - `z_hat_i = a_i z_0 + b_i z_K + w_i * r_theta(z_0, z_K, i)`
+# - `w_i = i*(K-i)/K^2`, so `w_0 = w_K = 0` -> endpoints preserved exactly.
+# - Path loss matches `path_pred[:, 1:-1]` against `segment[:, 1:-1]`.
+# - Reverse-score / boundary / rollout losses are skipped.
+# - PathResidualNet is registered automatically when `planner_type ==
+#   forward_bridge_residual` (see `_GOUBAgentCore.create`); old
+#   reverse-score checkpoints stay loadable when this knob is absent.
+
+env_name: antmaze-large-navigate-v0
+seed: 0
+run_group: antmaze_navigate
+
+train_epochs: 500
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+
+use_wandb: false
+use_tqdm: false
+
+batch_size: 1024
+joint_horizon: 25
+plan_candidates: 1
+plan_noise_scale: 0.0
+measure_timing: false
+eval_freq: 100
+eval_task_ids: "1,2,3,4,5"
+eval_episodes_per_task: 10
+eval_max_chunks: 200
+eval_goal_tol: 0.5
+eval_goal_dims: "0,1"
+
+goub:
+  rollout_loss_weight: 1.0
+  value_geom_sample: false
+  subgoal_value_alpha: 0.1
+  bridge_type: goub
+  clip_path_to_goal: true
+  planner_type: forward_bridge_residual
+  residual_hidden_dims: [512, 512, 512]
+  forward_bridge:
+    mode: mean
+    noise_scale: 0.0
+    eps: 1.0e-6
+    train_epsilon: false
+    use_path_loss: true
+    use_rollout_loss: false
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.99
+
+actor:
+  spi_tau: 1.0
+  spi_beta: 1.0
+  spi_actor_layer_norm: true
+  spi_conditioned: subgoal

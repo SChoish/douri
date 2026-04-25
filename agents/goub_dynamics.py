@@ -21,11 +21,55 @@ from agents.critic import ScalarValueNet
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.goub import (
     bridge_sample,
+    forward_bridge_coefficients,
     make_goub_schedule,
     model_mean,
     posterior_mean,
     sample_from_reverse_mean,
+    theta_linear_model_mean,
+    theta_linear_posterior_mean,
 )
+
+
+_VALID_PLANNER_TYPES = ('reverse_score', 'forward_bridge', 'forward_bridge_residual')
+_VALID_FORWARD_BRIDGE_MODES = ('mean', 'sample')
+
+
+def _planner_type(config) -> str:
+    """Return the canonical planner_type string from the agent config."""
+    pt = str(config.get('planner_type', 'reverse_score')).lower()
+    if pt not in _VALID_PLANNER_TYPES:
+        raise ValueError(
+            f'planner_type must be one of {_VALID_PLANNER_TYPES}, got {pt!r}.'
+        )
+    return pt
+
+
+def _forward_bridge_mode(config) -> str:
+    mode = str(config.get('forward_bridge_mode', 'mean')).lower()
+    if mode not in _VALID_FORWARD_BRIDGE_MODES:
+        raise ValueError(
+            f'forward_bridge_mode must be one of {_VALID_FORWARD_BRIDGE_MODES}, got {mode!r}.'
+        )
+    return mode
+
+
+def _bridge_type(config) -> str:
+    return str(config.get('bridge_type', 'goub')).lower()
+
+
+def _is_theta_linear_bridge(config) -> bool:
+    return _bridge_type(config) == 'theta_linear'
+
+
+def _bridge_type_metric(config) -> float:
+    bt = _bridge_type(config)
+    if bt == 'unidb_gou':
+        return 1.0
+    if bt == 'theta_linear':
+        return 2.0
+    return 0.0
+
 from utils.inverse_dynamics import InverseDynamicsMLP, parse_hidden_dims
 from utils.networks import MLP
 
@@ -104,6 +148,35 @@ class DistributionalSubgoalEstimatorNet(nn.Module):
         return mu, log_std
 
 
+class PathResidualNet(nn.Module):
+    """Per-step path residual network for ``forward_bridge_residual`` planner.
+
+    Takes the bridge endpoints ``(z_0, z_K)`` and a normalised time index
+    ``t_norm = i / K`` and outputs a per-step residual ``r_theta(z_0, z_K, i)``
+    of shape ``(B, T, state_dim)``.  The agent multiplies this residual by a
+    quadratic schedule ``w_i = i*(K-i)/K^2`` so that ``w_0 = w_K = 0`` and the
+    bridge endpoints are always preserved exactly.
+    """
+
+    hidden_dims: Sequence[int]
+    state_dim: int
+    time_embed_dim: int = 64
+    layer_norm: bool = True
+
+    @nn.compact
+    def __call__(self, z0, zK, t_norm):
+        # z0, zK: (B, D);  t_norm: (B, T) with values in [0, 1].
+        t_emb = SinusoidalEmbedding(self.time_embed_dim)(t_norm)  # (B, T, time_embed_dim)
+        z0_b = jnp.broadcast_to(z0[:, None, :], (z0.shape[0], t_norm.shape[1], z0.shape[1]))
+        zK_b = jnp.broadcast_to(zK[:, None, :], (zK.shape[0], t_norm.shape[1], zK.shape[1]))
+        inp = jnp.concatenate([z0_b, zK_b, t_emb], axis=-1)
+        return MLP(
+            hidden_dims=(*self.hidden_dims, self.state_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm,
+        )(inp)
+
+
 def _subgoal_mode(config) -> str:
     return str(config.get('subgoal_distribution', 'deterministic')).lower()
 
@@ -122,7 +195,10 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         is_boundary = n == n_total
 
         eps = self.network.select('eps_net')(x_n, x_T, x_0, n.astype(jnp.float32), params=params)
-        mu_inner = model_mean(x_n, x_T, eps, n_safe, schedule)
+        if _is_theta_linear_bridge(self.config):
+            mu_inner = theta_linear_model_mean(x_n, x_0, x_T, eps, n_safe, schedule)
+        else:
+            mu_inner = model_mean(x_n, x_T, eps, n_safe, schedule)
         mu_boundary = x_T + eps
         mu = jnp.where(is_boundary[..., None], mu_boundary, mu_inner)
         return mu, eps
@@ -166,7 +242,10 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
 
         x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
         x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
-        mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
+        if _is_theta_linear_bridge(self.config):
+            mu_true = theta_linear_posterior_mean(x_n, x_0, x_T, n, self.schedule)
+        else:
+            mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
         mu_pred, eps_pred = self._learned_reverse_mean(x_n, x_T, x_0, n, self.schedule, params=grad_params)
 
         g2_n = self.schedule['g2'][n - 1]
@@ -202,10 +281,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         }
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
-        info['bridge/bridge_type'] = jnp.asarray(
-            1.0 if str(self.config.get('bridge_type', 'goub')).lower() == 'unidb_gou' else 0.0,
-            dtype=jnp.float32,
-        )
+        info['bridge/bridge_type'] = jnp.asarray(_bridge_type_metric(self.config), dtype=jnp.float32)
         info['bridge/bridge_gamma'] = jnp.asarray(
             float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
         )
@@ -221,16 +297,147 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         return self.replace(network=new_network, rng=new_rng), info
 
-    @partial(jax.jit, static_argnames=('num_steps',))
-    def plan(self, current_state, desired_endpoint, *, num_steps: int | None = None):
-        squeeze = current_state.ndim == 1
-        if squeeze:
-            current_state = current_state[None]
-            desired_endpoint = desired_endpoint[None]
+    # ------------------------------------------------------------------
+    # GOUB forward-bridge planner (closed-form, endpoint-conditioned)
+    # ------------------------------------------------------------------
+    #
+    # For ``planner_type='reverse_score'`` (default) ``plan()`` / ``sample_plan()``
+    # take the existing learned-eps reverse chain.  For
+    # ``planner_type='forward_bridge'`` and ``planner_type='forward_bridge_residual'``
+    # they instead branch into the closed-form Gaussian bridge below.  The
+    # convention follows DOURI's state-space *forward* time direction:
+    #
+    #     z_0 = current state          (= x_T in legacy GOUB diffusion-time)
+    #     z_K = subgoal endpoint       (= x_0 in legacy GOUB diffusion-time)
+    #     trajectory[:, 0] = z_0
+    #     trajectory[:, K] = z_K
+    #
+    # which already matches the existing reverse-chain output convention
+    # (``traj[:, 0] = current_state`` and ``traj[:, -1]`` ~ predicted subgoal),
+    # so downstream consumers (IDM action decoding, rollout/subgoal.py, etc.)
+    # can be re-used without changes.
 
+    def forward_bridge_coefficients(self, K, *, eps: float | None = None):
+        """Return ``(a, b, std)`` of shape ``(K + 1,)`` for the GOUB forward bridge.
+
+        Coefficients satisfy ``z_i | z_0, z_K ~ N(a_i z_0 + b_i z_K, std_i^2 I)``
+        with the exact endpoint constraints
+        ``a[0]=1, b[0]=0, std[0]=0`` and ``a[K]=0, b[K]=1, std[K]=0``.
+
+        ``K`` is treated as a *static* Python int (it determines the size of
+        the returned arrays); ``eps`` defaults to ``self.config['forward_bridge_eps']``
+        when ``None``.
+        """
+        eps_val = float(self.config.get('forward_bridge_eps', 1.0e-6)) if eps is None else float(eps)
+        return forward_bridge_coefficients(
+            int(K),
+            beta_min=float(self.config['goub_beta_min']),
+            beta_max=float(self.config['goub_beta_max']),
+            lambda_=float(self.config['goub_lambda']),
+            eps=eps_val,
+            bridge_type=str(self.config.get('bridge_type', 'goub')),
+        )
+
+    def forward_bridge_plan(
+        self,
+        z0: jnp.ndarray,
+        zK: jnp.ndarray,
+        *,
+        sample: bool = False,
+        noise_scale: float = 0.0,
+        num_steps: int | None = None,
+        rng=None,
+    ) -> jnp.ndarray:
+        """Closed-form forward-bridge path ``z_0 -> z_K``.
+
+        Args:
+            z0: ``(B, state_dim)`` current state.
+            zK: ``(B, state_dim)`` subgoal endpoint.
+            sample: if ``True`` add per-step Gaussian noise scaled by ``std_i``.
+                **Note**: this samples each marginal independently and is *not*
+                an exact correlated bridge sample - it is intended only as an
+                ablation / regularisation lever.  Endpoints are clamped after
+                noise injection so ``path[:, 0] = z0`` and ``path[:, -1] = zK``
+                always hold.
+            noise_scale: scalar noise multiplier (``0`` falls back to mean).
+            num_steps: planning horizon ``K``; defaults to ``self.config['goub_N']``.
+            rng: required when ``sample=True`` and ``noise_scale > 0``.
+
+        Returns:
+            ``path`` of shape ``(B, K + 1, state_dim)``.
+        """
+        n_total = int(self.config['goub_N'])
+        K = n_total if num_steps is None else int(num_steps)
+        if K < 1 or K > n_total:
+            raise ValueError(f'num_steps must be in [1, {n_total}], got {K}.')
+
+        a, b, std = self.forward_bridge_coefficients(K)
+        mu = a[None, :, None] * z0[:, None, :] + b[None, :, None] * zK[:, None, :]
+
+        if sample and float(noise_scale) > 0.0:
+            if rng is None:
+                raise ValueError('forward_bridge_plan(sample=True, noise_scale>0) requires an rng.')
+            noise = jax.random.normal(rng, mu.shape)
+            path = mu + jnp.asarray(noise_scale, dtype=jnp.float32) * std[None, :, None] * noise
+            # Endpoint clamp - keeps ``path[:, 0] = z0`` and ``path[:, -1] = zK``
+            # exact even after the independent-marginal noise injection.
+            path = path.at[:, 0, :].set(z0).at[:, -1, :].set(zK)
+        else:
+            path = mu
+
+        return path
+
+    def forward_bridge_residual_plan(
+        self,
+        z0: jnp.ndarray,
+        zK: jnp.ndarray,
+        *,
+        sample: bool = False,
+        noise_scale: float = 0.0,
+        num_steps: int | None = None,
+        rng=None,
+        params=None,
+    ) -> jnp.ndarray:
+        """Forward bridge mean + endpoint-preserving learned residual.
+
+        ``z_hat_i = mu_i + w_i * r_theta(z_0, z_K, i)`` where
+        ``mu_i = a_i z_0 + b_i z_K`` is the closed-form bridge mean,
+        ``r_theta`` is :class:`PathResidualNet`, and the quadratic schedule
+        ``w_i = i*(K - i)/K^2`` zeros out at the endpoints so ``z_hat_0 = z_0``
+        and ``z_hat_K = z_K`` are preserved exactly (modulo the explicit
+        endpoint clamp at the end).
+        """
+        n_total = int(self.config['goub_N'])
+        K = n_total if num_steps is None else int(num_steps)
+        if K < 1 or K > n_total:
+            raise ValueError(f'num_steps must be in [1, {n_total}], got {K}.')
+
+        a, b, std = self.forward_bridge_coefficients(K)
+        mu = a[None, :, None] * z0[:, None, :] + b[None, :, None] * zK[:, None, :]
+
+        idx = jnp.arange(K + 1, dtype=jnp.float32)
+        w = idx * (float(K) - idx) / float(K * K)
+        t_norm = jnp.broadcast_to(idx[None, :] / float(K), (z0.shape[0], K + 1))
+
+        residual = self.network.select('path_residual_net')(z0, zK, t_norm, params=params)
+        path = mu + w[None, :, None] * residual
+
+        if sample and float(noise_scale) > 0.0:
+            if rng is None:
+                raise ValueError('forward_bridge_residual_plan(sample=True, noise_scale>0) requires an rng.')
+            noise = jax.random.normal(rng, path.shape)
+            path = path + jnp.asarray(noise_scale, dtype=jnp.float32) * std[None, :, None] * noise
+
+        # Endpoint clamp - safety net; ``w_0 = w_K = 0`` already preserves
+        # endpoints in the deterministic case, but the explicit ``set`` keeps
+        # things exact under sampled noise and floating-point round-off.
+        path = path.at[:, 0, :].set(z0).at[:, -1, :].set(zK)
+        return path
+
+    def _reverse_score_plan(self, current_state, desired_endpoint, num_steps: int | None = None):
         x_T = current_state
         x_0_goal = desired_endpoint
-        n_total = self.config['goub_N']
+        n_total = int(self.config['goub_N'])
         steps_to_roll = n_total if num_steps is None else int(num_steps)
         if steps_to_roll < 1 or steps_to_roll > n_total:
             raise ValueError(f'num_steps must be in [1, {n_total}], got {steps_to_roll}.')
@@ -244,53 +451,14 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
         _, traj_body = jax.lax.scan(scan_body, x_T, steps)
         traj = jnp.concatenate([x_T[None], traj_body], axis=0)
-        traj = jnp.swapaxes(traj, 0, 1)
-        next_step = traj_body[0]
+        return jnp.swapaxes(traj, 0, 1)
 
-        result = {'next_step': next_step, 'trajectory': traj}
-        if squeeze:
-            result = jax.tree_util.tree_map(lambda x: x[0], result)
-        return result
-
-    @partial(jax.jit, static_argnames=('noise_scale', 'num_steps'))
-    def sample_plan(self, current_state, desired_endpoint, rng, noise_scale: float = 1.0, num_steps: int | None = None):
-        squeeze = current_state.ndim == 1
-        if squeeze:
-            current_state = current_state[None]
-            desired_endpoint = desired_endpoint[None]
-
-        x_T = current_state
-        x_0_goal = desired_endpoint
-        n_total = self.config['goub_N']
-        steps_to_roll = n_total if num_steps is None else int(num_steps)
-        if steps_to_roll < 1 or steps_to_roll > n_total:
-            raise ValueError(f'num_steps must be in [1, {n_total}], got {steps_to_roll}.')
-        batch_size = x_T.shape[0]
-        step_rngs = jax.random.split(rng, steps_to_roll)
-
-        def scan_body(x, inputs):
-            step_n, step_rng = inputs
-            n = jnp.full((batch_size,), step_n, dtype=jnp.int32)
-            x_new, _ = self._reverse_step(x, x_T, x_0_goal, n, step_rng, True, noise_scale, params=None)
-            return x_new, x_new
-
-        steps = jnp.arange(n_total, n_total - steps_to_roll, -1)
-        _, traj_body = jax.lax.scan(scan_body, x_T, (steps, step_rngs))
-        traj = jnp.concatenate([x_T[None], traj_body], axis=0)
-        traj = jnp.swapaxes(traj, 0, 1)
-        next_step = traj_body[0]
-
-        result = {'next_step': next_step, 'trajectory': traj}
-        if squeeze:
-            result = jax.tree_util.tree_map(lambda x: x[0], result)
-        return result
-
-    def _sample_plan_trajectory(
+    def _reverse_score_sample_plan(
         self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None
     ):
         x_T = current_state
         x_0_goal = desired_endpoint
-        n_total = self.config['goub_N']
+        n_total = int(self.config['goub_N'])
         steps_to_roll = n_total if num_steps is None else int(num_steps)
         if steps_to_roll < 1 or steps_to_roll > n_total:
             raise ValueError(f'num_steps must be in [1, {n_total}], got {steps_to_roll}.')
@@ -307,6 +475,86 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         _, traj_body = jax.lax.scan(scan_body, x_T, (steps, step_rngs))
         traj = jnp.concatenate([x_T[None], traj_body], axis=0)
         return jnp.swapaxes(traj, 0, 1)
+
+    @partial(jax.jit, static_argnames=('num_steps',))
+    def plan(self, current_state, desired_endpoint, *, num_steps: int | None = None):
+        squeeze = current_state.ndim == 1
+        if squeeze:
+            current_state = current_state[None]
+            desired_endpoint = desired_endpoint[None]
+
+        planner = _planner_type(self.config)
+        if planner == 'forward_bridge':
+            traj = self.forward_bridge_plan(
+                current_state, desired_endpoint,
+                sample=False, noise_scale=0.0, num_steps=num_steps,
+            )
+        elif planner == 'forward_bridge_residual':
+            traj = self.forward_bridge_residual_plan(
+                current_state, desired_endpoint,
+                sample=False, noise_scale=0.0, num_steps=num_steps,
+            )
+        else:
+            traj = self._reverse_score_plan(current_state, desired_endpoint, num_steps=num_steps)
+
+        result = {'next_step': traj[:, 1, :], 'trajectory': traj}
+        if squeeze:
+            result = jax.tree_util.tree_map(lambda x: x[0], result)
+        return result
+
+    @partial(jax.jit, static_argnames=('noise_scale', 'num_steps'))
+    def sample_plan(self, current_state, desired_endpoint, rng, noise_scale: float = 1.0, num_steps: int | None = None):
+        squeeze = current_state.ndim == 1
+        if squeeze:
+            current_state = current_state[None]
+            desired_endpoint = desired_endpoint[None]
+
+        planner = _planner_type(self.config)
+        if planner == 'forward_bridge':
+            sample_flag = _forward_bridge_mode(self.config) == 'sample'
+            traj = self.forward_bridge_plan(
+                current_state, desired_endpoint,
+                sample=sample_flag, noise_scale=noise_scale,
+                num_steps=num_steps, rng=rng,
+            )
+        elif planner == 'forward_bridge_residual':
+            sample_flag = _forward_bridge_mode(self.config) == 'sample'
+            traj = self.forward_bridge_residual_plan(
+                current_state, desired_endpoint,
+                sample=sample_flag, noise_scale=noise_scale,
+                num_steps=num_steps, rng=rng,
+            )
+        else:
+            traj = self._reverse_score_sample_plan(
+                current_state, desired_endpoint, rng, noise_scale, num_steps=num_steps,
+            )
+
+        result = {'next_step': traj[:, 1, :], 'trajectory': traj}
+        if squeeze:
+            result = jax.tree_util.tree_map(lambda x: x[0], result)
+        return result
+
+    def _sample_plan_trajectory(
+        self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None
+    ):
+        planner = _planner_type(self.config)
+        if planner == 'forward_bridge':
+            sample_flag = _forward_bridge_mode(self.config) == 'sample'
+            return self.forward_bridge_plan(
+                current_state, desired_endpoint,
+                sample=sample_flag, noise_scale=noise_scale,
+                num_steps=num_steps, rng=rng,
+            )
+        if planner == 'forward_bridge_residual':
+            sample_flag = _forward_bridge_mode(self.config) == 'sample'
+            return self.forward_bridge_residual_plan(
+                current_state, desired_endpoint,
+                sample=sample_flag, noise_scale=noise_scale,
+                num_steps=num_steps, rng=rng,
+            )
+        return self._reverse_score_sample_plan(
+            current_state, desired_endpoint, rng, noise_scale, num_steps=num_steps,
+        )
 
     @partial(jax.jit, static_argnames=('num_candidates', 'include_mean', 'noise_scale', 'num_steps'))
     def sample_plan_candidates(
@@ -632,6 +880,25 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             subgoal_net=(subgoal_def, (dummy_x, dummy_g)),
             idm_net=(idm_def, (dummy_x, dummy_next)),
         )
+        # Optionally register the forward-bridge residual MLP.  Only created when
+        # ``planner_type == 'forward_bridge_residual'`` so existing reverse-score
+        # checkpoints stay loadable bit-for-bit (no extra params introduced).
+        planner_type = str(config.get('planner_type', 'reverse_score')).lower()
+        if planner_type == 'forward_bridge_residual':
+            residual_hidden = config.get('residual_hidden_dims', config.get('eps_hidden_dims', (512, 512, 512)))
+            if isinstance(residual_hidden, str):
+                residual_hidden = parse_hidden_dims(residual_hidden)
+            else:
+                residual_hidden = tuple(int(x) for x in residual_hidden)
+            residual_def = PathResidualNet(
+                hidden_dims=residual_hidden,
+                state_dim=state_dim,
+                time_embed_dim=int(config['time_embed_dim']),
+                layer_norm=bool(config['layer_norm']),
+            )
+            horizon = int(config['goub_N']) + 1
+            dummy_t = jnp.zeros((batch_size, horizon), dtype=jnp.float32)
+            network_info['path_residual_net'] = (residual_def, (dummy_x, dummy_x, dummy_t))
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -684,67 +951,13 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         value = jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))
         return value, jnp.asarray(alpha, dtype=jnp.float32) * value
 
-    @jax.jit
-    def total_loss(self, batch, grad_params, rng=None, critic_value_params=None):
-        """GOUB mean-matching + path-aligned reverse + short rollout + subgoal MSE."""
-        x_T = batch['observations']
-        x_0 = batch['high_actor_targets']
-        segment = jnp.asarray(batch['trajectory_segment'], dtype=jnp.float32)
-        B = x_T.shape[0]
-        N = int(self.config['goub_N'])
-        K = int(segment.shape[1]) - 1
-        # With PathHGCDataset, K should match N; avoid hard assert inside jit for speed.
-        sg_w = float(self.config.get('subgoal_loss_weight', 1.0))
-        w_g = float(self.config.get('goub_loss_weight', 1.0))
-        w_p = float(self.config.get('path_loss_weight', 1.0))
-        w_r = float(self.config.get('rollout_loss_weight', 0.25))
+    def _compute_subgoal_loss(self, batch, grad_params, rng_fr, critic_value_params):
+        """Compute the subgoal-net training loss + companion logging tensors.
 
-        rng1, rng2, rng_fr = jax.random.split(rng, 3)
-        n = jax.random.randint(rng1, (B,), 1, N + 1)
-
-        is_boundary = n == N
-        n_safe = jnp.minimum(n, N - 1)
-
-        # --- L_goub ---
-        x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
-        x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
-        mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
-        mu_pred, eps_pred = self._learned_reverse_mean(
-            x_n, x_T, x_0, n, self.schedule, params=grad_params,
-        )
-        g2_n = self.schedule['g2'][n - 1]
-        weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
-        loss_goub = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
-
-        # --- L_path: real x_n along segment, same n ---
-        row = jnp.arange(B, dtype=jnp.int32)
-        x_n_real = segment[row, K - n, :]
-        x_prev_real = segment[row, K - n + 1, :]
-        mu_pred_path, _ = self._learned_reverse_mean(
-            x_n_real, x_T, x_0, n, self.schedule, params=grad_params,
-        )
-        diff_p = mu_pred_path - x_prev_real
-        loss_path = jnp.abs(diff_p).sum(axis=-1).mean()
-
-        # --- L_roll: recursive deterministic reverse vs segment prefix ---
-        H_cfg = int(self.config.get('rollout_horizon', 5))
-        H_eff = max(1, min(H_cfg, N))
-        hs = jnp.arange(1, H_eff + 1, dtype=jnp.int32)
-
-        def roll_body(x, h):
-            step_n = N - h + 1
-            n_b = jnp.full((B,), step_n, dtype=jnp.int32)
-            mu_r, _ = self._learned_reverse_mean(
-                x, x_T, x_0, n_b, self.schedule, params=grad_params,
-            )
-            tgt = segment[row, h, :]
-            err = jnp.abs(mu_r - tgt).sum(axis=-1)
-            return mu_r, err
-
-        _, errs = jax.lax.scan(roll_body, segment[:, 0, :], hs)
-        loss_roll = jnp.mean(errs)
-
-        # --- L_subgoal ---
+        Shared by both the legacy reverse-score path and the
+        ``forward_bridge`` / ``forward_bridge_residual`` path so the subgoal
+        estimator is trained identically across planners.
+        """
         s = batch['observations']
         g_high = batch['high_actor_goals']
         target = batch['high_actor_targets']
@@ -826,6 +1039,80 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
                 'phase1/subgoal_fr_spi': zero,
                 'phase1/subgoal_mode': zero,
             }
+        return loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus, pred_sg_out, subgoal_extra_info
+
+    def _path_eval_slice(self) -> tuple[int, ...]:
+        pev = self.config.get('path_eval_slice')
+        if pev is None:
+            return (0, 1)
+        return tuple(int(x) for x in pev)
+
+    def _total_loss_reverse_score(self, batch, grad_params, rng, critic_value_params):
+        """Legacy GOUB mean-matching + path-aligned reverse + short rollout + subgoal MSE."""
+        x_T = batch['observations']
+        x_0 = batch['high_actor_targets']
+        segment = jnp.asarray(batch['trajectory_segment'], dtype=jnp.float32)
+        B = x_T.shape[0]
+        N = int(self.config['goub_N'])
+        K = int(segment.shape[1]) - 1
+        sg_w = float(self.config.get('subgoal_loss_weight', 1.0))
+        w_g = float(self.config.get('goub_loss_weight', 1.0))
+        w_p = float(self.config.get('path_loss_weight', 1.0))
+        w_r = float(self.config.get('rollout_loss_weight', 0.25))
+
+        rng1, rng2, rng_fr = jax.random.split(rng, 3)
+        n = jax.random.randint(rng1, (B,), 1, N + 1)
+
+        is_boundary = n == N
+        n_safe = jnp.minimum(n, N - 1)
+
+        # --- L_goub ---
+        x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
+        x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
+        if _is_theta_linear_bridge(self.config):
+            mu_true = theta_linear_posterior_mean(x_n, x_0, x_T, n, self.schedule)
+        else:
+            mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
+        mu_pred, eps_pred = self._learned_reverse_mean(
+            x_n, x_T, x_0, n, self.schedule, params=grad_params,
+        )
+        g2_n = self.schedule['g2'][n - 1]
+        weight = 1.0 / (2.0 * jnp.maximum(g2_n, 1e-12))
+        loss_goub = (weight * jnp.abs(mu_true - mu_pred).sum(axis=-1)).mean()
+
+        # --- L_path: real x_n along segment, same n ---
+        row = jnp.arange(B, dtype=jnp.int32)
+        x_n_real = segment[row, K - n, :]
+        x_prev_real = segment[row, K - n + 1, :]
+        mu_pred_path, _ = self._learned_reverse_mean(
+            x_n_real, x_T, x_0, n, self.schedule, params=grad_params,
+        )
+        diff_p = mu_pred_path - x_prev_real
+        loss_path = jnp.abs(diff_p).sum(axis=-1).mean()
+
+        # --- L_roll: recursive deterministic reverse vs segment prefix ---
+        H_cfg = int(self.config.get('rollout_horizon', 5))
+        H_eff = max(1, min(H_cfg, N))
+        hs = jnp.arange(1, H_eff + 1, dtype=jnp.int32)
+
+        def roll_body(x, h):
+            step_n = N - h + 1
+            n_b = jnp.full((B,), step_n, dtype=jnp.int32)
+            mu_r, _ = self._learned_reverse_mean(
+                x, x_T, x_0, n_b, self.schedule, params=grad_params,
+            )
+            tgt = segment[row, h, :]
+            err = jnp.abs(mu_r - tgt).sum(axis=-1)
+            return mu_r, err
+
+        _, errs = jax.lax.scan(roll_body, segment[:, 0, :], hs)
+        loss_roll = jnp.mean(errs)
+
+        # --- L_subgoal ---
+        (loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus,
+         pred_sg_out, subgoal_extra_info) = self._compute_subgoal_loss(
+            batch, grad_params, rng_fr, critic_value_params,
+        )
 
         loss = w_g * loss_goub + w_p * loss_path + w_r * loss_roll + sg_w * loss_sub
 
@@ -840,12 +1127,7 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
 
         s1 = segment[:, 1, :]
         first_step_l1 = jnp.abs(xNm1 - s1).sum(axis=-1).mean()
-        pev = self.config.get('path_eval_slice')
-        if pev is None:
-            pev_t = (0, 1)
-        else:
-            pev_t = tuple(int(x) for x in pev)
-        idx_xy = jnp.asarray(pev_t, dtype=jnp.int32)
+        idx_xy = jnp.asarray(self._path_eval_slice(), dtype=jnp.int32)
         d_xy = xNm1[:, idx_xy] - s1[:, idx_xy]
         first_step_xy_l2 = jnp.sqrt(jnp.mean(d_xy**2))
 
@@ -867,20 +1149,155 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
             'phase1/mu_pred_norm': jnp.linalg.norm(mu_pred, axis=-1).mean(),
             'phase1/xN_minus_1_norm': xNm1_norm,
             'phase1/bridge_step_mean': n.astype(jnp.float32).mean(),
+            'phase1/planner_type': jnp.asarray(0.0, dtype=jnp.float32),
         }
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
         info.update(subgoal_extra_info)
-        # Bridge identifiers (constant per run; logged for run-trace clarity).
-        info['bridge/bridge_type'] = jnp.asarray(
-            1.0 if str(self.config.get('bridge_type', 'goub')).lower() == 'unidb_gou' else 0.0,
-            dtype=jnp.float32,
-        )
+        info['bridge/bridge_type'] = jnp.asarray(_bridge_type_metric(self.config), dtype=jnp.float32)
         info['bridge/bridge_gamma'] = jnp.asarray(
             float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
         )
-
         return loss, info
+
+    def _total_loss_forward_bridge(self, batch, grad_params, rng, critic_value_params, planner: str):
+        """Forward-bridge path-supervised loss (planner_type in {forward_bridge,
+        forward_bridge_residual}).
+
+        - Bridge mean (and optional learned residual) is teacher-forced with the
+          *true* segment endpoints ``z_0 = segment[:, 0]`` and
+          ``z_K = segment[:, -1]``, so ``loss_path`` directly measures interior
+          MSE against the on-policy segment.
+        - Reverse-score / boundary / rollout losses are skipped (logged as 0).
+        - The subgoal estimator (``subgoal_net``) is trained exactly as in
+          reverse-score mode via ``_compute_subgoal_loss``.
+        - IDM is always trained (separate network).
+        """
+        x_T = batch['observations']
+        x_0 = batch['high_actor_targets']
+        segment = jnp.asarray(batch['trajectory_segment'], dtype=jnp.float32)
+        N = int(self.config['goub_N'])
+        K = int(segment.shape[1]) - 1
+        sg_w = float(self.config.get('subgoal_loss_weight', 1.0))
+        w_p = float(self.config.get('path_loss_weight', 1.0))
+
+        # NOTE: forward-bridge planner expects ``goub_N == subgoal_steps == K``.
+        # ``GOUBDynamicsAgent.create`` already validates ``goub_N == subgoal_steps``;
+        # asserting against ``segment.shape[1]`` here would be redundant, and a
+        # hard JIT assert is expensive, so rely on PathHGCDataset/horizon plumbing.
+        _, _, rng_fr = jax.random.split(rng, 3)
+
+        z0 = segment[:, 0, :]
+        zK = segment[:, -1, :]
+
+        if planner == 'forward_bridge_residual':
+            path_pred = self.forward_bridge_residual_plan(
+                z0, zK, sample=False, noise_scale=0.0, num_steps=N, params=grad_params,
+            )
+        else:
+            path_pred = self.forward_bridge_plan(
+                z0, zK, sample=False, noise_scale=0.0, num_steps=N,
+            )
+
+        # Teacher-forced path loss (interior steps + first step).  ``loss_next``
+        # is reported separately so it is comparable to reverse-score's
+        # ``phase1/first_step_l1`` and ``phase1/loss_path_step``.
+        diff_next = path_pred[:, 1, :] - segment[:, 1, :]
+        loss_next = jnp.mean(jnp.abs(diff_next).sum(axis=-1))
+        if K >= 2:
+            diff_interior = path_pred[:, 1:-1, :] - segment[:, 1:-1, :]
+            loss_path = jnp.mean(jnp.abs(diff_interior).sum(axis=-1))
+        else:
+            loss_path = jnp.zeros((), dtype=jnp.float32)
+
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
+        use_path = bool(self.config.get('forward_bridge_use_path_loss', True))
+        path_term = (loss_path + loss_next) if use_path else zero
+
+        (loss_sub, subgoal_mse, subgoal_value, subgoal_value_bonus,
+         pred_sg_out, subgoal_extra_info) = self._compute_subgoal_loss(
+            batch, grad_params, rng_fr, critic_value_params,
+        )
+
+        loss = w_p * path_term + sg_w * loss_sub
+
+        idm_term, loss_idm_unw = self._idm_loss_term(batch, grad_params)
+        loss = loss + idm_term
+
+        # Forward-bridge specific diagnostics.
+        bridge_path_mse = jnp.mean((path_pred[:, 1:-1, :] - segment[:, 1:-1, :]) ** 2) if K >= 2 else zero
+        bridge_next_mse = jnp.mean((path_pred[:, 1, :] - segment[:, 1, :]) ** 2)
+        bridge_final_mse = jnp.mean((path_pred[:, -1, :] - segment[:, -1, :]) ** 2)
+        bridge_endpoint_start_mse = jnp.mean((path_pred[:, 0, :] - segment[:, 0, :]) ** 2)
+        bridge_endpoint_end_mse = bridge_final_mse  # alias kept for compatibility with spec
+
+        # Per-step distance to subgoal (averaged over batch).  We report scalar
+        # samples for csv/wandb compatibility (no vector logging required).
+        dist_per_step = jnp.linalg.norm(path_pred - zK[:, None, :], axis=-1).mean(axis=0)
+        first_idx = 1 if K >= 1 else 0
+        mid_idx = max(1, K // 2)
+        last_idx = K
+
+        s1 = segment[:, 1, :]
+        first_step_l1 = jnp.mean(jnp.abs(path_pred[:, 1, :] - s1).sum(axis=-1))
+        idx_xy = jnp.asarray(self._path_eval_slice(), dtype=jnp.int32)
+        d_xy = path_pred[:, 1, :][:, idx_xy] - s1[:, idx_xy]
+        first_step_xy_l2 = jnp.sqrt(jnp.mean(d_xy ** 2))
+
+        planner_id = 1.0 if planner == 'forward_bridge' else 2.0
+        info = {
+            'phase1/loss': loss,
+            # Reverse-score legacy keys logged as 0 to keep the metrics dict
+            # shape-stable for existing csv/wandb consumers.
+            'phase1/loss_goub': zero,
+            'phase1/loss_roll': zero,
+            'phase1/loss_path_step': loss_next,
+            'phase1/loss_subgoal': loss_sub,
+            'phase1/loss_subgoal_mse': subgoal_mse.mean(),
+            'phase1/subgoal_value_mean': subgoal_value.mean(),
+            'phase1/subgoal_value_bonus_mean': subgoal_value_bonus.mean(),
+            'phase1/loss_idm': loss_idm_unw,
+            'phase1/first_step_l1': first_step_l1,
+            'phase1/first_step_xy_l2': first_step_xy_l2,
+            'phase1/roll_h_l1': zero,
+            'phase1/eps_norm': zero,
+            'phase1/mu_true_norm': jnp.linalg.norm(segment[:, 1, :], axis=-1).mean(),
+            'phase1/mu_pred_norm': jnp.linalg.norm(path_pred[:, 1, :], axis=-1).mean(),
+            'phase1/xN_minus_1_norm': jnp.linalg.norm(path_pred[:, 1, :], axis=-1).mean(),
+            'phase1/bridge_step_mean': zero,
+            'phase1/planner_type': jnp.asarray(planner_id, dtype=jnp.float32),
+            # Forward-bridge specific.
+            'forward_bridge/loss_path_interior': loss_path,
+            'forward_bridge/loss_path_next': loss_next,
+            'forward_bridge/path_mse': bridge_path_mse,
+            'forward_bridge/next_mse': bridge_next_mse,
+            'forward_bridge/final_mse': bridge_final_mse,
+            'forward_bridge/endpoint_start_mse': bridge_endpoint_start_mse,
+            'forward_bridge/endpoint_end_mse': bridge_endpoint_end_mse,
+            'forward_bridge/dist_to_subgoal_step_1': dist_per_step[first_idx],
+            'forward_bridge/dist_to_subgoal_step_mid': dist_per_step[mid_idx],
+            'forward_bridge/dist_to_subgoal_step_last': dist_per_step[last_idx],
+        }
+        info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
+        info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
+        info.update(subgoal_extra_info)
+        info['bridge/bridge_type'] = jnp.asarray(_bridge_type_metric(self.config), dtype=jnp.float32)
+        info['bridge/bridge_gamma'] = jnp.asarray(
+            float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
+        )
+        return loss, info
+
+    @jax.jit
+    def total_loss(self, batch, grad_params, rng=None, critic_value_params=None):
+        """Path-supervised Phase1 loss; dispatches on ``planner_type``."""
+        planner = _planner_type(self.config)
+        if planner in ('forward_bridge', 'forward_bridge_residual'):
+            return self._total_loss_forward_bridge(
+                batch, grad_params, rng, critic_value_params, planner,
+            )
+        return self._total_loss_reverse_score(
+            batch, grad_params, rng, critic_value_params,
+        )
 
 
 def _get_common_config():
@@ -897,6 +1314,8 @@ def _get_common_config():
             # UniDB-GOU soft-bridge controls.
             # bridge_type='goub' reproduces vanilla GOUB exactly.
             # bridge_type='unidb_gou' activates the finite-gamma soft bridge.
+            # bridge_type='theta_linear' uses the self-consistent theta-linear
+            # forward bridge with the same linear-beta theta scheduler.
             bridge_type='goub',
             bridge_gamma=1.0e7,
             eps_hidden_dims=(512, 512, 512),
@@ -928,13 +1347,28 @@ def _get_common_config():
             # tail with s_{t_g} for steps beyond t_g. This trains the bridge to "arrive
             # and stay" at close goals so subgoal predictions near the goal stay
             # in-distribution and reduces hovering near the goal.
-            clip_path_to_goal=False,
+            clip_path_to_goal=True,
+            # Path-supervised planner switch.  Default 'reverse_score' keeps
+            # the legacy learned-eps reverse chain bit-for-bit.  Alternatives:
+            #   'forward_bridge'          : closed-form GOUB Prop. 3.1 forward
+            #                               bridge mean (no learned path params).
+            #   'forward_bridge_residual' : bridge mean + endpoint-preserving
+            #                               learned residual (PathResidualNet).
+            planner_type='reverse_score',
+            forward_bridge_mode='mean',
+            forward_bridge_noise_scale=0.0,
+            forward_bridge_eps=1.0e-6,
+            forward_bridge_train_epsilon=False,
+            forward_bridge_use_path_loss=True,
+            forward_bridge_use_rollout_loss=False,
+            # Hidden dims for the optional PathResidualNet (forward_bridge_residual).
+            residual_hidden_dims=(512, 512, 512),
             idm_loss_weight=1.0,
             idm_hidden_dims=(512, 512, 512),
             value_p_curgoal=0.2,
             value_p_trajgoal=0.5,
             value_p_randomgoal=0.3,
-            value_geom_sample=True,
+            value_geom_sample=False,
             actor_p_curgoal=0.0,
             actor_p_trajgoal=1.0,
             actor_p_randomgoal=0.0,
@@ -952,7 +1386,7 @@ def get_dynamics_config():
     c.require_matching_horizon = True
     c.goub_loss_weight = 1.0
     c.path_loss_weight = 1.0
-    c.rollout_loss_weight = 0.25
+    c.rollout_loss_weight = 1.0
     c.rollout_horizon = 5
     c.path_eval_slice = [0, 1]
     c.idm_loss_weight = 1.0

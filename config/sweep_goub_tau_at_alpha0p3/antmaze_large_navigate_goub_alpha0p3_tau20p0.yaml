@@ -1,0 +1,26 @@
+# AntMaze large navigate — alpha=0.3 fixed, spi_tau=20.
+# Omitted keys use main.py / agents/goub_dynamics defaults.
+
+env_name: antmaze-large-navigate-v0
+seed: 0
+run_group: antmaze_navigate_goub_tau_at_alpha0p3_sweep
+
+train_epochs: 400
+log_every_n_epochs: 10
+
+batch_size: 1024
+plan_candidates: 1
+plan_noise_scale: 0.01
+
+goub:
+  subgoal_value_alpha: 0.3
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.99
+
+actor:
+  spi_tau: 20.0
+  spi_beta: 1.0
+  spi_actor_layer_norm: true
+  spi_conditioned: subgoal

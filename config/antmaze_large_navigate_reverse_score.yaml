@@ -1,0 +1,47 @@
+# AntMaze large baseline: explicit `planner_type: reverse_score` so this
+# config is structurally comparable to `*_forward_bridge_mean.yaml` and
+# `*_forward_bridge_residual.yaml` for ablation runs.  Default behaviour
+# is bit-for-bit identical to `antmaze_large_navigate_clip_vanilla_goub.yaml`
+# - the `planner_type` key is the only difference (and `reverse_score`
+# is the implicit default).
+
+env_name: antmaze-large-navigate-v0
+seed: 0
+run_group: antmaze_navigate
+
+train_epochs: 500
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+
+use_wandb: false
+use_tqdm: false
+
+batch_size: 1024
+joint_horizon: 25
+plan_candidates: 1
+plan_noise_scale: 0.01
+measure_timing: false
+eval_freq: 100
+eval_task_ids: "1,2,3,4,5"
+eval_episodes_per_task: 10
+eval_max_chunks: 200
+eval_goal_tol: 0.5
+eval_goal_dims: "0,1"
+
+goub:
+  rollout_loss_weight: 1.0
+  value_geom_sample: false
+  subgoal_value_alpha: 0.1
+  bridge_type: goub
+  clip_path_to_goal: true
+  planner_type: reverse_score
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.99
+
+actor:
+  spi_tau: 1.0
+  spi_beta: 1.0
+  spi_actor_layer_norm: true
+  spi_conditioned: subgoal

@@ -41,7 +41,7 @@ import jax
 import jax.numpy as jnp
 
 
-_VALID_BRIDGE_TYPES = ('goub', 'unidb_gou')
+_VALID_BRIDGE_TYPES = ('goub', 'unidb_gou', 'theta_linear')
 
 
 def _resolve_gamma_inv(bridge_type: str, bridge_gamma: float) -> float:
@@ -55,10 +55,86 @@ def _resolve_gamma_inv(bridge_type: str, bridge_gamma: float) -> float:
     gamma = float(bridge_gamma)
     if not (gamma > 0.0):
         raise ValueError(
-            f'bridge_gamma must be > 0 for unidb_gou, got {bridge_gamma!r}.'
+            f'bridge_gamma must be > 0 for {bridge_type}, got {bridge_gamma!r}.'
         )
     return 1.0 / gamma
 
+
+
+def _theta_linear_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=0.0):
+    """Exact linear-SDE bridge arrays in forward state time.
+
+    This uses the exact per-step discretization
+
+        r_{i+1} = exp(theta_i) r_i + eta_i,
+        eta_i ~ N(0, exp(2 theta_i) step_var_i I).
+
+    The returned arrays are converted to the legacy diffusion index ``n`` via
+    ``i = N - n`` so existing calls ``bridge_w[n]`` / ``bridge_var[n]`` keep the
+    same syntax as the GOUB helpers.
+    """
+    theta_fwd = jnp.asarray(theta_fwd, dtype=jnp.float32)
+    g2_fwd = jnp.asarray(g2_fwd, dtype=jnp.float32)
+    step_var_fwd = jnp.asarray(step_var_fwd, dtype=jnp.float32)
+    N = int(theta_fwd.shape[0])
+    A = jnp.exp(theta_fwd)
+    q2 = step_var_fwd * A ** 2
+
+    # P_i = Var[r_i | r_0 = 0].
+    Ps = [jnp.asarray(0.0, dtype=jnp.float32)]
+    for i in range(N):
+        Ps.append(A[i] ** 2 * Ps[-1] + q2[i])
+    P = jnp.stack(Ps)  # (N+1,)
+
+    # Phi_{i:K} = prod_{l=i}^{K-1} A_l.
+    Phis = [None] * (N + 1)
+    Phis[N] = jnp.asarray(1.0, dtype=jnp.float32)
+    for i in range(N - 1, -1, -1):
+        Phis[i] = A[i] * Phis[i + 1]
+    Phi = jnp.stack(Phis)
+
+    # Omega_{i:K} = Var[r_K | r_i] with r_i fixed.
+    Oms = [None] * (N + 1)
+    Oms[N] = jnp.asarray(0.0, dtype=jnp.float32)
+    for i in range(N - 1, -1, -1):
+        Oms[i] = q2[i] * Phi[i + 1] ** 2 + Oms[i + 1]
+    Omega = jnp.stack(Oms)
+
+    gamma_inv_arr = jnp.asarray(gamma_inv, dtype=jnp.float32)
+    denom = jnp.maximum(P[-1] + gamma_inv_arr, 1e-12)
+
+    beta = P * Phi / denom
+    bridge_var = P * (Omega + gamma_inv_arr) / denom
+    bridge_var = jnp.maximum(bridge_var, 0.0)
+
+    # Hard endpoint bridge should pin endpoints exactly.
+    if float(gamma_inv) == 0.0:
+        beta = beta.at[0].set(0.0).at[-1].set(1.0)
+        bridge_var = bridge_var.at[0].set(0.0).at[-1].set(0.0)
+
+    # Legacy index n corresponds to forward index i = N - n.
+    return dict(
+        theta_fwd=theta_fwd,
+        g2_fwd=g2_fwd,
+        step_var_fwd=step_var_fwd,
+        theta_legacy=theta_fwd[::-1],
+        g2_legacy=g2_fwd[::-1],
+        step_var_legacy=step_var_fwd[::-1],
+        theta_linear_A_fwd=A,
+        theta_linear_A=A[::-1],
+        theta_linear_q2_fwd=q2,
+        theta_linear_q2=q2[::-1],
+        theta_linear_P_fwd=P,
+        theta_linear_P=P[::-1],
+        theta_linear_phi_iK_fwd=Phi,
+        theta_linear_phi_iK=Phi[::-1],
+        theta_linear_omega_iK_fwd=Omega,
+        theta_linear_omega_iK=Omega[::-1],
+        theta_linear_beta_fwd=beta,
+        theta_linear_bridge_w=beta[::-1],
+        theta_linear_bridge_var_fwd=bridge_var,
+        theta_linear_bridge_var=bridge_var[::-1],
+    )
 
 def make_goub_schedule(
     N: int,
@@ -112,7 +188,19 @@ def make_goub_schedule(
     # Bridge interpolation weight uses the soft-bridge denominator.
     bridge_w = bar_sigma2_nN_gamma * jnp.exp(-bar_theta) / jnp.maximum(bar_sigma2_N_gamma, 1e-12)  # (N+1,)
 
-    return dict(
+    theta_linear = {}
+    if bridge_type == 'theta_linear':
+        theta_linear = _theta_linear_arrays(theta[::-1], g2[::-1], step_var[::-1], gamma_inv=gamma_inv)
+        # In theta-linear mode, arrays indexed by legacy n correspond to
+        # forward state-time step i = N - n.  Pass reversed forward arrays so
+        # schedule['theta'][n - 1] remains the original legacy theta_n.
+        theta = theta_linear['theta_legacy']
+        g2 = theta_linear['g2_legacy']
+        step_var = theta_linear['step_var_legacy']
+        bridge_w = theta_linear['theta_linear_bridge_w']
+        bridge_var = theta_linear['theta_linear_bridge_var']
+
+    out = dict(
         theta=theta, g2=g2, step_var=step_var,
         bar_theta=bar_theta, bar_sigma2=bar_sigma2,
         bar_theta_nN=bar_theta_nN, bar_sigma2_nN=bar_sigma2_nN,
@@ -122,6 +210,8 @@ def make_goub_schedule(
         bridge_var=bridge_var, bridge_w=bridge_w,
         gamma_inv=gamma_inv_arr,
     )
+    out.update(theta_linear)
+    return out
 
 
 def bridge_sample(x_0, x_T, n, schedule, rng):
@@ -142,6 +232,29 @@ def bridge_sample(x_0, x_T, n, schedule, rng):
     mean = w * x_0 + (1.0 - w) * x_T
     return mean + jnp.sqrt(jnp.maximum(var, 1e-12)) * jax.random.normal(rng, x_0.shape)
 
+
+
+def theta_linear_posterior_mean(x_n, x_0, x_T, n, schedule):
+    """Exact posterior teacher for the exp-discretized linear-SDE bridge."""
+    return posterior_mean(x_n, x_0, x_T, n, schedule)
+
+
+def theta_linear_model_mean(x_n, x_0, x_T, eps_pred, n, schedule):
+    """SDE/Euler model mean for theta-linear mode with explicit h-control."""
+    k = n - 1
+    theta_i = schedule['theta'][k][..., None]
+    g2_i = schedule['g2'][k][..., None]
+    phi_iK = schedule['theta_linear_phi_iK'][n][..., None]
+    omega_iK = schedule['theta_linear_omega_iK'][n][..., None]
+    gamma_inv = schedule.get('gamma_inv', jnp.asarray(0.0, dtype=jnp.float32))
+    gamma_inv = jnp.asarray(gamma_inv, dtype=jnp.float32)
+    bvar_i = schedule['bridge_var'][n][..., None]
+
+    r_i = x_n - x_T
+    delta = x_0 - x_T
+    h_drift = g2_i * phi_iK / jnp.maximum(omega_iK + gamma_inv, 1e-12) * (delta - phi_iK * r_i)
+    scale = g2_i / jnp.sqrt(jnp.maximum(bvar_i, 1e-12))
+    return x_n + theta_i * r_i + h_drift - scale * eps_pred
 
 def posterior_mean(x_n, x_0, x_T, n, schedule):
     """Analytic posterior mean  E[x_{n-1} | x_n, x_0, x_T].
@@ -252,3 +365,113 @@ def sample_from_reverse_mean(mu, n, schedule, rng, noise_scale=1.0):
     noise = jax.random.normal(rng, mu.shape)
     ns = jnp.asarray(noise_scale, dtype=jnp.float32)
     return mu + ns * std * noise
+
+
+
+def theta_linear_forward_bridge_coefficients(
+    K: int,
+    *,
+    beta_min: float,
+    beta_max: float,
+    lambda_: float,
+    eps: float = 1.0e-6,
+):
+    """Closed-form forward bridge marginals for theta-linear mode."""
+    if K < 1:
+        raise ValueError(f'K must be >= 1, got {K}.')
+    K_int = int(K)
+    steps = jnp.arange(1, K_int + 1, dtype=jnp.float32)
+    theta = beta_min / float(K_int) + (beta_max - beta_min) * steps / float(K_int * K_int)
+    g2 = 2.0 * float(lambda_) ** 2 * theta
+    step_var = float(lambda_) ** 2 * (1.0 - jnp.exp(-2.0 * theta))
+    arr = _theta_linear_arrays(theta, g2, step_var, gamma_inv=0.0)
+    b = arr['theta_linear_beta_fwd']
+    std = jnp.sqrt(jnp.maximum(arr['theta_linear_bridge_var_fwd'], 0.0))
+    a = 1.0 - b
+    a = a.at[0].set(1.0).at[-1].set(0.0)
+    b = b.at[0].set(0.0).at[-1].set(1.0)
+    std = std.at[0].set(0.0).at[-1].set(0.0)
+    return a, b, std
+
+def forward_bridge_coefficients(
+    K: int,
+    *,
+    beta_min: float,
+    beta_max: float,
+    lambda_: float,
+    eps: float = 1.0e-6,
+    bridge_type: str = 'goub',
+):
+    """Closed-form GOUB *forward* bridge coefficients in DOURI ``z_0 -> z_K`` form.
+
+    Returns three arrays ``a, b, std`` of shape ``(K + 1,)`` such that
+
+        z_i | z_0, z_K ~ N( a_i * z_0 + b_i * z_K , std_i^2 * I )
+
+    using the GOUB Proposition 3.1 formulae with the same per-step OU rate
+    schedule as :func:`make_goub_schedule` (linear-beta, ``delta_l = 1``):
+
+        theta_l         = beta_min / N + (beta_max - beta_min) * l / N^2  (l = 1..N)
+        bar_theta_{0:i} = sum_{l=1}^{i} theta_l
+        bar_sigma2_{a:b}^2 = lambda^2 * (1 - exp(-2 * bar_theta_{a:b}))
+
+        a_i   = exp(-bar_theta_{0:i}) * bar_sigma2_{i:K}^2 / bar_sigma2_{0:K}^2
+        b_i   = (1 - exp(-bar_theta_{0:i})) * bar_sigma2_{i:K}^2 / bar_sigma2_{0:K}^2
+              + exp(-2 * bar_theta_{i:K}) * bar_sigma2_{0:i}^2 / bar_sigma2_{0:K}^2
+        std_i^2 = bar_sigma2_{0:i}^2 * bar_sigma2_{i:K}^2 / bar_sigma2_{0:K}^2
+
+    The endpoints are *clamped* exactly after the numerical computation so that
+
+        a[0]  = 1, b[0]  = 0, std[0]  = 0
+        a[-1] = 0, b[-1] = 1, std[-1] = 0
+
+    are guaranteed regardless of ``eps`` / floating-point error.
+
+    The convention here is the DOURI state-space *forward* time direction:
+    index 0 = current state ``z_0``, index K = subgoal ``z_K``.  The
+    ``make_goub_schedule`` arrays use the GOUB diffusion-time index
+    ``n = 0`` = clean endpoint, ``n = N`` = noisy endpoint, so we re-derive
+    ``theta`` / ``bar_theta`` here for clarity rather than reusing the
+    pre-computed schedule directly (this also lets callers re-coefficient at
+    a smaller ``K`` than ``goub_N`` without re-running the schedule).
+    """
+    if K < 1:
+        raise ValueError(f'K must be >= 1, got {K}.')
+    if str(bridge_type).lower() == 'theta_linear':
+        return theta_linear_forward_bridge_coefficients(
+            K,
+            beta_min=beta_min,
+            beta_max=beta_max,
+            lambda_=lambda_,
+            eps=eps,
+        )
+
+    K_int = int(K)
+    steps = jnp.arange(1, K_int + 1, dtype=jnp.float32)
+    theta = beta_min / float(K_int) + (beta_max - beta_min) * steps / float(K_int * K_int)
+
+    bar_theta = jnp.concatenate([jnp.zeros(1, dtype=jnp.float32), jnp.cumsum(theta)])  # (K+1,)
+    bar_total = bar_theta[-1]
+    bar_theta_iK = bar_total - bar_theta  # (K+1,)
+
+    lam2 = float(lambda_) ** 2
+    bar_sigma2_0i = lam2 * (1.0 - jnp.exp(-2.0 * bar_theta))
+    bar_sigma2_iK = lam2 * (1.0 - jnp.exp(-2.0 * bar_theta_iK))
+    bar_sigma2_0K = bar_sigma2_0i[-1]
+    denom = jnp.maximum(bar_sigma2_0K, jnp.asarray(eps, dtype=jnp.float32))
+
+    exp_neg_0i = jnp.exp(-bar_theta)
+    exp_neg2_iK = jnp.exp(-2.0 * bar_theta_iK)
+
+    a = exp_neg_0i * bar_sigma2_iK / denom
+    b = (1.0 - exp_neg_0i) * bar_sigma2_iK / denom + exp_neg2_iK * bar_sigma2_0i / denom
+    std2 = bar_sigma2_0i * bar_sigma2_iK / denom
+    std = jnp.sqrt(jnp.maximum(std2, 0.0))
+
+    # Exact endpoint clamp - both for numerical safety and to match the
+    # mathematical bridge definition independent of ``eps``.
+    a = a.at[0].set(1.0).at[-1].set(0.0)
+    b = b.at[0].set(0.0).at[-1].set(1.0)
+    std = std.at[0].set(0.0).at[-1].set(0.0)
+
+    return a, b, std

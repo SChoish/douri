@@ -79,7 +79,7 @@ flags.DEFINE_integer('seed', 0, 'Seed.')
 flags.DEFINE_string('env_name', 'antmaze-medium-navigate-v0', 'OGBench env / dataset name.')
 flags.DEFINE_integer('train_epochs', 10, 'Training epochs.')
 flags.DEFINE_integer('log_every_n_epochs', 1, 'Log interval (epochs).')
-flags.DEFINE_integer('save_every_n_epochs', 10, 'Checkpoint interval.')
+flags.DEFINE_integer('save_every_n_epochs', 100, 'Checkpoint interval.')
 flags.DEFINE_boolean('use_wandb', False, 'W&B.')
 flags.DEFINE_boolean('use_tqdm', False, 'tqdm over epochs.')
 flags.DEFINE_integer('batch_size', 256, 'Shared batch size for GOUB, critic, and actor.')
@@ -89,10 +89,14 @@ flags.DEFINE_integer(
 flags.DEFINE_integer('plan_candidates', 1, 'Number of GOUB candidate plans scored by the critic.')
 flags.DEFINE_float('plan_noise_scale', 1.0, 'Noise scale used for stochastic GOUB plan sampling.')
 flags.DEFINE_boolean('measure_timing', False, 'Whether to measure and log per-phase wall-clock timings.')
-flags.DEFINE_integer('eval_freq', 0, 'Run validation loss and env evaluation every N epochs; <= 0 disables.')
+flags.DEFINE_integer(
+    'eval_freq',
+    100,
+    'Run validation loss and env evaluation every N epochs; <= 0 disables.',
+)
 flags.DEFINE_string('eval_task_ids', '1,2,3,4,5', 'Comma-separated OGBench task ids for env evaluation.')
 flags.DEFINE_integer('eval_episodes_per_task', 10, 'Number of env evaluation episodes to run for each task id.')
-flags.DEFINE_integer('eval_max_chunks', 50, 'Maximum action chunks to execute per evaluation episode.')
+flags.DEFINE_integer('eval_max_chunks', 200, 'Maximum action chunks to execute per evaluation episode.')
 flags.DEFINE_float('eval_goal_tol', 0.5, 'Goal tolerance for marking env evaluation success.')
 flags.DEFINE_string('eval_goal_dims', '0,1', 'Comma-separated observation dims used for env goal distance.')
 
@@ -174,6 +178,22 @@ def _apply_yaml_to_flags(data: dict) -> tuple[dict, dict, dict]:
     for name, updates in [('goub', goub_updates), ('critic_agent', critic_updates), ('actor', actor_updates)]:
         if updates is not None and not isinstance(updates, dict):
             raise ValueError(f'YAML key "{name}" must be a mapping.')
+
+    # Allow forward-bridge planner knobs at the top level for ergonomic YAML
+    # (route them into goub_updates so the dynamics-agent config picks them up).
+    if 'planner_type' in data:
+        goub_updates = goub_updates or {}
+        goub_updates.setdefault('planner_type', data.pop('planner_type'))
+    if 'forward_bridge' in data:
+        goub_updates = goub_updates or {}
+        goub_updates.setdefault('forward_bridge', data.pop('forward_bridge'))
+
+    # Flatten ``goub.forward_bridge: { mode, noise_scale, ... }`` into the
+    # individual ``forward_bridge_*`` keys recognised by the dynamics config.
+    if isinstance(goub_updates, dict) and isinstance(goub_updates.get('forward_bridge'), dict):
+        fb = goub_updates.pop('forward_bridge')
+        for k, v in fb.items():
+            goub_updates.setdefault(f'forward_bridge_{k}', v)
 
     # Migrate legacy actor key names to canonical ones (e.g., spi_goal_conditioning ->
     # spi_conditioned) so older YAMLs and flags.json snapshots keep working.

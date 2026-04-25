@@ -1,0 +1,26 @@
+# AntMaze giant navigate — alpha=0.3 fixed, spi_tau=10.0.
+# forward bridge 아님(기존 vanilla GOUB 경로).
+
+env_name: antmaze-giant-navigate-v0
+seed: 0
+run_group: antmaze_giant_navigate_goub_alpha0p3_tau10
+
+train_epochs: 300
+log_every_n_epochs: 10
+
+batch_size: 1024
+plan_candidates: 1
+plan_noise_scale: 0.01
+
+goub:
+  subgoal_value_alpha: 0.3
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.99
+
+actor:
+  spi_tau: 10.0
+  spi_beta: 1.0
+  spi_actor_layer_norm: true
+  spi_conditioned: subgoal

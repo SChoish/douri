@@ -1,4 +1,4 @@
-"""Unit tests for the distributional-subgoal + UniDB-GOU refactor.
+"""Unit tests for the distributional-subgoal + linear dynamics refactor.
 
 These tests are intentionally lightweight (no offline dataset, no actor / critic
 training) so they can be run standalone with::
@@ -8,12 +8,12 @@ training) so they can be run standalone with::
 
 They cover the contract changes only:
 1. backward compatibility of the deterministic subgoal mode
-2. UniDB-GOU schedule with large gamma matches vanilla GOUB
+2. linear dynamics schedule exposes finite gamma_inv and bridge arrays
 3. distributional-subgoal sampling shape correctness
 4. critic ``score_action_chunks`` accepts both ``[B, D]`` and ``[B, N, D]`` goals
 5. ``plan_candidates=1`` and ``plan_candidates>1`` both succeed
 6. distributional subgoal loss path is finite (no NaNs / Infs)
-7. dynamics-config defaults are backward-compatible
+7. dynamics-config defaults remain usable
 """
 
 import os
@@ -43,14 +43,12 @@ ACTION_DIM = 2
 BATCH = 8
 
 
-def _make_dynamics_agent(subgoal_distribution: str, bridge_type: str = 'goub',
-                         bridge_gamma: float = 1.0e7):
+def _make_dynamics_agent(subgoal_distribution: str, bridge_gamma: float = 1.0e7):
     cfg = get_dynamics_config()
     cfg.goub_N = 4
     cfg.subgoal_steps = 4
     cfg.rollout_horizon = 2
     cfg.subgoal_distribution = subgoal_distribution
-    cfg.bridge_type = bridge_type
     cfg.bridge_gamma = bridge_gamma
     cfg.eps_hidden_dims = (32, 32)
     cfg.subgoal_hidden_dims = (32, 32)
@@ -102,59 +100,40 @@ def test_deterministic_subgoal_backward_compat():
 
 
 # ---------------------------------------------------------------------------
-# 2. large-gamma UniDB-GOU ~= vanilla GOUB
+# 2. linear dynamics schedule
 # ---------------------------------------------------------------------------
 
-def test_unidb_large_gamma_matches_goub():
-    s_goub = make_goub_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0,
-                                bridge_type='goub')
-    s_unidb = make_goub_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0,
-                                 bridge_type='unidb_gou', bridge_gamma=1.0e9)
-    # Bridge interpolation weight is the soft-bridge-affected quantity.
-    np.testing.assert_allclose(np.asarray(s_goub['bridge_w']),
-                               np.asarray(s_unidb['bridge_w']),
-                               rtol=1e-4, atol=1e-6)
-    # Conditional bridge variance is identical by construction.
-    np.testing.assert_allclose(np.asarray(s_goub['bridge_var']),
-                               np.asarray(s_unidb['bridge_var']),
-                               rtol=0.0, atol=0.0)
+def test_linear_dynamics_schedule_and_model_mean_are_finite():
+    schedule = make_goub_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0, bridge_gamma=1.0e9)
+    assert schedule['bridge_w'].shape == (9,)
+    assert schedule['bridge_var'].shape == (9,)
+    assert 'dynamics_phi_iK' in schedule
+    assert 'dynamics_omega_iK' in schedule
+    assert abs(float(schedule['gamma_inv']) - 1.0e-9) < 1e-12
 
     rng = jax.random.PRNGKey(0)
     x0 = jax.random.normal(rng, (BATCH, STATE_DIM))
     xT = jax.random.normal(jax.random.fold_in(rng, 1), (BATCH, STATE_DIM))
     n = jnp.full((BATCH,), 3, dtype=jnp.int32)
-    bg = bridge_sample(x0, xT, n, s_goub, rng)
-    bu = bridge_sample(x0, xT, n, s_unidb, rng)
-    np.testing.assert_allclose(np.asarray(bg), np.asarray(bu), rtol=1e-4, atol=1e-5)
-
+    x_n = bridge_sample(x0, xT, n, schedule, rng)
     eps = jax.random.normal(jax.random.fold_in(rng, 2), (BATCH, STATE_DIM))
-    mg = model_mean(bg, xT, eps, n, s_goub)
-    mu = model_mean(bu, xT, eps, n, s_unidb)
-    np.testing.assert_allclose(np.asarray(mg), np.asarray(mu), rtol=1e-4, atol=1e-5)
+    mu = model_mean(x_n, x0, xT, eps, n, schedule)
+    assert np.all(np.isfinite(np.asarray(x_n)))
+    assert np.all(np.isfinite(np.asarray(mu)))
 
 
-def test_unidb_resolves_gamma_inv_correctly():
-    # The schedule must thread (bridge_type, bridge_gamma) into a `gamma_inv`
-    # entry so downstream agents can query it.  GOUB ↔ gamma_inv == 0.
-    s_goub = make_goub_schedule(N=8, bridge_type='goub')
-    s_soft = make_goub_schedule(N=8, bridge_type='unidb_gou', bridge_gamma=2.0)
-    assert float(s_goub['gamma_inv']) == 0.0
+def test_linear_dynamics_resolves_gamma_inv_correctly():
+    # The schedule must thread bridge_gamma into a `gamma_inv` entry so
+    # downstream agents can query it.
+    s_soft = make_goub_schedule(N=8, bridge_gamma=2.0)
     assert abs(float(s_soft['gamma_inv']) - 0.5) < 1e-6
-    # Soft-bridge denominator key exists and respects gamma_inv.
-    assert 'bar_sigma2_nN_gamma' in s_soft
-    diff = float(jnp.max(jnp.abs(s_soft['bar_sigma2_nN_gamma'] - s_goub['bar_sigma2_nN'])))
-    assert abs(diff - 0.5) < 1e-5, diff
+    assert 'dynamics_bridge_w' in s_soft
+    assert 'dynamics_bridge_var' in s_soft
 
-    # Invalid bridge_type / gamma must raise.
+    # Invalid gamma must raise.
     raised = False
     try:
-        make_goub_schedule(N=4, bridge_type='unknown')
-    except ValueError:
-        raised = True
-    assert raised
-    raised = False
-    try:
-        make_goub_schedule(N=4, bridge_type='unidb_gou', bridge_gamma=-1.0)
+        make_goub_schedule(N=4, bridge_gamma=-1.0)
     except ValueError:
         raised = True
     assert raised
@@ -277,8 +256,8 @@ def test_distributional_subgoal_loss_is_finite():
         'phase1/subgoal_std_max',
         'phase1/subgoal_fr_spi',
         'phase1/subgoal_mode',
-        'bridge/bridge_type',
-        'bridge/bridge_gamma',
+        'dynamics/bridge_gamma',
+        'dynamics/gamma_inv',
     ):
         assert required in info, f'missing log key {required}'
     # subgoal_mode == 1.0 in diag_gaussian mode.
@@ -300,9 +279,8 @@ def test_deterministic_subgoal_loss_is_finite_and_logs_match_legacy():
 # 7. dynamics-config defaults remain backward-compatible
 # ---------------------------------------------------------------------------
 
-def test_dynamics_config_defaults_backward_compatible():
+def test_dynamics_config_defaults_are_usable():
     cfg = get_dynamics_config()
-    assert str(cfg.bridge_type) == 'goub'
     assert str(cfg.subgoal_distribution) == 'deterministic'
     assert bool(cfg.subgoal_use_mean_for_actor_goal) is True
     assert float(cfg.subgoal_fr_spi_weight) == 0.0

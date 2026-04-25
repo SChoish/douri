@@ -31,7 +31,6 @@ goub:
   rollout_loss_weight: 1.0
   value_geom_sample: false
   subgoal_value_alpha: 0.1
-  bridge_type: unidb_gou
   bridge_gamma: 1.0e+7
   subgoal_distribution: diag_gaussian
   subgoal_log_std_min: -5.0

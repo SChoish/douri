@@ -90,7 +90,6 @@ def format_joint_run_diff_markdown(cfg: dict) -> str:
     top = merge_top_level(cfg)
     tau = a.get("spi_tau", "—")
     alpha = g.get("subgoal_value_alpha", "—")
-    bt = g.get("bridge_type", "goub")
     clip = g.get("clip_path_to_goal", True)
     clip_s = "true" if clip is True else ("false" if clip is False else str(clip))
     te = top.get("train_epochs", "—")
@@ -99,7 +98,7 @@ def format_joint_run_diff_markdown(cfg: dict) -> str:
     parts = [
         f"`spi_tau={tau}`",
         f"`subgoal_α={alpha}`",
-        f"`bridge_type={bt}`",
+        "`dynamics=linear_sde`",
         f"`clip_path_to_goal={clip_s}`",
         f"`train_epochs={te}`",
     ]

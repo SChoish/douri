@@ -34,7 +34,6 @@ goub:
   rollout_loss_weight: 1.0      # default 0.25
   value_geom_sample: false      # default true; align with DQC-style relabeling
   subgoal_value_alpha: 0.1      # weight on V(s_g, g) in subgoal loss; 0 disables
-  bridge_type: unidb_gou
   bridge_gamma: 1.0e+7
   subgoal_distribution: diag_gaussian
   subgoal_log_std_min: -5.0

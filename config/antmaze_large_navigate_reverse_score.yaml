@@ -32,7 +32,6 @@ goub:
   rollout_loss_weight: 1.0
   value_geom_sample: false
   subgoal_value_alpha: 0.1
-  bridge_type: goub
   clip_path_to_goal: true
   planner_type: reverse_score
 

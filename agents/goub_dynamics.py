@@ -26,8 +26,6 @@ from utils.goub import (
     model_mean,
     posterior_mean,
     sample_from_reverse_mean,
-    theta_linear_model_mean,
-    theta_linear_posterior_mean,
 )
 
 
@@ -53,22 +51,6 @@ def _forward_bridge_mode(config) -> str:
         )
     return mode
 
-
-def _bridge_type(config) -> str:
-    return str(config.get('bridge_type', 'goub')).lower()
-
-
-def _is_theta_linear_bridge(config) -> bool:
-    return _bridge_type(config) == 'theta_linear'
-
-
-def _bridge_type_metric(config) -> float:
-    bt = _bridge_type(config)
-    if bt == 'unidb_gou':
-        return 1.0
-    if bt == 'theta_linear':
-        return 2.0
-    return 0.0
 
 from utils.inverse_dynamics import InverseDynamicsMLP, parse_hidden_dims
 from utils.networks import MLP
@@ -195,10 +177,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         is_boundary = n == n_total
 
         eps = self.network.select('eps_net')(x_n, x_T, x_0, n.astype(jnp.float32), params=params)
-        if _is_theta_linear_bridge(self.config):
-            mu_inner = theta_linear_model_mean(x_n, x_0, x_T, eps, n_safe, schedule)
-        else:
-            mu_inner = model_mean(x_n, x_T, eps, n_safe, schedule)
+        mu_inner = model_mean(x_n, x_0, x_T, eps, n_safe, schedule)
         mu_boundary = x_T + eps
         mu = jnp.where(is_boundary[..., None], mu_boundary, mu_inner)
         return mu, eps
@@ -242,10 +221,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
 
         x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
         x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
-        if _is_theta_linear_bridge(self.config):
-            mu_true = theta_linear_posterior_mean(x_n, x_0, x_T, n, self.schedule)
-        else:
-            mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
+        mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
         mu_pred, eps_pred = self._learned_reverse_mean(x_n, x_T, x_0, n, self.schedule, params=grad_params)
 
         g2_n = self.schedule['g2'][n - 1]
@@ -281,10 +257,10 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         }
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
-        info['bridge/bridge_type'] = jnp.asarray(_bridge_type_metric(self.config), dtype=jnp.float32)
-        info['bridge/bridge_gamma'] = jnp.asarray(
+        info['dynamics/bridge_gamma'] = jnp.asarray(
             float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
         )
+        info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
         return loss, info
 
     @jax.jit
@@ -335,7 +311,6 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             beta_max=float(self.config['goub_beta_max']),
             lambda_=float(self.config['goub_lambda']),
             eps=eps_val,
-            bridge_type=str(self.config.get('bridge_type', 'goub')),
         )
 
     def forward_bridge_plan(
@@ -834,7 +809,6 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             beta_min=config['goub_beta_min'],
             beta_max=config['goub_beta_max'],
             lambda_=config['goub_lambda'],
-            bridge_type=str(config.get('bridge_type', 'goub')),
             bridge_gamma=float(config.get('bridge_gamma', 1.0e7)),
         )
 
@@ -1069,10 +1043,7 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         # --- L_goub ---
         x_n_bridge = bridge_sample(x_0, x_T, n_safe, self.schedule, rng2)
         x_n = jnp.where(is_boundary[..., None], x_T, x_n_bridge)
-        if _is_theta_linear_bridge(self.config):
-            mu_true = theta_linear_posterior_mean(x_n, x_0, x_T, n, self.schedule)
-        else:
-            mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
+        mu_true = posterior_mean(x_n, x_0, x_T, n, self.schedule)
         mu_pred, eps_pred = self._learned_reverse_mean(
             x_n, x_T, x_0, n, self.schedule, params=grad_params,
         )
@@ -1154,10 +1125,10 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
         info.update(subgoal_extra_info)
-        info['bridge/bridge_type'] = jnp.asarray(_bridge_type_metric(self.config), dtype=jnp.float32)
-        info['bridge/bridge_gamma'] = jnp.asarray(
+        info['dynamics/bridge_gamma'] = jnp.asarray(
             float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
         )
+        info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
         return loss, info
 
     def _total_loss_forward_bridge(self, batch, grad_params, rng, critic_value_params, planner: str):
@@ -1281,10 +1252,10 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
         info.update(subgoal_extra_info)
-        info['bridge/bridge_type'] = jnp.asarray(_bridge_type_metric(self.config), dtype=jnp.float32)
-        info['bridge/bridge_gamma'] = jnp.asarray(
+        info['dynamics/bridge_gamma'] = jnp.asarray(
             float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
         )
+        info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
         return loss, info
 
     @jax.jit
@@ -1301,7 +1272,7 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
 
 
 def _get_common_config():
-    """Common defaults for GOUB dynamics training and rollout."""
+    """Common defaults for linear dynamics training and rollout."""
     return ml_collections.ConfigDict(
         dict(
             agent_name='goub_dynamics',
@@ -1311,12 +1282,8 @@ def _get_common_config():
             goub_beta_min=0.1,
             goub_beta_max=20.0,
             goub_lambda=1.0,
-            # UniDB-GOU soft-bridge controls.
-            # bridge_type='goub' reproduces vanilla GOUB exactly.
-            # bridge_type='unidb_gou' activates the finite-gamma soft bridge.
-            # bridge_type='theta_linear' uses the self-consistent theta-linear
-            # forward bridge with the same linear-beta theta scheduler.
-            bridge_type='goub',
+            # Linear-SDE bridge endpoint precision. Larger values approach a
+            # hard endpoint bridge.
             bridge_gamma=1.0e7,
             eps_hidden_dims=(512, 512, 512),
             time_embed_dim=64,

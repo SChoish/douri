@@ -1,9 +1,9 @@
-# AntMaze large navigate — theta-linear GOUB bridge smoke run.
+# AntMaze large navigate — linear dynamics bridge smoke run.
 # alpha=0.3, actor.spi_tau=10.0, 300 epochs.
 
 env_name: antmaze-large-navigate-v0
 seed: 0
-run_group: antmaze_navigate_theta_linear_alpha0p3_tau10
+run_group: antmaze_navigate_dynamics_alpha0p3_tau10
 
 train_epochs: 300
 log_every_n_epochs: 10
@@ -13,7 +13,6 @@ plan_candidates: 1
 plan_noise_scale: 0.01
 
 goub:
-  bridge_type: theta_linear
   bridge_gamma: 1.0e+7
   subgoal_value_alpha: 0.3
 

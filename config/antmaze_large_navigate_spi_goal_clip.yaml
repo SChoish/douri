@@ -29,8 +29,6 @@ goub:
   rollout_loss_weight: 1.0
   value_geom_sample: false
   subgoal_value_alpha: 0.1
-  # Match config/antmaze_large_navigate.yaml (these sweeps do not inherit that file).
-  bridge_type: unidb_gou
   bridge_gamma: 1.0e+7
   # Same distributional subgoal stack as config/antmaze_large_navigate.yaml (sweeps do not inherit it).
   subgoal_distribution: diag_gaussian

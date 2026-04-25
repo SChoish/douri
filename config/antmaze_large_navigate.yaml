@@ -31,10 +31,7 @@ goub:
   value_geom_sample: false      # default true; align with DQC-style relabeling
   subgoal_value_alpha: 0.1      # weight on V(ŝ_g, g) in subgoal loss; 0 disables
 
-  # --- UniDB-GOU soft bridge (opt-in) ---
-  # bridge_type: "goub"     -> reproduces vanilla GOUB exactly (default).
-  # bridge_type: "unidb_gou" -> finite-gamma soft bridge.  Larger gamma -> closer to GOUB.
-  bridge_type: unidb_gou
+  # --- Linear dynamics bridge endpoint precision ---
   bridge_gamma: 1.0e+7
 
   # --- Distributional subgoal interface (opt-in) ---

@@ -8,7 +8,7 @@ training) so they can be run standalone with::
 
 They cover the contract changes only:
 1. backward compatibility of the deterministic subgoal mode
-2. linear dynamics schedule exposes finite gamma_inv and bridge arrays
+2. linear dynamics schedule exposes gamma_inv and bridge arrays
 3. distributional-subgoal sampling shape correctness
 4. critic ``score_action_chunks`` accepts both ``[B, D]`` and ``[B, N, D]`` goals
 5. ``plan_candidates=1`` and ``plan_candidates>1`` both succeed
@@ -43,13 +43,13 @@ ACTION_DIM = 2
 BATCH = 8
 
 
-def _make_dynamics_agent(subgoal_distribution: str, bridge_gamma: float = 1.0e7):
+def _make_dynamics_agent(subgoal_distribution: str, bridge_gamma_inv: float = 0.0):
     cfg = get_dynamics_config()
     cfg.goub_N = 4
     cfg.subgoal_steps = 4
     cfg.rollout_horizon = 2
     cfg.subgoal_distribution = subgoal_distribution
-    cfg.bridge_gamma = bridge_gamma
+    cfg.bridge_gamma_inv = bridge_gamma_inv
     cfg.eps_hidden_dims = (32, 32)
     cfg.subgoal_hidden_dims = (32, 32)
     cfg.subgoal_value_hidden_dims = (32, 32)
@@ -104,12 +104,12 @@ def test_deterministic_subgoal_backward_compat():
 # ---------------------------------------------------------------------------
 
 def test_linear_dynamics_schedule_and_model_mean_are_finite():
-    schedule = make_goub_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0, bridge_gamma=1.0e9)
+    schedule = make_goub_schedule(N=8, beta_min=0.1, beta_max=20.0, lambda_=1.0, bridge_gamma_inv=0.0)
     assert schedule['bridge_w'].shape == (9,)
     assert schedule['bridge_var'].shape == (9,)
     assert 'dynamics_phi_iK' in schedule
     assert 'dynamics_omega_iK' in schedule
-    assert abs(float(schedule['gamma_inv']) - 1.0e-9) < 1e-12
+    assert float(schedule['gamma_inv']) == 0.0
 
     rng = jax.random.PRNGKey(0)
     x0 = jax.random.normal(rng, (BATCH, STATE_DIM))
@@ -123,17 +123,17 @@ def test_linear_dynamics_schedule_and_model_mean_are_finite():
 
 
 def test_linear_dynamics_resolves_gamma_inv_correctly():
-    # The schedule must thread bridge_gamma into a `gamma_inv` entry so
-    # downstream agents can query it.
-    s_soft = make_goub_schedule(N=8, bridge_gamma=2.0)
+    # The schedule must thread bridge_gamma_inv into a `gamma_inv` entry so
+    # downstream agents can query the exact configured denominator offset.
+    s_soft = make_goub_schedule(N=8, bridge_gamma_inv=0.5)
     assert abs(float(s_soft['gamma_inv']) - 0.5) < 1e-6
     assert 'dynamics_bridge_w' in s_soft
     assert 'dynamics_bridge_var' in s_soft
 
-    # Invalid gamma must raise.
+    # Negative inverse gamma must raise.
     raised = False
     try:
-        make_goub_schedule(N=4, bridge_gamma=-1.0)
+        make_goub_schedule(N=4, bridge_gamma_inv=-1.0)
     except ValueError:
         raised = True
     assert raised
@@ -256,7 +256,7 @@ def test_distributional_subgoal_loss_is_finite():
         'phase1/subgoal_std_max',
         'phase1/subgoal_fr_spi',
         'phase1/subgoal_mode',
-        'dynamics/bridge_gamma',
+        'dynamics/bridge_gamma_inv',
         'dynamics/gamma_inv',
     ):
         assert required in info, f'missing log key {required}'

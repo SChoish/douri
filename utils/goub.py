@@ -18,15 +18,6 @@ import jax
 import jax.numpy as jnp
 
 
-def _resolve_gamma_inv(bridge_gamma: float) -> float:
-    """Map bridge_gamma to the soft endpoint precision offset."""
-    gamma = float(bridge_gamma)
-    if not (gamma > 0.0):
-        raise ValueError(f'bridge_gamma must be > 0, got {bridge_gamma!r}.')
-    return 1.0 / gamma
-
-
-
 def _linear_dynamics_arrays(theta_fwd, g2_fwd, step_var_fwd, gamma_inv=0.0):
     """Exact linear-SDE bridge arrays in forward state time.
 
@@ -107,17 +98,19 @@ def make_goub_schedule(
     beta_min: float = 0.1,
     beta_max: float = 20.0,
     lambda_: float = 1.0,
-    bridge_gamma: float = 1.0e7,
+    bridge_gamma_inv: float = 0.0,
 ):
     """Precompute all theta-linear dynamics schedule quantities.
 
     Args:
         N: number of diffusion steps.
         beta_min, beta_max, lambda_: linear-beta OU schedule parameters.
-        bridge_gamma: finite endpoint precision parameter. Larger values
-            approach a hard endpoint bridge.
+        bridge_gamma_inv: endpoint precision offset used directly in bridge
+            denominators. ``0.0`` is the hard endpoint bridge.
     """
-    gamma_inv = _resolve_gamma_inv(bridge_gamma)
+    gamma_inv = float(bridge_gamma_inv)
+    if gamma_inv < 0.0:
+        raise ValueError(f'bridge_gamma_inv must be >= 0, got {bridge_gamma_inv!r}.')
 
     steps = jnp.arange(1, N + 1, dtype=jnp.float32)
 

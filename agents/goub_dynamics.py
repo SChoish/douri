@@ -257,8 +257,8 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
         }
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
-        info['dynamics/bridge_gamma'] = jnp.asarray(
-            float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
+        info['dynamics/bridge_gamma_inv'] = jnp.asarray(
+            float(self.config.get('bridge_gamma_inv', 0.0)), dtype=jnp.float32
         )
         info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
         return loss, info
@@ -809,7 +809,7 @@ class _GOUBAgentCore(flax.struct.PyTreeNode):
             beta_min=config['goub_beta_min'],
             beta_max=config['goub_beta_max'],
             lambda_=config['goub_lambda'],
-            bridge_gamma=float(config.get('bridge_gamma', 1.0e7)),
+            bridge_gamma_inv=float(config.get('bridge_gamma_inv', 0.0)),
         )
 
         eps_net_def = GOUBEpsilonNet(
@@ -1125,8 +1125,8 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
         info.update(subgoal_extra_info)
-        info['dynamics/bridge_gamma'] = jnp.asarray(
-            float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
+        info['dynamics/bridge_gamma_inv'] = jnp.asarray(
+            float(self.config.get('bridge_gamma_inv', 0.0)), dtype=jnp.float32
         )
         info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
         return loss, info
@@ -1252,8 +1252,8 @@ class GOUBDynamicsAgent(_GOUBAgentCore):
         info['phase1/subgoal_pred_norm'] = jnp.linalg.norm(pred_sg_out, axis=-1).mean()
         info['phase1/subgoal_target_norm'] = jnp.linalg.norm(batch['high_actor_targets'], axis=-1).mean()
         info.update(subgoal_extra_info)
-        info['dynamics/bridge_gamma'] = jnp.asarray(
-            float(self.config.get('bridge_gamma', 1.0e7)), dtype=jnp.float32
+        info['dynamics/bridge_gamma_inv'] = jnp.asarray(
+            float(self.config.get('bridge_gamma_inv', 0.0)), dtype=jnp.float32
         )
         info['dynamics/gamma_inv'] = self.schedule['gamma_inv']
         return loss, info
@@ -1282,9 +1282,8 @@ def _get_common_config():
             goub_beta_min=0.1,
             goub_beta_max=20.0,
             goub_lambda=1.0,
-            # Linear-SDE bridge endpoint precision. Larger values approach a
-            # hard endpoint bridge.
-            bridge_gamma=1.0e7,
+            # Linear-SDE bridge denominator offset. 0.0 is the hard endpoint bridge.
+            bridge_gamma_inv=0.0,
             eps_hidden_dims=(512, 512, 512),
             time_embed_dim=64,
             layer_norm=True,

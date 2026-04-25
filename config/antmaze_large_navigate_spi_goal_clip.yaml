@@ -29,18 +29,8 @@ goub:
   rollout_loss_weight: 1.0
   value_geom_sample: false
   subgoal_value_alpha: 0.1
-  bridge_gamma: 1.0e+7
-  # Same distributional subgoal stack as config/antmaze_large_navigate.yaml (sweeps do not inherit it).
-  subgoal_distribution: diag_gaussian
-  subgoal_log_std_min: -5.0
-  subgoal_log_std_max: 0.5
-  subgoal_temperature: 1.0
-  subgoal_use_mean_for_actor_goal: true
-  subgoal_nll_weight: 1.0
-  subgoal_mse_weight: 0.25
-  subgoal_var_reg_weight: 0.0001
-  subgoal_fr_spi_weight: 0.0
-  subgoal_fr_spi_tau: 1.0
+  bridge_gamma_inv: 0.0
+  subgoal_distribution: deterministic
   # Clip per-row segment endpoint to s_{min(t+K, t_g)} and pad trajectory_segment past
   # t_g with s_{t_g}. Both bridge endpoint and subgoal_net teacher reflect the actual
   # close goal; bridge learns identity at s_g.

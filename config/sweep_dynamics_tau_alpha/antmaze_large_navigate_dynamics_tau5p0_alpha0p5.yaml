@@ -1,9 +1,9 @@
-# AntMaze large navigate — linear dynamics bridge smoke run.
-# alpha=0.3, actor.spi_tau=10.0, 300 epochs.
+# AntMaze large navigate -- linear dynamics sweep over (spi_tau, subgoal_value_alpha).
+# alpha=0.5, actor.spi_tau=5.0, 300 epochs.
 
 env_name: antmaze-large-navigate-v0
 seed: 0
-run_group: antmaze_navigate_dynamics_alpha0p3_tau10
+run_group: antmaze_navigate_dynamics_tau_alpha_sweep
 
 train_epochs: 300
 log_every_n_epochs: 10
@@ -15,14 +15,14 @@ plan_noise_scale: 0.01
 goub:
   bridge_gamma_inv: 0.0
   subgoal_distribution: deterministic
-  subgoal_value_alpha: 0.3
+  subgoal_value_alpha: 0.5
 
 critic_agent:
   action_chunk_horizon: 5
   discount: 0.99
 
 actor:
-  spi_tau: 10.0
+  spi_tau: 5.0
   spi_beta: 1.0
   spi_actor_layer_norm: true
   spi_conditioned: subgoal

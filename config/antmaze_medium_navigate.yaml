@@ -1,4 +1,4 @@
-# Joint linear-SDE dynamics + critic + separated actor offline training.
+# Linear-SDE dynamics + critic + actor offline training.
 
 env_name: antmaze-medium-navigate-v0
 seed: 0
@@ -28,7 +28,7 @@ eval_goal_dims: "0,1"
 # and agents/critic.get_config(). Everything else uses the agent defaults.
 dynamics:
   rollout_loss_weight: 1.0      # default 0.25
-  value_geom_sample: false      # default true; align with DQC-style relabeling
+  value_geom_sample: false      # default true; uniform-future relabeling
   subgoal_value_alpha: 0.1      # weight on V(ŝ_g, g) in subgoal loss; 0 disables
 
   # --- Linear dynamics bridge denominator offset ---
@@ -48,5 +48,4 @@ actor:
   # ``subgoal`` (default): use per-candidate dynamics sub-goals for actor MLP input and
   # critic Q used in SPI proposal scoring + actor loss.
   # ``goal``: condition the actor and Q on the global high-level goal instead.
-  # Legacy alias accepted: ``spi_goal_conditioning``.
   spi_conditioned: subgoal

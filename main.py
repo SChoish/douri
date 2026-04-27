@@ -301,14 +301,15 @@ def _emit_time_sums(metrics: dict[str, float], prefix: str, time_sums: dict[str,
 
 def _format_epoch_log(metrics: dict[str, float]) -> str:
     parts = [
-        f"dyn={metrics['train/dynamics/loss_epoch_mean']:.6f}",
-        f"critic={metrics['train/critic/loss_epoch_mean']:.6f}",
+        f"dyn={metrics['train/dynamics/phase1/loss_epoch_mean']:.6f}",
+        f"critic={metrics['train/critic/total_loss_epoch_mean']:.6f}",
     ]
-    if 'train/actor/loss_epoch_mean' in metrics:
-        parts.append(f"actor={metrics['train/actor/loss_epoch_mean']:.6f}")
+    actor_key = 'train/actor/spi_actor/actor_loss_epoch_mean'
+    if actor_key in metrics:
+        parts.append(f"actor={metrics[actor_key]:.6f}")
     else:
         parts.append('actor=disabled')
-    parts.append(f"coupling={metrics['train/coupling/critic_score_epoch_mean']:.6f}")
+    parts.append(f"coupling={metrics['train/coupling/critic_score_mean_epoch_mean']:.6f}")
 
     detail_keys = [
         ('dyn_g', 'train/dynamics/phase1/loss_dynamics_epoch_mean'),
@@ -502,10 +503,10 @@ def _rescore_with_stats_jit(
         'valids': valids,
     }
     coupling_stats = {
-        'coupling/critic_score_mean': score_mean,
-        'coupling/critic_score_max': score_max,
-        'coupling/critic_score_min': score_min,
-        'coupling/critic_score_gap_top1_top2': gap,
+        'critic_score_mean': score_mean,
+        'critic_score_max': score_max,
+        'critic_score_min': score_min,
+        'critic_score_gap_top1_top2': gap,
     }
     return out_batch, coupling_stats
 
@@ -517,9 +518,9 @@ def _proposal_goal_stats_jit(
 ) -> dict:
     """Compute proposal-goal coupling stats in a single fused dispatch."""
     return {
-        'coupling/predicted_subgoal_norm': jnp.linalg.norm(actor_goal_mean, axis=-1).mean(),
-        'coupling/proposal_goal_norm_mean': jnp.linalg.norm(candidate_goals, axis=-1).mean(),
-        'coupling/proposal_goal_std_mean': candidate_goals.std(axis=1).mean(),
+        'predicted_subgoal_norm': jnp.linalg.norm(actor_goal_mean, axis=-1).mean(),
+        'proposal_goal_norm_mean': jnp.linalg.norm(candidate_goals, axis=-1).mean(),
+        'proposal_goal_std_mean': candidate_goals.std(axis=1).mean(),
     }
 
 
@@ -590,11 +591,11 @@ def _build_actor_batch_from_dynamics(
     proposal_goal_stats = _proposal_goal_stats_jit(actor_goal_mean, candidate_goals)
     coupling_info = {
         **proposal_goal_stats,
-        'coupling/critic_score_mean': nan,
-        'coupling/critic_score_max': nan,
-        'coupling/critic_score_min': nan,
-        'coupling/critic_score_gap_top1_top2': nan,
-        'coupling/proposal_count': jnp.asarray(float(candidate_actions.shape[1]), dtype=jnp.float32),
+        'critic_score_mean': nan,
+        'critic_score_max': nan,
+        'critic_score_min': nan,
+        'critic_score_gap_top1_top2': nan,
+        'proposal_count': jnp.asarray(float(candidate_actions.shape[1]), dtype=jnp.float32),
     }
     return dynamics_agent, actor_batch, coupling_info, timing
 
@@ -622,10 +623,10 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
                 'valids': valids,
             },
             {
-                'coupling/critic_score_mean': zero,
-                'coupling/critic_score_max': zero,
-                'coupling/critic_score_min': zero,
-                'coupling/critic_score_gap_top1_top2': zero,
+                'critic_score_mean': zero,
+                'critic_score_max': zero,
+                'critic_score_min': zero,
+                'critic_score_gap_top1_top2': zero,
             },
         )
     # Multi-candidate path: fused score + rank + stats in one compiled graph.
@@ -1120,23 +1121,12 @@ def main(_):
             metrics.update(_to_host_metrics('train/dynamics', last_dynamics_info))
             metrics.update(_to_host_metrics('train/critic', last_critic_info))
             metrics.update(_to_host_metrics('train/actor', last_actor_info))
-            metrics.update(_to_host_metrics('train', last_coupling_info))
+            metrics.update(_to_host_metrics('train/coupling', last_coupling_info))
             metrics['train/critic/primary_score'] = extract_critic_primary_score(last_critic_info)
             _emit_metric_means(metrics, 'train/dynamics', dynamics_metric_sums, steps_done)
             _emit_metric_means(metrics, 'train/critic', critic_metric_sums, steps_done)
             _emit_metric_means(metrics, 'train/actor', actor_metric_sums, steps_done)
             _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, steps_done)
-            # Backward-compatible aliases for legacy log/dashboard consumers.
-            _alias = {
-                'train/dynamics/loss_epoch_mean': 'train/dynamics/phase1/loss_epoch_mean',
-                'train/critic/loss_epoch_mean': 'train/critic/total_loss_epoch_mean',
-                'train/value/loss_epoch_mean': 'train/critic/action_critic/value_loss_epoch_mean',
-                'train/actor/loss_epoch_mean': 'train/actor/spi_actor/actor_loss_epoch_mean',
-                'train/coupling/critic_score_epoch_mean': 'train/coupling/coupling/critic_score_mean_epoch_mean',
-            }
-            for dst, src in _alias.items():
-                if src in metrics:
-                    metrics[dst] = metrics[src]
             metrics['train/epoch'] = float(epoch)
             if eval_freq > 0 and epoch % eval_freq == 0:
                 metrics.update(

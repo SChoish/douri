@@ -1,7 +1,7 @@
-# Joint GOUB + critic + SPI actor (global-goal conditioning) — short 200-epoch run.
+# Linear-SDE dynamics + critic + SPI actor (global-goal conditioning) — short 200-epoch run.
 # Same as config/antmaze_large_navigate.yaml except:
 #   - actor.spi_conditioned: goal   (pi and Q are conditioned on the global high_actor_goals
-#                                    instead of GOUB predict_subgoal(s, g_global))
+#                                    instead of dynamics predict_subgoal(s, g_global))
 #   - train_epochs: 200             (sanity-length sweep)
 
 env_name: antmaze-large-navigate-v0
@@ -32,7 +32,7 @@ eval_goal_dims: "0,1"
 # and agents/critic.get_config(). Everything else uses the agent defaults.
 dynamics:
   rollout_loss_weight: 1.0      # default 0.25
-  value_geom_sample: false      # default true; align with DQC-style relabeling
+  value_geom_sample: false      # default true; uniform-future relabeling
   subgoal_value_alpha: 0.1      # weight on V(s_g, g) in subgoal loss; 0 disables
   bridge_gamma_inv: 0.0
   subgoal_distribution: deterministic

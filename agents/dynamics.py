@@ -1057,7 +1057,6 @@ class DynamicsAgent(_DynamicsAgentCore):
             'phase1/loss_idm': loss_idm_unw,
             'phase1/first_step_l1': first_step_l1,
             'phase1/first_step_xy_l2': first_step_xy_l2,
-            'phase1/roll_h_l1': loss_roll,
             'phase1/eps_norm': jnp.linalg.norm(eps_pred, axis=-1).mean(),
             'phase1/mu_true_norm': jnp.linalg.norm(mu_true, axis=-1).mean(),
             'phase1/mu_pred_norm': jnp.linalg.norm(mu_pred, axis=-1).mean(),
@@ -1173,7 +1172,6 @@ class DynamicsAgent(_DynamicsAgentCore):
             'phase1/loss_idm': loss_idm_unw,
             'phase1/first_step_l1': first_step_l1,
             'phase1/first_step_xy_l2': first_step_xy_l2,
-            'phase1/roll_h_l1': zero,
             'phase1/eps_norm': zero,
             'phase1/mu_true_norm': jnp.linalg.norm(segment[:, 1, :], axis=-1).mean(),
             'phase1/mu_pred_norm': jnp.linalg.norm(path_pred[:, 1, :], axis=-1).mean(),
@@ -1265,11 +1263,8 @@ def _get_common_config():
             #                               learned residual (PathResidualNet).
             planner_type='reverse_score',
             forward_bridge_mode='mean',
-            forward_bridge_noise_scale=0.0,
             forward_bridge_eps=1.0e-6,
-            forward_bridge_train_epsilon=False,
             forward_bridge_use_path_loss=True,
-            forward_bridge_use_rollout_loss=False,
             # Hidden dims for the optional PathResidualNet (forward_bridge_residual).
             residual_hidden_dims=(512, 512, 512),
             idm_loss_weight=1.0,

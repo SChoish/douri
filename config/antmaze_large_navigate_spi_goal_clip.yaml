@@ -1,6 +1,6 @@
-# Joint GOUB + critic + SPI actor — subgoal-conditioned SPI + bridge/subgoal clip-and-pad.
-# Enables goub.clip_path_to_goal: true (same rationale as before).
-# Actor/Q use per-candidate GOUB subgoals (spi_conditioned: subgoal), not the global goal.
+# Linear-SDE dynamics + critic + SPI actor — subgoal-conditioned SPI + bridge/subgoal clip-and-pad.
+# Enables dynamics.clip_path_to_goal: true.
+# Actor/Q use per-candidate predicted subgoals (spi_conditioned: subgoal), not the global goal.
 
 env_name: antmaze-large-navigate-v0
 seed: 0

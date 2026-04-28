@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 *.pkl
 runs/
+prev_runs/
 nohup_logs/
 .env
 .venv/

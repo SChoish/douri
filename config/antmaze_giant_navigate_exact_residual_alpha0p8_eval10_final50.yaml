@@ -1,0 +1,46 @@
+# Linear-SDE dynamics + critic + actor offline training.
+# AntMaze giant exact-residual ablation at (alpha, spi_tau, spi_beta) = (0.8, 10.0, 1.0).
+
+env_name: antmaze-giant-navigate-v0
+seed: 0
+run_group: antmaze_giant_navigate_exact_residual_alpha0p8_eval10_final50
+
+train_epochs: 1000
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+
+use_wandb: false
+use_tqdm: false
+
+batch_size: 1024
+horizon: 25
+plan_candidates: 1
+plan_noise_scale: 0.01
+measure_timing: false
+eval_freq: 100
+eval_task_ids: "1,2,3,4,5"
+eval_episodes_per_task: 10
+final_eval_episodes_per_task: 50
+eval_max_chunks: 200
+eval_goal_tol: 0.5
+eval_goal_dims: "0,1"
+
+dynamics:
+  rollout_loss_weight: 1.0
+  value_geom_sample: false
+  subgoal_value_alpha: 0.8
+  bridge_gamma_inv: 0.0
+  subgoal_distribution: deterministic
+  dynamics_model_type: exact_residual
+  exact_residual_scale: 1.0
+  exact_residual_bridge_match_weight: 0.0
+  exact_residual_reg_weight: 1.0e-4
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.995
+
+actor:
+  spi_tau: 10.0
+  spi_beta: 1.0
+  spi_actor_layer_norm: true

@@ -102,6 +102,11 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_string('eval_task_ids', '1,2,3,4,5', 'Comma-separated OGBench task ids for env evaluation.')
 flags.DEFINE_integer('eval_episodes_per_task', 10, 'Number of env evaluation episodes to run for each task id.')
+flags.DEFINE_integer(
+    'final_eval_episodes_per_task',
+    0,
+    'If > 0, override eval_episodes_per_task for the final training epoch evaluation only.',
+)
 flags.DEFINE_integer('eval_max_chunks', 200, 'Maximum action chunks to execute per evaluation episode.')
 flags.DEFINE_float('eval_goal_tol', 0.5, 'Goal tolerance for marking env evaluation success.')
 flags.DEFINE_string('eval_goal_dims', '0,1', 'Comma-separated observation dims used for env goal distance.')
@@ -969,6 +974,7 @@ def main(_):
     eval_freq = int(FLAGS.eval_freq)
     eval_task_ids = parse_int_list(FLAGS.eval_task_ids)
     eval_episodes_per_task = max(1, int(FLAGS.eval_episodes_per_task))
+    final_eval_episodes_per_task = max(0, int(FLAGS.final_eval_episodes_per_task))
     eval_goal_dims = parse_int_list(FLAGS.eval_goal_dims)
     eval_goal_dims = eval_goal_dims if len(eval_goal_dims) > 0 else None
     eval_goal_tol = float(FLAGS.eval_goal_tol)
@@ -1107,6 +1113,11 @@ def main(_):
             _emit_metric_means(metrics, 'train/coupling', coupling_metric_sums, steps_done)
             metrics['train/epoch'] = float(epoch)
             if eval_freq > 0 and epoch % eval_freq == 0:
+                eval_episode_count = (
+                    final_eval_episodes_per_task
+                    if final_eval_episodes_per_task > 0 and epoch == int(FLAGS.train_epochs)
+                    else eval_episodes_per_task
+                )
                 metrics.update(
                     _evaluate_env_tasks(
                         env,
@@ -1116,7 +1127,7 @@ def main(_):
                         critic_config,
                         critic_value_params=_extract_critic_value_params(critic_agent),
                         task_ids=eval_task_ids,
-                        episodes_per_task=eval_episodes_per_task,
+                        episodes_per_task=eval_episode_count,
                         max_chunks=eval_max_chunks,
                         goal_tol=eval_goal_tol,
                         goal_dims=eval_goal_dims,

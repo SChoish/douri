@@ -190,7 +190,9 @@ def bridge_sample(x_0, x_T, n, schedule, rng):
 
     Args:
         x_0: Target endpoint, shape (B, D).
-        x_T: Current state, shape (B, D).
+        x_T: Start state in the active frame, shape (B, D).  This is the
+            absolute current state in legacy mode and zero in the translated
+            displacement chart.
         n: Step indices, shape (B,), values in {1, ..., N-1}.
         schedule: Output of ``make_dynamics_schedule``.
         rng: JAX PRNG key.
@@ -218,7 +220,9 @@ def posterior_moments(x_n, x_0, x_T, n, schedule):
     Args:
         x_n: Current bridge state, shape (B, D).
         x_0: Target endpoint, shape (B, D).
-        x_T: Current observation, shape (B, D).
+        x_T: Start state in the active frame, shape (B, D).  This is the
+            absolute current state in legacy mode and zero in the translated
+            displacement chart.
         n: Step indices, shape (B,), values in {1, ..., N}.
         schedule: Output of ``make_dynamics_schedule``.
 

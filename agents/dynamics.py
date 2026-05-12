@@ -96,11 +96,12 @@ class ResidualNet(nn.Module):
     Reverse-chain implementation notation:
         ``x_T = r_0`` and ``x_0 = r_K``.
 
-    The dedicated ``anchor`` channel always carries the absolute current
-    state ``s_t``: in ``absolute`` mode this is redundant with ``x_T`` (both
-    equal ``s_t``), in ``displacement`` mode it is the only path through which
-    ``s_t`` reaches the network so the learned correction is *not* forced to
-    be translation-invariant.
+    Public training/planning paths pass the absolute current state ``s_t``
+    through the dedicated ``anchor`` channel.  In ``absolute`` mode this is
+    redundant with ``x_T`` (both equal ``s_t``); in ``displacement`` mode it is
+    the only path through which ``s_t`` reaches the network, matching the PDF's
+    ``M_r(r_i, s_t, Delta)`` interface and preventing the learned correction
+    from being forced to be translation-invariant.
     """
 
     hidden_dims: Sequence[int]
@@ -145,7 +146,8 @@ class DistributionalSubgoalEstimatorNet(nn.Module):
     ``s_{t+K}`` in legacy mode, displacement ``Delta`` in displacement mode).
     The phase-1 implementation intentionally supports two stochastic losses:
     the PDF-style reparameterized sample MSE and an NLL option used by some
-    configs; both can include the optional ``- alpha * V(sample, g)`` bonus.
+    configs; both can include the optional ``- alpha * V(sample_abs, g)``
+    bonus after mapping a displacement sample back to absolute state space.
     Actor proposals sample endpoint candidates from this distribution in
     :meth:`_DynamicsAgentCore.sample_subgoal_candidates`.
     """
@@ -224,11 +226,11 @@ def _subgoal_target_mode(config) -> str:
     - ``'absolute'`` (default, legacy): subgoal_net predicts the absolute
       next-K state ``s_{t+K}``; the bridge interpolates between ``s_t`` and
       ``s_{t+K}`` in absolute state space.
-    - ``'displacement'``: subgoal_net predicts the displacement
-      ``Delta = s_{t+K} - s_t`` (matching the prior that endpoints should be
-      *small offsets* from the current state).  External APIs still hand off
-      absolute states / trajectories; the displacement frame only exists
-      inside :class:`DynamicsAgent`.
+    - ``'displacement'``: PDF-aligned translated chart.  The subgoal_net
+      predicts ``Delta = s_{t+K} - s_t`` and the bridge/residual model is
+      trained in the local frame ``r_i = s_{t+i} - s_t``.  External APIs still
+      hand off absolute states / trajectories; the displacement frame only
+      exists inside :class:`DynamicsAgent`.
     """
     mode = str(config.get('subgoal_target_mode', 'absolute')).lower()
     if mode not in ('absolute', 'displacement'):
@@ -1222,10 +1224,13 @@ class DynamicsAgent(_DynamicsAgentCore):
         ``forward_bridge_residual`` paths so the subgoal estimator is trained
         identically across planners.
 
-        Note on the PDF: the deterministic subgoal objective matches the
-        value-guided regression form, while stochastic subgoals intentionally
-        add an implementation choice between sample-MSE and weighted Gaussian
-        NLL via ``subgoal_stochastic_loss``.
+        Note on the PDF: deterministic subgoals match the value-guided
+        regression form directly.  Stochastic subgoals intentionally add an
+        implementation choice between the PDF-style reparameterized sample-MSE
+        objective and a weighted Gaussian NLL objective via
+        ``subgoal_stochastic_loss``.  In displacement mode, value terms are
+        always evaluated after reconstructing the absolute sample
+        ``observations + Delta``.
 
         In ``subgoal_target_mode='displacement'`` the raw network output is the
         predicted displacement ``Delta`` and the supervised target becomes

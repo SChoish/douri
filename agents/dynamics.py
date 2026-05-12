@@ -96,11 +96,12 @@ class ResidualNet(nn.Module):
     Reverse-chain implementation notation:
         ``x_T = r_0`` and ``x_0 = r_K``.
 
-    The dedicated ``anchor`` channel always carries the absolute current
-    state ``s_t``: in ``absolute`` mode this is redundant with ``x_T`` (both
-    equal ``s_t``), in ``displacement`` mode it is the only path through which
-    ``s_t`` reaches the network so the learned correction is *not* forced to
-    be translation-invariant.
+    Public training/planning paths pass the absolute current state ``s_t``
+    through the dedicated ``anchor`` channel.  In ``absolute`` mode this is
+    redundant with ``x_T`` (both equal ``s_t``); in ``displacement`` mode it is
+    the only path through which ``s_t`` reaches the network, matching the PDF's
+    ``M_r(r_i, s_t, Delta)`` interface and preventing the learned correction
+    from being forced to be translation-invariant.
     """
 
     hidden_dims: Sequence[int]
@@ -141,11 +142,13 @@ class SubgoalEstimatorNet(nn.Module):
 class DistributionalSubgoalEstimatorNet(nn.Module):
     """Diagonal-Gaussian subgoal estimator (``subgoal_distribution='diag_gaussian'``).
 
-    Returns ``(mu, log_std)`` for ``pi_phi(s_{t+K} | s_t, g)``.  The phase-1
-    subgoal objective uses a reparameterized sample with a value-gap-weighted
-    MSE and optional ``- alpha * V(sample, g)`` bonus; ``log_std`` is also used
-    for stochastic actor proposals and NLL diagnostics.  Actor proposals sample
-    endpoint candidates from this distribution in
+    Returns ``(mu, log_std)`` for the raw subgoal frame (absolute
+    ``s_{t+K}`` in legacy mode, displacement ``Delta`` in displacement mode).
+    The phase-1 implementation intentionally supports two stochastic losses:
+    the PDF-style reparameterized sample MSE and an NLL option used by some
+    configs; both can include the optional ``- alpha * V(sample_abs, g)``
+    bonus after mapping a displacement sample back to absolute state space.
+    Actor proposals sample endpoint candidates from this distribution in
     :meth:`_DynamicsAgentCore.sample_subgoal_candidates`.
     """
 
@@ -223,11 +226,11 @@ def _subgoal_target_mode(config) -> str:
     - ``'absolute'`` (default, legacy): subgoal_net predicts the absolute
       next-K state ``s_{t+K}``; the bridge interpolates between ``s_t`` and
       ``s_{t+K}`` in absolute state space.
-    - ``'displacement'``: subgoal_net predicts the displacement
-      ``Delta = s_{t+K} - s_t`` (matching the prior that endpoints should be
-      *small offsets* from the current state).  External APIs still hand off
-      absolute states / trajectories; the displacement frame only exists
-      inside :class:`DynamicsAgent`.
+    - ``'displacement'``: PDF-aligned translated chart.  The subgoal_net
+      predicts ``Delta = s_{t+K} - s_t`` and the bridge/residual model is
+      trained in the local frame ``r_i = s_{t+i} - s_t``.  External APIs still
+      hand off absolute states / trajectories; the displacement frame only
+      exists inside :class:`DynamicsAgent`.
     """
     mode = str(config.get('subgoal_target_mode', 'absolute')).lower()
     if mode not in ('absolute', 'displacement'):
@@ -312,8 +315,10 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         self, x_n, x_T, x_0, n, schedule, goal=None, params=None, anchor=None,
     ):
         if anchor is None:
-            # Backward-compatible default; callers operating in absolute mode
-            # implicitly pass a zero anchor when they do not provide one.
+            # Backward-compatible low-level fallback for legacy private calls.
+            # Public planners and training paths pass an explicit anchor; in
+            # displacement mode callers should use ``plan`` / ``sample_plan`` so
+            # the unshifted ``s_t`` is threaded through this channel.
             anchor = jnp.zeros_like(x_T)
         eps = self.network.select('residual_net')(
             x_n, x_T, x_0, anchor, n.astype(jnp.float32), params=params,
@@ -1070,9 +1075,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         dummy_n = jnp.ones((batch_size,), dtype=jnp.float32)
         dummy_next = jnp.zeros_like(ex_observations)
 
-        # ResidualNet signature now takes an explicit ``anchor`` input
-        # (``s_t`` in displacement mode, zero tensor in absolute mode); the
-        # initializer must therefore see the matching shape.
+        # ResidualNet signature takes an explicit ``anchor`` input.  Public
+        # training/planning paths pass the absolute current state ``s_t``
+        # (redundant with ``x_T`` in absolute mode, essential context in
+        # displacement mode); the initializer must therefore see the matching
+        # shape.
         network_info = dict(
             residual_net=(residual_net_def, (dummy_x, dummy_x, dummy_x, dummy_x, dummy_n)),
             subgoal_net=(subgoal_def, (dummy_x, dummy_g)),
@@ -1216,6 +1223,14 @@ class DynamicsAgent(_DynamicsAgentCore):
         Shared by ``exact_residual_chain`` and the ``forward_bridge`` /
         ``forward_bridge_residual`` paths so the subgoal estimator is trained
         identically across planners.
+
+        Note on the PDF: deterministic subgoals match the value-guided
+        regression form directly.  Stochastic subgoals intentionally add an
+        implementation choice between the PDF-style reparameterized sample-MSE
+        objective and a weighted Gaussian NLL objective via
+        ``subgoal_stochastic_loss``.  In displacement mode, value terms are
+        always evaluated after reconstructing the absolute sample
+        ``observations + Delta``.
 
         In ``subgoal_target_mode='displacement'`` the raw network output is the
         predicted displacement ``Delta`` and the supervised target becomes
@@ -1764,6 +1779,9 @@ def _get_common_config():
             subgoal_hidden_dims=(512, 512, 512),
             # Distributional subgoal controls (default: deterministic point).
             subgoal_distribution='deterministic',
+            # Stochastic subgoals intentionally support either the PDF-style
+            # reparameterized sample-MSE objective or a weighted Gaussian NLL
+            # objective used by selected experiment configs.
             subgoal_stochastic_loss='mse',
             subgoal_num_samples=1,
             subgoal_log_std_min=-5.0,

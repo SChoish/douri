@@ -182,8 +182,8 @@ def get_actor_config():
     return ml_collections.ConfigDict(
         dict(
             lr=3e-4,
-            spi_tau=10.0,
-            spi_beta=10.0,
+            spi_tau=5.0,
+            spi_beta=1.0,
             spi_actor_layer_norm=True,
             spi_q_norm_eps=1e-6,
             # π and Q in the SPI loss are always conditioned on the dynamics-predicted

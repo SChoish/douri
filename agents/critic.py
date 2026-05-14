@@ -467,18 +467,18 @@ def get_config():
             # Goal input to value/Q nets. 'full' preserves raw goal concat.
             # 'phi' uses ManipSpace cube channels when inferred, else
             # critic_agent.phi_goal_obs_indices (required; e.g. [0,1] for maze x,y).
-            goal_representation='full',
+            goal_representation='phi',
             phi_goal_obs_indices=(),
             env_name='',
             full_chunk_horizon=25,
-            action_chunk_horizon=10,
+            action_chunk_horizon=5,
             # Match dynamics' default clip_path_to_goal semantics for critic backups:
             # if the sampled value goal lies within the chunk window, use the goal
             # state as next_obs, shorten backup_horizon to steps-to-goal, and set
             # mask=0 so Q terminates at the goal.
             clip_chunk_to_goal=True,
             value_hidden_dims=(512, 512, 512),
-            discount=0.99,
+            discount=0.995,
             num_qs=2,
             # 'dqc' (default): chunk_critic + partial action_critic + value (current behavior).
             # 'iql':           action_critic + value only; Q backup uses V at s_{t+H_action}.
@@ -496,7 +496,7 @@ def get_config():
             # Optional cap for same-trajectory sampled value goals. None/<=0
             # preserves terminal-only clipping.
             max_goal_steps=None,
-            max_goal_steps_from_env=False,
+            max_goal_steps_from_env=True,
             gc_negative=False,
         )
     )

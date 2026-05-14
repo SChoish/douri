@@ -1785,7 +1785,7 @@ def _get_common_config():
             time_embed_dim=64,
             layer_norm=True,
             subgoal_loss_weight=1.0,
-            subgoal_value_alpha=0.5,
+            subgoal_value_alpha=0.3,
             subgoal_value_style='exponential',
             subgoal_value_expectile=0.7,
             subgoal_value_gap_scale=1.0,
@@ -1795,7 +1795,7 @@ def _get_common_config():
             # Goal input to the subgoal estimator. 'full' preserves historical
             # behavior; 'phi' uses task goal-representation channels
             # (ManipSpace cube positions, else maze xy).
-            subgoal_goal_representation='full',
+            subgoal_goal_representation='phi',
             # Subgoal target representation:
             #   - 'absolute'    : subgoal_net predicts s_{t+K}, bridge is trained
             #                     in absolute state space (legacy behavior).
@@ -1816,12 +1816,12 @@ def _get_common_config():
             subgoal_value_goal_representation='full',
             subgoal_hidden_dims=(512, 512, 512),
             # Distributional subgoal controls (default: deterministic point).
-            subgoal_distribution='deterministic',
+            subgoal_distribution='diag_gaussian',
             # Stochastic subgoals intentionally support either the PDF-style
             # reparameterized sample-MSE objective or a weighted Gaussian NLL
             # objective used by selected experiment configs.
-            subgoal_stochastic_loss='mse',
-            subgoal_num_samples=1,
+            subgoal_stochastic_loss='nll',
+            subgoal_num_samples=4,
             subgoal_log_std_min=-5.0,
             subgoal_log_std_max=1.0,
             subgoal_temperature=1.0,
@@ -1861,7 +1861,7 @@ def _get_common_config():
             # Optional cap for same-trajectory sampled goals. None/<=0 keeps
             # the historical behavior of sampling up to the episode terminal.
             max_goal_steps=None,
-            max_goal_steps_from_env=False,
+            max_goal_steps_from_env=True,
             gc_negative=True,
             p_aug=0.0,
             frame_stack=ml_collections.config_dict.placeholder(int),

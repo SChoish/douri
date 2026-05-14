@@ -1,0 +1,35 @@
+# Phi recipe aligned with antmaze-giant navigate (phi, diag_gaussian, kappa_b=0.93, spi_tau=5);
+# humanoid-specific: dynamics.subgoal_value_gap_scale=5.0.
+
+env_name: humanoidmaze-large-navigate-v0
+run_group: humanoidmaze_large_navigate_phi_gap5_ha5_kb93_kd80_tau5
+train_epochs: 1000
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+horizon: 25
+plan_candidates: 1
+subgoal_filter: false
+
+dynamics:
+  max_goal_steps_from_env: true
+  clip_path_to_goal: true
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 4
+  subgoal_value_alpha: 0.3
+  subgoal_value_gap_scale: 5.0
+  subgoal_goal_representation: phi
+
+critic_agent:
+  phi_goal_obs_indices: [0, 1]
+  action_chunk_horizon: 5
+  discount: 0.995
+  kappa_b: 0.93
+  kappa_d: 0.8
+  max_goal_steps_from_env: true
+  clip_chunk_to_goal: true
+  goal_representation: phi
+
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0

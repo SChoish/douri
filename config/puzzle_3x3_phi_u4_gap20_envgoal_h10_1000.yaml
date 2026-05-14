@@ -1,0 +1,35 @@
+# puzzle-3x3-play-v0, phi recipe, horizon=10, 1000 epochs.
+# Same phi recipe as cube_double_phi_u4_gap20_envgoal_h10_1000.yaml;
+# only critic kappa_b/kappa_d differ (taken from config/puzzle_3x3.yaml baseline).
+
+env_name: puzzle-3x3-play-v0
+run_group: puzzle_3x3_phi_u4_gap20_envgoal_h10_1000
+train_epochs: 1000
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+horizon: 10
+plan_candidates: 1
+subgoal_filter: false
+
+dynamics:
+  max_goal_steps_from_env: true
+  clip_path_to_goal: true
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 4
+  subgoal_value_alpha: 0.3
+  subgoal_value_gap_scale: 20.0
+  subgoal_goal_representation: phi
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.995
+  kappa_b: 0.9
+  kappa_d: 0.5
+  max_goal_steps_from_env: true
+  clip_chunk_to_goal: true
+  goal_representation: phi
+
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0

@@ -39,6 +39,7 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_vi
 from utils.ogbench_eval_rollout import rollout_chunked_eval_episode
 from utils.run_io import parse_int_list
 from utils.subgoal_filter import make_value_subgoal_filter_from_params
+from utils.goal_representation import normalize_phi_goal_obs_indices
 
 FLAGS = flags.FLAGS
 _DEFAULT_HORIZON = 25
@@ -789,6 +790,9 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     dynamics_config['subgoal_value_goal_representation'] = str(
         critic_config.get('goal_representation', 'full'),
     )
+    phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
+    critic_config['phi_goal_obs_indices'] = phi_idxs
+    dynamics_config['phi_goal_obs_indices'] = phi_idxs
     validate_config(critic_config, actor_config)
     shared_batch = int(FLAGS.batch_size)
     if shared_batch < 1:

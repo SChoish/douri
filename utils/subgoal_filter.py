@@ -9,12 +9,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from agents.critic import ScalarValueNet
-from utils.goal_representation import manip_cube_pos_indices
+from utils.goal_representation import manip_cube_pos_indices, normalize_phi_goal_obs_indices
 
 
 SubgoalFilterFn = Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
-
-_DEFAULT_GOAL_REP_DIM = 2
 
 
 def _as_row(x: np.ndarray | jnp.ndarray) -> jnp.ndarray:
@@ -34,11 +32,17 @@ def _manip_cube_pos_indices(obs_dim: int) -> tuple[int, ...]:
     return manip_cube_pos_indices(obs_dim)
 
 
-def _filter_replacement_target(subgoal_b: jnp.ndarray, goal_b: jnp.ndarray) -> jnp.ndarray:
+def _filter_replacement_target(
+    subgoal_b: jnp.ndarray, goal_b: jnp.ndarray, phi_goal_obs_indices: tuple[int, ...],
+) -> jnp.ndarray:
     idxs = _manip_cube_pos_indices(int(subgoal_b.shape[-1]))
     if not idxs:
-        n = min(_DEFAULT_GOAL_REP_DIM, int(subgoal_b.shape[-1]), int(goal_b.shape[-1]))
-        idxs = tuple(range(n))
+        idxs = phi_goal_obs_indices
+        if not idxs:
+            raise ValueError(
+                'Subgoal filter replacement needs ManipSpace cube layout or '
+                'critic_agent.phi_goal_obs_indices for non-ManipSpace observations.'
+            )
     target = subgoal_b
     idx_arr = jnp.asarray(idxs, dtype=jnp.int32)
     return target.at[:, idx_arr].set(goal_b[:, idx_arr])
@@ -53,18 +57,20 @@ def make_value_subgoal_filter_from_params(
 
     The filter compares sigmoid-transformed scalar values under the critic
     value head. If ``V(subgoal, g) <= V(s, g)`` and ``V(s, subgoal) > R``, only
-    the goal representation ``phi`` is copied from ``g``. For compact
-    ManipSpace this is cube position channels; otherwise this defaults to the
-    first two state channels (maze x/y). Other channels in the predicted
-    subgoal are kept unchanged.
+    the goal representation ``phi`` channels listed in
+    ``critic_agent.phi_goal_obs_indices`` are copied from ``g`` (ManipSpace:
+    inferred cube position channels). Other channels in the predicted subgoal
+    are kept unchanged.
     """
 
     if critic_value_params is None:
         return None
+    phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
     value_def = ScalarValueNet(
         tuple(int(x) for x in critic_config['value_hidden_dims']),
         layer_norm=bool(critic_config.get('layer_norm', True)),
         goal_representation=str(critic_config.get('goal_representation', 'full')),
+        phi_goal_obs_indices=phi_idxs,
     )
 
     @jax.jit
@@ -75,7 +81,7 @@ def make_value_subgoal_filter_from_params(
         cur_to_goal_v = jax.nn.sigmoid(value_def.apply({'params': critic_value_params}, obs_b, goal_b))
         sg_to_goal_v = jax.nn.sigmoid(value_def.apply({'params': critic_value_params}, sg_b, goal_b))
         obs_to_sg_v = jax.nn.sigmoid(value_def.apply({'params': critic_value_params}, obs_b, sg_b))
-        replacement = _filter_replacement_target(sg_b, goal_b)
+        replacement = _filter_replacement_target(sg_b, goal_b, phi_idxs)
         should_filter = (sg_to_goal_v <= cur_to_goal_v) & (obs_to_sg_v > float(reachability_threshold))
         filtered = jnp.where(should_filter.reshape((-1, 1)), replacement, sg_b).reshape(subgoal.shape)
         return filtered, should_filter

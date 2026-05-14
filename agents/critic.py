@@ -17,7 +17,7 @@ import numpy as np
 import optax
 
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.goal_representation import goal_representation
+from utils.goal_representation import assert_phi_goal_obs_indices, goal_representation, normalize_phi_goal_obs_indices
 from utils.networks import MLP
 
 
@@ -30,12 +30,13 @@ class ScalarValueNet(nn.Module):
     hidden_dims: Sequence[int]
     layer_norm: bool = True
     goal_representation: str = 'full'
+    phi_goal_obs_indices: tuple[int, ...] = ()
 
     @nn.compact
     def __call__(self, observations: jnp.ndarray, goals: jnp.ndarray | None = None) -> jnp.ndarray:
         xs = [observations]
         if goals is not None:
-            xs.append(goal_representation(goals, self.goal_representation))
+            xs.append(goal_representation(goals, self.goal_representation, self.phi_goal_obs_indices))
         x = jnp.concatenate(xs, axis=-1)
         return MLP((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)(x).squeeze(-1)
 
@@ -45,6 +46,7 @@ class BinaryChunkCritic(nn.Module):
     num_qs: int
     layer_norm: bool = True
     goal_representation: str = 'full'
+    phi_goal_obs_indices: tuple[int, ...] = ()
 
     @nn.compact
     def __call__(
@@ -55,7 +57,7 @@ class BinaryChunkCritic(nn.Module):
     ) -> jnp.ndarray:
         xs = [observations]
         if goals is not None:
-            xs.append(goal_representation(goals, self.goal_representation))
+            xs.append(goal_representation(goals, self.goal_representation, self.phi_goal_obs_indices))
         if actions_flat is not None:
             xs.append(actions_flat)
         x = jnp.concatenate(xs, axis=-1)
@@ -345,13 +347,24 @@ class CriticAgent(flax.struct.PyTreeNode):
         ln = bool(config['layer_norm'])
         nq = int(config['num_qs'])
         goal_rep = str(config.get('goal_representation', 'full')).lower()
+        phi_idxs = normalize_phi_goal_obs_indices(config.get('phi_goal_obs_indices', ()))
+        assert_phi_goal_obs_indices(
+            int(ex_obs.shape[-1]),
+            goal_rep,
+            phi_idxs,
+            where='CriticAgent.create (critic goal_representation)',
+        )
         critic_type = str(config.get('critic_type', 'dqc')).lower()
         if critic_type not in ('dqc', 'iql'):
             raise ValueError(f"critic_type must be 'dqc' or 'iql', got {critic_type!r}")
 
-        value_def = ScalarValueNet(hdims, layer_norm=ln, goal_representation=goal_rep)
-        action_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep)
-        target_action_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep)
+        value_def = ScalarValueNet(
+            hdims, layer_norm=ln, goal_representation=goal_rep, phi_goal_obs_indices=phi_idxs
+        )
+        action_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep, phi_goal_obs_indices=phi_idxs)
+        target_action_critic_def = BinaryChunkCritic(
+            hdims, nq, ln, goal_representation=goal_rep, phi_goal_obs_indices=phi_idxs
+        )
 
         network_info = {
             'action_critic': (action_critic_def, (ex_obs, ex_goal, ex_part)),
@@ -365,8 +378,12 @@ class CriticAgent(flax.struct.PyTreeNode):
                     "critic_type='dqc' requires ex_full_chunk_actions for chunk_critic init."
                 )
             ex_full = jnp.asarray(ex_full_chunk_actions, dtype=jnp.float32)
-            chunk_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep)
-            target_chunk_critic_def = BinaryChunkCritic(hdims, nq, ln, goal_representation=goal_rep)
+            chunk_critic_def = BinaryChunkCritic(
+                hdims, nq, ln, goal_representation=goal_rep, phi_goal_obs_indices=phi_idxs
+            )
+            target_chunk_critic_def = BinaryChunkCritic(
+                hdims, nq, ln, goal_representation=goal_rep, phi_goal_obs_indices=phi_idxs
+            )
             network_info['chunk_critic'] = (chunk_critic_def, (ex_obs, ex_goal, ex_full))
             network_info['target_chunk_critic'] = (target_chunk_critic_def, (ex_obs, ex_goal, ex_full))
 
@@ -378,7 +395,9 @@ class CriticAgent(flax.struct.PyTreeNode):
             network_params['modules_target_chunk_critic'] = network_params['modules_chunk_critic']
         network_params['modules_target_action_critic'] = network_params['modules_action_critic']
         network = TrainState.create(network_def, network_params, tx=optax.adam(float(config['lr'])))
-        return cls(rng=rng, network=network, config=flax.core.FrozenDict(**config))
+        cfg_out = dict(config)
+        cfg_out['phi_goal_obs_indices'] = phi_idxs
+        return cls(rng=rng, network=network, config=flax.core.FrozenDict(**cfg_out))
 
 
 def validate_config(critic_config, actor_config=None) -> None:
@@ -421,10 +440,11 @@ def get_config():
             frame_stack=None,
             p_aug=0.0,
             q_agg='mean',
-            # Goal input to value/Q nets. 'full' preserves the historical raw
-            # full-goal concatenation; 'phi' uses task goal-representation
-            # channels (ManipSpace cube positions, else maze xy).
+            # Goal input to value/Q nets. 'full' preserves raw goal concat.
+            # 'phi' uses ManipSpace cube channels when inferred, else
+            # critic_agent.phi_goal_obs_indices (required; e.g. [0,1] for maze x,y).
             goal_representation='full',
+            phi_goal_obs_indices=(),
             full_chunk_horizon=25,
             action_chunk_horizon=10,
             # Match dynamics' default clip_path_to_goal semantics for critic backups:

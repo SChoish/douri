@@ -27,7 +27,7 @@ from utils.dynamics import (
     posterior_mean,
     sample_from_reverse_mean,
 )
-from utils.goal_representation import goal_representation
+from utils.goal_representation import assert_phi_goal_obs_indices, goal_representation, normalize_phi_goal_obs_indices
 
 
 _VALID_PLANNER_TYPES = ('exact_residual_chain', 'forward_bridge', 'forward_bridge_residual')
@@ -126,10 +126,11 @@ class SubgoalEstimatorNet(nn.Module):
     state_dim: int
     layer_norm: bool = True
     goal_representation: str = 'full'
+    phi_goal_obs_indices: tuple[int, ...] = ()
 
     @nn.compact
     def __call__(self, observations, high_actor_goals):
-        goal_inp = goal_representation(high_actor_goals, self.goal_representation)
+        goal_inp = goal_representation(high_actor_goals, self.goal_representation, self.phi_goal_obs_indices)
         inp = jnp.concatenate([observations, goal_inp], axis=-1)
         return MLP(
             hidden_dims=(*self.hidden_dims, self.state_dim),
@@ -156,10 +157,11 @@ class DistributionalSubgoalEstimatorNet(nn.Module):
     log_std_min: float = -5.0
     log_std_max: float = 1.0
     goal_representation: str = 'full'
+    phi_goal_obs_indices: tuple[int, ...] = ()
 
     @nn.compact
     def __call__(self, observations, high_actor_goals):
-        goal_inp = goal_representation(high_actor_goals, self.goal_representation)
+        goal_inp = goal_representation(high_actor_goals, self.goal_representation, self.phi_goal_obs_indices)
         inp = jnp.concatenate([observations, goal_inp], axis=-1)
         trunk = MLP(
             hidden_dims=tuple(self.hidden_dims),
@@ -1008,6 +1010,21 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         state_dim = ex_observations.shape[-1]
         action_dim = int(ex_actions.shape[-1])
+        phi_idxs = normalize_phi_goal_obs_indices(config.get('phi_goal_obs_indices', ()))
+        sg_rep = str(config.get('subgoal_goal_representation', config.get('goal_representation', 'full'))).lower()
+        assert_phi_goal_obs_indices(
+            int(state_dim),
+            sg_rep,
+            phi_idxs,
+            where='DynamicsAgent.create (subgoal_goal_representation)',
+        )
+        val_rep = str(config.get('subgoal_value_goal_representation', 'full')).lower()
+        assert_phi_goal_obs_indices(
+            int(state_dim),
+            val_rep,
+            phi_idxs,
+            where='DynamicsAgent.create (subgoal_value_goal_representation)',
+        )
         idm_hidden = config.get('idm_hidden_dims', (512, 512, 512))
         if isinstance(idm_hidden, str):
             idm_hidden = parse_hidden_dims(idm_hidden)
@@ -1045,6 +1062,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 goal_representation=str(
                     config.get('subgoal_goal_representation', config.get('goal_representation', 'full')),
                 ),
+                phi_goal_obs_indices=phi_idxs,
             )
         elif sub_mode == 'diag_gaussian':
             subgoal_def = DistributionalSubgoalEstimatorNet(
@@ -1056,6 +1074,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 goal_representation=str(
                     config.get('subgoal_goal_representation', config.get('goal_representation', 'full')),
                 ),
+                phi_goal_obs_indices=phi_idxs,
             )
         else:
             raise ValueError(
@@ -1118,7 +1137,12 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         network_params = network_def.init(init_rng, **network_args)['params']
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
-        cfg_out = {**dict(config), 'idm_action_dim': action_dim, 'idm_hidden_dims': idm_hidden}
+        cfg_out = {
+            **dict(config),
+            'idm_action_dim': action_dim,
+            'idm_hidden_dims': idm_hidden,
+            'phi_goal_obs_indices': phi_idxs,
+        }
         return cls(
             rng=rng,
             network=network,
@@ -1192,6 +1216,7 @@ class DynamicsAgent(_DynamicsAgentCore):
             tuple(int(x) for x in self.config.get('subgoal_value_hidden_dims', (512, 512, 512))),
             layer_norm=bool(self.config.get('subgoal_value_layer_norm', True)),
             goal_representation=str(self.config.get('subgoal_value_goal_representation', 'full')),
+            phi_goal_obs_indices=normalize_phi_goal_obs_indices(self.config.get('phi_goal_obs_indices', ())),
         )
         value_logits = value_def.apply({'params': critic_value_params}, states, high_actor_goals)
         return jax.nn.sigmoid(jnp.asarray(value_logits, dtype=jnp.float32))

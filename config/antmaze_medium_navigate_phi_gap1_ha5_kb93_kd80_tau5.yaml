@@ -1,9 +1,9 @@
-# Antmaze giant: same as gap5 recipe but subgoal_value_gap_scale=1.0 (weaker exp weighting).
-# Eval value-based subgoal filtering off via subgoal_filter: false.
+# Phi recipe identical to antmaze_*_navigate_phi_u4_a03_h25_pc1_ha5_kb93_kd80_tau5 except
+# dynamics.subgoal_value_gap_scale=1.0 (was 20.0).
 
-env_name: antmaze-giant-navigate-v0
-run_group: antmaze_giant_gaussian_u4_alpha0p3_gap1_phi_nll_no_vfilter
-train_epochs: 300
+env_name: antmaze-medium-navigate-v0
+run_group: antmaze_medium_navigate_phi_gap1_ha5_kb93_kd80_tau5
+train_epochs: 1000
 log_every_n_epochs: 10
 save_every_n_epochs: 100
 horizon: 25
@@ -11,6 +11,8 @@ plan_candidates: 1
 subgoal_filter: false
 
 dynamics:
+  max_goal_steps_from_env: true
+  clip_path_to_goal: true
   subgoal_distribution: diag_gaussian
   subgoal_stochastic_loss: nll
   subgoal_num_samples: 4
@@ -22,7 +24,12 @@ critic_agent:
   phi_goal_obs_indices: [0, 1]
   action_chunk_horizon: 5
   discount: 0.995
+  kappa_b: 0.93
+  kappa_d: 0.8
+  max_goal_steps_from_env: true
+  clip_chunk_to_goal: true
   goal_representation: phi
 
 actor:
   spi_beta: 1.0
+  spi_tau: 5.0

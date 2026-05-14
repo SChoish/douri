@@ -1,0 +1,36 @@
+# puzzle-3x3-play-v0, phi recipe, diag_gaussian subgoal estimator.
+# Mirrors config/cube_double_phi_u4_gap20_envgoal_h10_1000.yaml structure with
+# overrides: env=puzzle-3x3, alpha=0.3, horizon=25, plan_candidates=4,
+# action_chunk_horizon (ha)=5, kappa_b=0.9, kappa_d=0.5, spi_tau=5.
+
+env_name: puzzle-3x3-play-v0
+run_group: puzzle_3x3_phi_u4_a03_h25_pc4_ha5_kb90_kd50_tau5
+train_epochs: 1000
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+horizon: 25
+plan_candidates: 4
+subgoal_filter: false
+
+dynamics:
+  max_goal_steps_from_env: true
+  clip_path_to_goal: true
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 4
+  subgoal_value_alpha: 0.3
+  subgoal_value_gap_scale: 20.0
+  subgoal_goal_representation: phi
+
+critic_agent:
+  action_chunk_horizon: 5
+  discount: 0.995
+  kappa_b: 0.9
+  kappa_d: 0.5
+  max_goal_steps_from_env: true
+  clip_chunk_to_goal: true
+  goal_representation: phi
+
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0

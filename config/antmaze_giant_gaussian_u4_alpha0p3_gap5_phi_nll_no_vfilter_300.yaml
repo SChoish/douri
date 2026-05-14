@@ -21,6 +21,7 @@ dynamics:
   subgoal_goal_representation: phi
 
 critic_agent:
+  phi_goal_obs_indices: [0, 1]
   action_chunk_horizon: 5
   discount: 0.995
   goal_representation: phi

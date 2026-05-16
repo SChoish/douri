@@ -1,4 +1,6 @@
-# Same as antmaze_medium_navigate.yaml but goal_rep=full, target=absolute.
+# Same as antmaze_medium_navigate.yaml but goal_rep=full, target=absolute,
+# and dynamics planner_type=forward_bridge_residual (closed-form bridge mean +
+# endpoint-preserving path residual / PathResidualNet).
 
 env_name: antmaze-medium-navigate-v0
 run_group: antmaze_medium_navigate_table_full_abs
@@ -9,6 +11,8 @@ horizon: 25
 plan_candidates: 1
 
 dynamics:
+  planner_type: forward_bridge_residual
+  forward_bridge_path_loss_horizon: 5
   max_goal_steps_from_env: true
   clip_path_to_goal: true
   subgoal_distribution: deterministic

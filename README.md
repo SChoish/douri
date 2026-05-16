@@ -26,6 +26,15 @@ OGBench 기반 오프라인 제어 실험 코드입니다. 메인 경로는 **li
 | `config/` | 실험 YAML |
 | `scripts/` | sweep / eval summary / heatmap 스크립트 |
 
+## JAX · GPU (CUDA 12)
+
+GPU 학습은 **CUDA용 JAX**와 **pip로 깔린 `nvidia-*-cu12` 공유 라이브러리 경로**가 잡혀 있어야 합니다.
+
+1. 환경에서 설치: `pip install -U "jax[cuda12]"` (`requirements.txt`의 `jax[cuda12]`와 동일 계열).
+2. `import jax` 전에 `site-packages/nvidia/*/lib`들이 `LD_LIBRARY_PATH` 앞쪽에 있어야 합니다. 그렇지 않으면 `cuSPARSE`를 못 찾거나 CPU로 폴백할 수 있습니다.
+3. **conda 예시** (`offrl` 등): `$CONDA_PREFIX/etc/conda/activate.d/jax_cuda_ld.sh`에서 위 경로를 붙이고, `deactivate.d/jax_cuda_ld.sh`에서 복원합니다. 스크립트는 **`chmod +x`** 해 두는 것이 안전합니다.
+4. 확인: `conda activate <env>` 후 `python -c "import jax; print(jax.default_backend(), jax.devices())"` → `gpu` / `CudaDevice`가 나와야 합니다.
+
 ## 설정
 
 YAML은 agent default 위에 필요한 override만 적습니다. 기본값은 다음에서 옵니다.

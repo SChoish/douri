@@ -66,6 +66,32 @@ def _block_until_ready(tree: Any) -> Any:
     return jax.tree_util.tree_map(_ready, tree)
 
 
+def _require_gpu_jax(logger: logging.Logger) -> None:
+    """Fail fast if JAX did not pick the CUDA GPU backend (avoids silent CPU training)."""
+    if bool(FLAGS.allow_cpu):
+        logger.warning(
+            'allow_cpu=True: skipping GPU-only check (jax default_backend=%s devices=%s)',
+            jax.default_backend(),
+            jax.devices(),
+        )
+        return
+    backend = str(jax.default_backend()).lower()
+    devs = jax.devices()
+    dev_str = ', '.join(str(d) for d in devs)
+    cuda_vis = os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')
+    jax_plat = os.environ.get('JAX_PLATFORMS', '<unset>')
+    if backend != 'gpu':
+        msg = (
+            f'GPU-only mode: JAX default_backend is {backend!r} (expected "gpu"). devices=[{dev_str}]. '
+            f'CUDA_VISIBLE_DEVICES={cuda_vis!r} JAX_PLATFORMS={jax_plat!r}. '
+            'Install a CUDA-enabled jaxlib matching your driver (e.g. cuSPARSE), confirm `nvidia-smi`, '
+            'or pass --allow_cpu=True for intentional CPU runs.'
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+    logger.info('GPU-only check passed: default_backend=%s device_count=%d', backend, len(devs))
+
+
 flags.DEFINE_string('run_config', '', 'YAML config; empty uses config/antmaze_large_navigate.yaml.')
 flags.DEFINE_string('runs_root', '', 'Run root; default <repo>/runs.')
 flags.DEFINE_string(
@@ -137,6 +163,12 @@ flags.DEFINE_boolean(
     'subgoal_override_goal',
     False,
     'Inference/eval ablation: ignore predicted subgoals and condition IDM/actor directly on the final goal.',
+)
+flags.DEFINE_boolean(
+    'allow_cpu',
+    False,
+    'If True, allow JAX to run on CPU when CUDA is unavailable. Default False: require GPU and exit '
+    'with an error if jax.default_backend() is not gpu (no silent CPU fallback).',
 )
 
 _SPI_ACTOR_KEYS = {
@@ -322,6 +354,8 @@ def _format_epoch_log(metrics: dict[str, float]) -> str:
         ('dyn_roll', 'train/dynamics/phase1/loss_roll_epoch_mean'),
         ('dyn_sub', 'train/dynamics/phase1/loss_subgoal_epoch_mean'),
         ('dyn_idm', 'train/dynamics/phase1/loss_idm_epoch_mean'),
+        ('fb_path', 'train/dynamics/forward_bridge/loss_path_interior_epoch_mean'),
+        ('fb_next', 'train/dynamics/forward_bridge/loss_path_next_epoch_mean'),
         ('critic_chunk', 'train/critic/chunk_critic/critic_loss_epoch_mean'),
         ('critic_distill', 'train/critic/action_critic/distill_loss_epoch_mean'),
         ('critic_value', 'train/critic/action_critic/value_loss_epoch_mean'),
@@ -1059,6 +1093,12 @@ def main(_):
     run_logger.info('log_path=%s', run_log_path)
     if resume_snapshot_path is not None:
         run_logger.info('resume hyperparameters from snapshot file: %s', resume_snapshot_path)
+    # Force PJRT/CUDA initialisation before MuJoCo/EGL environment creation.
+    # In some shells, delaying the first JAX device touch until after env setup
+    # can make cuInit fail and silently fall back to CPU.
+    jax_devices = jax.devices()
+    run_logger.info('jax_backend=%s jax_devices=%s', jax.default_backend(), jax_devices)
+    _require_gpu_jax(run_logger)
 
     env, train_plain, _ = make_env_and_datasets(
         FLAGS.env_name,

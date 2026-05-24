@@ -382,6 +382,36 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     # so downstream consumers (IDM action decoding, rollout/subgoal.py, etc.)
     # can be re-used without changes.
 
+    def _eval_forward_bridge_path_residual(
+        self,
+        mu: jnp.ndarray,
+        anchor: jnp.ndarray,
+        zK: jnp.ndarray,
+        n_idx: jnp.ndarray,
+        *,
+        params=None,
+    ) -> jnp.ndarray:
+        """Evaluate ``residual_net`` at each ``(batch, time)`` bridge mean state.
+
+        ``mu`` is ``[B, T, D]``; ``anchor`` and ``zK`` are ``[B, D]``; ``n_idx`` is
+        ``[B, T]`` integer step indices.
+        """
+
+        def _per_step(mu_t, anchor_b, zK_b, n_t):
+            return self.network.select('residual_net')(
+                mu_t,
+                anchor_b,
+                zK_b,
+                anchor_b,
+                n_t.astype(jnp.float32),
+                params=params,
+            )
+
+        def _per_batch(mu_b, anchor_b, zK_b, n_b):
+            return jax.vmap(_per_step, in_axes=(0, None, None, 0))(mu_b, anchor_b, zK_b, n_b)
+
+        return jax.vmap(_per_batch, in_axes=(0, 0, 0, 0))(mu, anchor, zK, n_idx)
+
     def forward_bridge_coefficients(self, K, *, bridge_gamma_inv: float | None = None):
         """Return ``(a, b, std)`` of shape ``(K + 1,)`` for the linear-SDE forward bridge.
 
@@ -507,12 +537,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         # x_n := forward-bridge mean state at step i, x_T := s_1(anchor),
         # x_0 := delta(zK), n := i.
         n_idx = jnp.broadcast_to(jnp.arange(K + 1, dtype=jnp.int32)[None, :], t_norm.shape)
-        residual = jax.vmap(
-            lambda mu_b, anchor_b, zK_b, n_b: self.network.select('residual_net')(
-                mu_b, anchor_b, zK_b, anchor_b, n_b, params=params,
-            ),
-            in_axes=(0, 0, 0, 0),
-        )(mu, anchor, zK, n_idx)
+        residual = self._eval_forward_bridge_path_residual(mu, anchor, zK, n_idx, params=params)
         path = mu + w[None, :, None] * residual
 
         if sample and float(noise_scale) > 0.0:
@@ -550,12 +575,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 )
             anchor = z0
         n_idx = jnp.broadcast_to(idx[None, :], (z0.shape[0], idx.shape[0]))
-        residual = jax.vmap(
-            lambda mu_b, anchor_b, zK_b, n_b: self.network.select('residual_net')(
-                mu_b, anchor_b, zK_b, anchor_b, n_b, params=params,
-            ),
-            in_axes=(0, 0, 0, 0),
-        )(mu, anchor, zK, n_idx)
+        residual = self._eval_forward_bridge_path_residual(mu, anchor, zK, n_idx, params=params)
         w = idx_f * (float(N) - idx_f) / float(N * N)
         path = mu + w[None, :, None] * residual
         path = jnp.where((idx == 0)[None, :, None], z0[:, None, :], path)

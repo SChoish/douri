@@ -2,7 +2,7 @@
 
 OGBench 기반 오프라인 제어 실험 코드입니다. 메인 경로는 **linear-SDE dynamics + critic + SPI actor**의 동시 학습입니다.
 
-- Dynamics 부분은 GOUB[^goub] 계열의 reverse mean matching을 따와서 시작했지만, 현재는 단일 exact linear-SDE bridge로 정리한 자체 구현입니다. `bridge_gamma_inv: 0.0`이면 hard endpoint bridge입니다. Subgoal은 기본값으로 deterministic point를 쓰며, 실험 YAML에서는 `diag_gaussian` + `subgoal_stochastic_loss: nll` 및 `subgoal_target_mode: displacement` 같은 ablation도 지원합니다.
+- Dynamics 부분은 GOUB[^goub] 계열의 reverse mean matching을 따와서 시작했지만, 현재는 단일 exact linear-SDE bridge로 정리한 자체 구현입니다. `bridge_gamma_inv: 0.0`이면 hard endpoint bridge입니다. 코드 기본값은 기존 run 호환을 위해 absolute deterministic subgoal이지만, `docs/linear_displacement.pdf`에 맞춘 translated displacement chart(`subgoal_target_mode: displacement`)와 `diag_gaussian` subgoal도 지원합니다.
 - Critic 부분은 DQC[^dqc]의 chunk + action critic 구조를 가져와 SPI actor에 맞게 재구성한 것입니다.
 
 [^goub]: Generalized Ornstein-Uhlenbeck Bridge.
@@ -67,9 +67,11 @@ YAML의 `dynamics:` 키 아래에 둡니다. 모든 옵션은 `get_dynamics_conf
 dynamics:
   # 모든 dynamics 키는 default가 잡혀 있어 yaml에 적지 않으면
   # agents/dynamics.get_dynamics_config()의 값이 쓰입니다.
-  # 예시: 새 default와 다른 값만 명시.
-  bridge_gamma_inv: 1.0e-6      # default 0.0 (hard endpoint bridge)
+  # 예시: PDF-aligned diag-Gaussian displacement run.
+  bridge_gamma_inv: 0.0                 # hard endpoint bridge (default)
+  subgoal_target_mode: displacement     # PDF-aligned translated chart
   subgoal_distribution: diag_gaussian   # default deterministic
+  subgoal_stochastic_loss: nll          # default mse; intentional stochastic ablation
 ```
 
 #### Bridge / 스케줄
@@ -89,7 +91,7 @@ dynamics:
 | 키 | 기본 | 설명 |
 |----|------|------|
 | `subgoal_distribution` | `deterministic` | 기본은 point subgoal. 분포 학습 ablation에서는 `diag_gaussian`으로 `(mu, log_std)`를 예측 |
-| `subgoal_stochastic_loss` | `mse` | `diag_gaussian` 학습 loss. `mse`는 PDF Eq. (51)에 가까운 reparameterized sample-MSE, `nll`은 일부 실험에서 의도적으로 쓰는 value-gap-weighted Gaussian NLL |
+| `subgoal_stochastic_loss` | `mse` | `diag_gaussian` 학습 loss. `mse`는 PDF의 value-guided sample regression(Eq. 27/51)에 가까운 reparameterized sample-MSE, `nll`은 일부 실험에서 의도적으로 쓰는 value-gap-weighted Gaussian NLL |
 | `subgoal_target_mode` | `absolute` | `absolute`: raw subgoal output/teacher가 $s_{t+K}$. `displacement`: raw output/teacher가 $\Delta=s_{t+K}-s_t$이고 bridge는 local frame에서 학습/계획 |
 | `subgoal_loss_weight` | `1.0` | subgoal regression/value loss 가중치 |
 | `subgoal_value_alpha` | `0.5` | subgoal loss의 $V(\hat s_{t+K}, g)$ critic value bonus 계수. `0`이면 비활성화 |
@@ -104,9 +106,9 @@ dynamics:
 
 #### Displacement target mode
 
-`subgoal_target_mode: displacement`는 `docs/linear_displacement.pdf`의 translated displacement chart와 맞춘 모드입니다. 내부적으로는 현재 상태를 원점으로 빼서 `z0=0`, `zK=s_{t+K}-s_t`인 bridge/residual chain을 학습하고, subgoal net도 raw `Delta`를 예측합니다. 하지만 public API(`predict_subgoal`, `infer_subgoal_distribution`, `sample_subgoal_candidates`, `plan`, actor proposal 생성)는 항상 absolute state endpoint를 반환/소비합니다. 즉 downstream IDM/critic/actor는 기존처럼 absolute state를 보고, displacement frame은 dynamics 내부 표현으로만 쓰입니다.
+`subgoal_target_mode: displacement`는 `docs/linear_displacement.pdf`의 translated displacement chart와 맞춘 모드입니다. 내부적으로는 현재 상태를 원점으로 빼서 `z0=0`, `zK=s_{t+K}-s_t`인 bridge/residual chain을 학습하고, subgoal net도 raw `Delta`를 예측합니다. Residual network는 PDF의 $M_r(r_i, s_t, \Delta)$처럼 absolute current state `s_t`를 `anchor` 입력으로 함께 받아 translation-invariant correction으로 강제되지 않게 합니다.
 
-Stochastic subgoal의 경우 PDF는 sample-MSE 형태로 쓰여 있지만, 이 저장소는 실험 편의를 위해 `subgoal_stochastic_loss: nll`도 제공합니다. 이 차이는 의도된 구현 차이이며, NLL 모드에서도 value bonus는 reconstructed absolute sample `s_t + Delta`에 대해 계산합니다.
+Public API(`predict_subgoal`, `infer_subgoal_distribution`, `sample_subgoal_candidates`, `plan`, actor proposal 생성)는 항상 absolute state endpoint를 반환/소비합니다. 즉 downstream IDM/critic/actor는 기존처럼 absolute state를 보고, displacement frame은 dynamics 내부 표현으로만 쓰입니다. Stochastic subgoal의 경우 PDF는 sample-MSE 형태로 쓰여 있지만, 이 저장소는 실험 편의를 위해 `subgoal_stochastic_loss: nll`도 제공합니다. 이 차이는 의도된 구현 차이이며, NLL 모드에서도 value bonus는 reconstructed absolute sample `s_t + Delta`에 대해 계산합니다.
 
 #### Planner / model 모드
 
@@ -211,7 +213,7 @@ runs/<YYYYMMDD_HHMMSS>_seed<seed>_<env_name>/
 
 Dynamics agent는 다음 손실을 함께 학습합니다.
 
-- `phase1/loss_dynamics`: reverse mean matching (또는 `forward_bridge*` 모드의 forward bridge mean matching)
+- `phase1/loss_dynamics`: exact bridge posterior mean과 learned residual의 weak bridge-consistency regularizer (`exact_residual_bridge_match_weight`가 기본 `0.0`이므로 주 학습 신호는 path/rollout supervision입니다. `forward_bridge*` 모드에서는 0으로 로깅)
 - `phase1/loss_path_step`: dataset segment와 step-aligned path loss
 - `phase1/loss_roll`: short rollout consistency
 - `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 `subgoal_stochastic_loss=mse`이면 reparameterized sample에 대해 `stopgrad(w(Delta V)) * MSE(sample, target) - alpha * V(sample_abs, g)`를 쓰고, `subgoal_stochastic_loss=nll`이면 `stopgrad(w(Delta V)) * NLL(target | mu, log_std) - alpha * V(sample_abs, g)`를 씁니다. `nll`은 PDF의 stochastic subgoal 식과 다른 의도적 구현 옵션입니다. `subgoal_value_style=exponential`이면 `w(Delta V)=exp(c * (V(target_abs, g) - V(s, g)))`, `expectile`이면 gap이 양수일 때 `subgoal_value_expectile`, 그 외에는 `1-subgoal_value_expectile`

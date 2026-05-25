@@ -30,14 +30,14 @@ from utils.dynamics import (
 from utils.goal_representation import assert_phi_goal_obs_indices, goal_representation, normalize_phi_goal_obs_indices
 
 
-_VALID_PLANNER_TYPES = ('exact_residual_chain', 'forward_bridge', 'forward_bridge_residual')
+_VALID_PLANNER_TYPES = ('forward_bridge_residual',)
 _VALID_FORWARD_BRIDGE_MODES = ('mean', 'sample')
 _VALID_DYNAMICS_MODEL_TYPES = ('exact_residual',)
 
 
 def _planner_type(config) -> str:
     """Return the canonical planner_type string from the agent config."""
-    pt = str(config.get('planner_type', 'exact_residual_chain')).lower()
+    pt = str(config.get('planner_type', 'forward_bridge_residual')).lower()
     if pt not in _VALID_PLANNER_TYPES:
         raise ValueError(
             f'planner_type must be one of {_VALID_PLANNER_TYPES}, got {pt!r}.'
@@ -89,19 +89,7 @@ class SinusoidalEmbedding(nn.Module):
 
 
 class ResidualNet(nn.Module):
-    """Reverse-chain residual network.
-
-    State-time notation:
-        ``r_0 = 0``, ``r_K = Delta = s_{t+K} - s_t``.
-    Reverse-chain implementation notation:
-        ``x_T = r_0`` and ``x_0 = r_K``.
-
-    The dedicated ``anchor`` channel always carries the absolute current
-    state ``s_t``: in ``absolute`` mode this is redundant with ``x_T`` (both
-    equal ``s_t``), in ``displacement`` mode it is the only path through which
-    ``s_t`` reaches the network so the learned correction is *not* forced to
-    be translation-invariant.
-    """
+    """Residual network conditioned on ``(s_1, z_K, i/K)`` (+ sinusoidal time embedding)."""
 
     hidden_dims: Sequence[int]
     state_dim: int
@@ -109,9 +97,9 @@ class ResidualNet(nn.Module):
     layer_norm: bool = True
 
     @nn.compact
-    def __call__(self, x_n, x_T, x_0, anchor, n):
-        t_emb = SinusoidalEmbedding(self.time_embed_dim)(n)
-        inp = jnp.concatenate([x_n, x_T, x_0, anchor, t_emb], axis=-1)
+    def __call__(self, s1, zK, t_norm):
+        t_emb = SinusoidalEmbedding(self.time_embed_dim)(t_norm)
+        inp = jnp.concatenate([s1, zK, t_emb], axis=-1)
         return MLP(
             hidden_dims=(*self.hidden_dims, self.state_dim),
             activate_final=False,
@@ -186,44 +174,6 @@ class DistributionalSubgoalEstimatorNet(nn.Module):
         return mu, log_std
 
 
-class PathResidualNet(nn.Module):
-    """Per-step path residual network for ``forward_bridge_residual`` planner.
-
-    Takes the bridge endpoints ``(z_0, z_K)``, an ``anchor`` state and a
-    normalised time index ``t_norm = i / K`` and outputs a per-step residual
-    ``r_theta(z_0, z_K, anchor, i)`` of shape ``(B, T, state_dim)``.  The agent
-    multiplies this residual by a quadratic schedule ``w_i = i*(K-i)/K^2`` so
-    that ``w_0 = w_K = 0`` and the bridge endpoints are always preserved
-    exactly.
-
-    ``anchor`` always carries the absolute current state ``s_t``: in
-    displacement mode it is the only path through which ``s_t`` reaches the
-    MLP (since ``z_0`` is shifted to ``0``); in absolute mode it is
-    redundant with ``z_0`` (both equal ``s_t``) but is kept for shape stability.
-    """
-
-    hidden_dims: Sequence[int]
-    state_dim: int
-    time_embed_dim: int = 64
-    layer_norm: bool = True
-
-    @nn.compact
-    def __call__(self, z0, zK, anchor, t_norm):
-        # z0, zK, anchor: (B, D);  t_norm: (B, T) with values in [0, 1].
-        t_emb = SinusoidalEmbedding(self.time_embed_dim)(t_norm)  # (B, T, time_embed_dim)
-        z0_b = jnp.broadcast_to(z0[:, None, :], (z0.shape[0], t_norm.shape[1], z0.shape[1]))
-        zK_b = jnp.broadcast_to(zK[:, None, :], (zK.shape[0], t_norm.shape[1], zK.shape[1]))
-        anchor_b = jnp.broadcast_to(
-            anchor[:, None, :], (anchor.shape[0], t_norm.shape[1], anchor.shape[1])
-        )
-        inp = jnp.concatenate([z0_b, zK_b, anchor_b, t_emb], axis=-1)
-        return MLP(
-            hidden_dims=(*self.hidden_dims, self.state_dim),
-            activate_final=False,
-            layer_norm=self.layer_norm,
-        )(inp)
-
-
 def _subgoal_mode(config) -> str:
     return str(config.get('subgoal_distribution', 'deterministic')).lower()
 
@@ -256,6 +206,16 @@ def _subgoal_target_mode(config) -> str:
 def _is_displacement_mode(config) -> bool:
     return _subgoal_target_mode(config) == 'displacement'
 
+def _residual_target_mode(config) -> str:
+    """Target representation for residual/bridge inputs (independent of subgoal mode)."""
+    mode = str(config.get('residual_target_mode', 'absolute')).lower()
+    if mode not in ('absolute', 'displacement'):
+        raise ValueError(
+            "residual_target_mode must be 'absolute' or 'displacement', "
+            f'got {mode!r}.'
+        )
+    return mode
+
 
 def _subgoal_target_mode_id(config) -> float:
     """Scalar id for CSV/W&B logging. 0 = absolute, 1 = displacement."""
@@ -282,13 +242,16 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     def _is_displacement_mode(self) -> bool:
         return _is_displacement_mode(self.config)
 
+    def _is_residual_displacement_mode(self) -> bool:
+        return _residual_target_mode(self.config) == 'displacement'
+
     def _displacement_origin(self, current_state: jnp.ndarray) -> jnp.ndarray:
         """Origin to subtract for the displacement frame.
 
-        Returns ``current_state`` when ``subgoal_target_mode='displacement'``
+        Returns ``current_state`` when ``residual_target_mode='displacement'``
         and a zero tensor otherwise (so callers can unconditionally subtract).
         """
-        if self._is_displacement_mode():
+        if self._is_residual_displacement_mode():
             return jnp.asarray(current_state, dtype=jnp.float32)
         return jnp.zeros_like(jnp.asarray(current_state, dtype=jnp.float32))
 
@@ -326,15 +289,8 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     def _learned_reverse_mean(
         self, x_n, x_T, x_0, n, schedule, goal=None, params=None, anchor=None,
     ):
-        if anchor is None:
-            # Backward-compatible low-level fallback for legacy private calls.
-            # Public planners and training paths pass an explicit anchor; in
-            # displacement mode callers should use ``plan`` / ``sample_plan`` so
-            # the unshifted ``s_t`` is threaded through this channel.
-            anchor = jnp.zeros_like(x_T)
-        eps = self.network.select('residual_net')(
-            x_n, x_T, x_0, anchor, n.astype(jnp.float32), params=params,
-        )
+        t_norm = n.astype(jnp.float32) / jnp.asarray(float(self.config['dynamics_N']), dtype=jnp.float32)
+        eps = self.network.select('residual_net')(x_T, x_0, t_norm, params=params)
         # Exact bridge posterior mean as base transition + learned residual.
         # Valid for all n in {1, ..., N}; no boundary override needed because
         # posterior_moments(...) already handles the terminal step.
@@ -391,11 +347,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     # Forward-bridge planner (closed-form, endpoint-conditioned)
     # ------------------------------------------------------------------
     #
-    # For ``planner_type='exact_residual_chain'`` (default) ``plan()`` /
-    # ``sample_plan()`` take the learned residual reverse chain.  For
-    # ``planner_type='forward_bridge'`` and ``planner_type='forward_bridge_residual'``
-    # they instead branch into the closed-form Gaussian bridge below.  The
-    # convention follows DOURI's state-space *forward* time direction:
+    # Planner is fixed to ``forward_bridge_residual`` and uses the closed-form
+    # Gaussian bridge plus a learned residual correction.  The convention
+    # follows DOURI's state-space *forward* time direction:
     #
     #     z_0 = current state
     #     z_K = subgoal endpoint
@@ -499,7 +453,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         ``z_hat_i = mu_i + w_i * r_theta(z_0, z_K, anchor, i)`` where
         ``mu_i = a_i z_0 + b_i z_K`` is the closed-form bridge mean,
-        ``r_theta`` is :class:`PathResidualNet`, and the quadratic schedule
+        ``r_theta`` is :class:`ResidualNet`, and the quadratic schedule
         ``w_i = i*(K - i)/K^2`` zeros out at the endpoints so ``z_hat_0 = z_0``
         and ``z_hat_K = z_K`` are preserved exactly (modulo the explicit
         endpoint clamp at the end).  ``anchor`` is the absolute current state
@@ -516,10 +470,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         idx = jnp.arange(K + 1, dtype=jnp.float32)
         w = idx * (float(K) - idx) / float(K * K)
-        t_norm = jnp.broadcast_to(idx[None, :] / float(K), (z0.shape[0], K + 1))
 
         if anchor is None:
-            if self._is_displacement_mode():
+            if self._is_residual_displacement_mode():
                 raise ValueError(
                     'forward_bridge_residual_plan in displacement mode requires '
                     'anchor=s_t (the absolute current state).  Use plan() / '
@@ -528,9 +481,15 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             # Absolute mode: ``z0`` already equals the current state ``s_t``,
             # so it is the natural anchor fallback.
             anchor = z0
-        residual = self.network.select('path_residual_net')(
-            z0, zK, anchor, t_norm, params=params,
-        )
+        # Reuse the shared residual_net with inputs R(s_1, z_K, i/K):
+        # z_K is Delta in displacement mode and absolute s_K in absolute mode.
+        t_norm = jnp.broadcast_to(idx[None, :] / float(K), (z0.shape[0], K + 1))
+        residual = jax.vmap(
+            lambda anchor_b, zK_b, t_b: self.network.select('residual_net')(
+                anchor_b, zK_b, t_b, params=params,
+            ),
+            in_axes=(0, 0, 0),
+        )(anchor, zK, t_norm)
         path = mu + w[None, :, None] * residual
 
         if sample and float(noise_scale) > 0.0:
@@ -561,19 +520,19 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         idx = jnp.asarray(indices, dtype=jnp.int32)
         idx_f = idx.astype(jnp.float32)
         mu = a[idx][None, :, None] * z0[:, None, :] + b[idx][None, :, None] * zK[:, None, :]
-        if planner != 'forward_bridge_residual':
-            return mu
-
         if anchor is None:
-            if self._is_displacement_mode():
+            if self._is_residual_displacement_mode():
                 raise ValueError(
                     '_forward_bridge_path_at_indices in displacement mode requires anchor=s_t.'
                 )
             anchor = z0
         t_norm = jnp.broadcast_to(idx_f[None, :] / float(N), (z0.shape[0], idx.shape[0]))
-        residual = self.network.select('path_residual_net')(
-            z0, zK, anchor, t_norm, params=params,
-        )
+        residual = jax.vmap(
+            lambda anchor_b, zK_b, t_b: self.network.select('residual_net')(
+                anchor_b, zK_b, t_b, params=params,
+            ),
+            in_axes=(0, 0, 0),
+        )(anchor, zK, t_norm)
         w = idx_f * (float(N) - idx_f) / float(N * N)
         path = mu + w[None, :, None] * residual
         path = jnp.where((idx == 0)[None, :, None], z0[:, None, :], path)
@@ -662,19 +621,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         origin, z0, zK, anchor = self._shift_to_displacement_frame(current_state, desired_endpoint)
 
-        planner = _planner_type(self.config)
-        if planner == 'forward_bridge':
-            traj_local = self.forward_bridge_plan(
-                z0, zK, sample=False, noise_scale=0.0, num_steps=num_steps,
-            )
-        elif planner == 'forward_bridge_residual':
-            traj_local = self.forward_bridge_residual_plan(
-                z0, zK, sample=False, noise_scale=0.0, num_steps=num_steps, anchor=anchor,
-            )
-        else:
-            traj_local = self._exact_residual_chain_plan(
-                z0, zK, num_steps=num_steps, goal=goal, anchor=anchor,
-            )
+        traj_local = self.forward_bridge_residual_plan(
+            z0, zK, sample=False, noise_scale=0.0, num_steps=num_steps, anchor=anchor,
+        )
 
         traj = traj_local + origin[:, None, :]
         result = {'next_step': traj[:, 1, :], 'trajectory': traj}
@@ -693,23 +642,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         origin, z0, zK, anchor = self._shift_to_displacement_frame(current_state, desired_endpoint)
 
-        planner = _planner_type(self.config)
-        if planner == 'forward_bridge':
-            sample_flag = _forward_bridge_mode(self.config) == 'sample'
-            traj_local = self.forward_bridge_plan(
-                z0, zK, sample=sample_flag, noise_scale=noise_scale,
-                num_steps=num_steps, rng=rng,
-            )
-        elif planner == 'forward_bridge_residual':
-            sample_flag = _forward_bridge_mode(self.config) == 'sample'
-            traj_local = self.forward_bridge_residual_plan(
-                z0, zK, sample=sample_flag, noise_scale=noise_scale,
-                num_steps=num_steps, rng=rng, anchor=anchor,
-            )
-        else:
-            traj_local = self._exact_residual_chain_sample_plan(
-                z0, zK, rng, noise_scale, num_steps=num_steps, goal=goal, anchor=anchor,
-            )
+        sample_flag = _forward_bridge_mode(self.config) == 'sample'
+        traj_local = self.forward_bridge_residual_plan(
+            z0, zK, sample=sample_flag, noise_scale=noise_scale,
+            num_steps=num_steps, rng=rng, anchor=anchor,
+        )
 
         traj = traj_local + origin[:, None, :]
         result = {'next_step': traj[:, 1, :], 'trajectory': traj}
@@ -721,23 +658,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         self, current_state, desired_endpoint, rng, noise_scale: float, num_steps: int | None = None, *, goal=None,
     ):
         origin, z0, zK, anchor = self._shift_to_displacement_frame(current_state, desired_endpoint)
-        planner = _planner_type(self.config)
-        if planner == 'forward_bridge':
-            sample_flag = _forward_bridge_mode(self.config) == 'sample'
-            traj_local = self.forward_bridge_plan(
-                z0, zK, sample=sample_flag, noise_scale=noise_scale,
-                num_steps=num_steps, rng=rng,
-            )
-        elif planner == 'forward_bridge_residual':
-            sample_flag = _forward_bridge_mode(self.config) == 'sample'
-            traj_local = self.forward_bridge_residual_plan(
-                z0, zK, sample=sample_flag, noise_scale=noise_scale,
-                num_steps=num_steps, rng=rng, anchor=anchor,
-            )
-        else:
-            traj_local = self._exact_residual_chain_sample_plan(
-                z0, zK, rng, noise_scale, num_steps=num_steps, goal=goal, anchor=anchor,
-            )
+        sample_flag = _forward_bridge_mode(self.config) == 'sample'
+        traj_local = self.forward_bridge_residual_plan(
+            z0, zK, sample=sample_flag, noise_scale=noise_scale,
+            num_steps=num_steps, rng=rng, anchor=anchor,
+        )
         return traj_local + origin[:, None, :]
 
     @partial(jax.jit, static_argnames=('num_candidates', 'include_mean', 'noise_scale', 'num_steps'))
@@ -967,11 +892,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         obs = jnp.asarray(observations, dtype=jnp.float32)
         goals = jnp.asarray(high_actor_goals, dtype=jnp.float32)
         sub_mode = _subgoal_mode(self.config)
-        planner = _planner_type(self.config)
-        use_full_bridge_prefix = (
-            planner in ('forward_bridge', 'forward_bridge_residual')
-            and int(proposal_horizon) < int(self.config['dynamics_N'])
-        )
+        use_full_bridge_prefix = int(proposal_horizon) < int(self.config['dynamics_N'])
 
         if sub_mode == 'diag_gaussian':
             sub_rng, plan_rng, new_rng = jax.random.split(rng, 3)
@@ -1162,43 +1083,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         dummy_n = jnp.ones((batch_size,), dtype=jnp.float32)
         dummy_next = jnp.zeros_like(ex_observations)
 
-        # ResidualNet signature takes an explicit ``anchor`` input.  Public
-        # training/planning paths pass the absolute current state ``s_t``
-        # (redundant with ``x_T`` in absolute mode, essential context in
-        # displacement mode); the initializer must therefore see the matching
-        # shape.
         network_info = dict(
-            residual_net=(residual_net_def, (dummy_x, dummy_x, dummy_x, dummy_x, dummy_n)),
+            residual_net=(residual_net_def, (dummy_x, dummy_x, dummy_n)),
             subgoal_net=(subgoal_def, (dummy_x, dummy_g)),
             idm_net=(idm_def, (dummy_x, dummy_next)),
         )
-        # Optionally register the forward-bridge residual MLP.  Only created when
-        # ``planner_type == 'forward_bridge_residual'`` so the default exact
-        # residual chain does not allocate path-residual parameters.
-        planner_type = str(config.get('planner_type', 'exact_residual_chain')).lower()
-        if planner_type == 'forward_bridge_residual':
-            residual_hidden = config.get(
-                'path_residual_hidden_dims',
-                config.get('residual_model_hidden_dims', (512, 512, 512)),
-            )
-            if isinstance(residual_hidden, str):
-                residual_hidden = parse_hidden_dims(residual_hidden)
-            else:
-                residual_hidden = tuple(int(x) for x in residual_hidden)
-            residual_def = PathResidualNet(
-                hidden_dims=residual_hidden,
-                state_dim=state_dim,
-                time_embed_dim=int(config['time_embed_dim']),
-                layer_norm=bool(config['layer_norm']),
-            )
-            horizon = int(config['dynamics_N']) + 1
-            dummy_t = jnp.zeros((batch_size, horizon), dtype=jnp.float32)
-            # PathResidualNet signature now also takes an ``anchor`` (B, D)
-            # input.
-            network_info['path_residual_net'] = (
-                residual_def, (dummy_x, dummy_x, dummy_x, dummy_t),
-            )
-
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -1475,9 +1364,7 @@ class DynamicsAgent(_DynamicsAgentCore):
     def _exact_residual_reverse_loss_block(self, batch, grad_params, rng1, rng2):
         """Reverse-chain dynamics + path + rollout losses (shared exact-residual math).
 
-        Used only by ``_total_loss_exact_residual_chain``.  Forward-bridge
-        residual training uses ``PathResidualNet`` instead of this reverse-chain
-        ``ResidualNet`` block.
+        Used only by ``_total_loss_exact_residual_chain``.
         """
         x_T_abs = batch['observations']
         x_0_abs = batch['high_actor_targets']
@@ -1662,17 +1549,11 @@ class DynamicsAgent(_DynamicsAgentCore):
         return loss, info
 
     def _total_loss_forward_bridge(self, batch, grad_params, rng, critic_value_params, planner: str):
-        """Forward-bridge path-supervised loss (planner_type in {forward_bridge,
-        forward_bridge_residual}).
+        """Forward-bridge-residual path-supervised loss.
 
-        - ``forward_bridge``: closed-form bridge mean only; reverse-chain terms
-          are not trained (logged as zero).
-        - ``forward_bridge_residual``: trains only the endpoint-preserving
-          ``PathResidualNet`` on top of the closed-form forward bridge.  It does
-          not train the reverse-chain ``ResidualNet`` because that network is not
-          used by the forward-bridge-residual planner at inference time.
-        - Subgoal + IDM match the exact-residual path (single ``_compute_subgoal_loss``
-          / ``_idm_loss_term`` per step).
+        Trains the endpoint-preserving residual on top of the closed-form
+        forward bridge. Subgoal + IDM match the shared path
+        (single ``_compute_subgoal_loss`` / ``_idm_loss_term`` per step).
         """
         x_T_abs = batch['observations']
         segment_abs = jnp.asarray(batch['trajectory_segment'], dtype=jnp.float32)
@@ -1856,13 +1737,8 @@ class DynamicsAgent(_DynamicsAgentCore):
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None, critic_value_params=None):
         """Path-supervised Phase1 loss; dispatches on ``planner_type``."""
-        planner = _planner_type(self.config)
-        if planner in ('forward_bridge', 'forward_bridge_residual'):
-            return self._total_loss_forward_bridge(
-                batch, grad_params, rng, critic_value_params, planner,
-            )
-        return self._total_loss_exact_residual_chain(
-            batch, grad_params, rng, critic_value_params,
+        return self._total_loss_forward_bridge(
+            batch, grad_params, rng, critic_value_params, 'forward_bridge_residual',
         )
 
 
@@ -1912,6 +1788,10 @@ def _get_common_config():
             #                     from the current state.  External APIs still
             #                     expose absolute states.
             subgoal_target_mode='absolute',
+            # Residual/bridge conditioning frame, separate from subgoal_target_mode:
+            #   - absolute: residual net uses (s_1, s_K, i/K)
+            #   - displacement: residual net uses (s_1, delta, i/K), delta=s_K-s_1
+            residual_target_mode='absolute',
             # NOTE: in the standard `main.py` training path, these two are
             # overwritten in `_prepare_configs` to mirror the critic's
             # `value_hidden_dims` / `layer_norm` so that the borrowed critic
@@ -1943,22 +1823,15 @@ def _get_common_config():
             # and stay" at close goals so subgoal predictions near the goal stay
             # in-distribution and reduces hovering near the goal.
             clip_path_to_goal=True,
-            # Path-supervised planner switch.  Default 'exact_residual_chain'
-            # uses the learned residual reverse chain.  Alternatives:
-            #   'forward_bridge'          : closed-form forward
-            #                               bridge mean (no learned path params).
-            #   'forward_bridge_residual' : bridge mean + endpoint-preserving
-            #                               learned residual (PathResidualNet).
-            planner_type='exact_residual_chain',
+            # Path planner type (fixed to forward_bridge_residual in this codepath).
+            planner_type='forward_bridge_residual',
             forward_bridge_mode='mean',
             forward_bridge_use_path_loss=True,
             # If >0, train forward-bridge path supervision only on the prefix
             # steps 1..H (plus the exact endpoint for diagnostics).  This keeps
-            # PathResidualNet aligned with the actor/IDM chunk horizon without
+            # Residual path supervision aligned with the actor/IDM chunk horizon without
             # evaluating all K bridge states on every update.
             forward_bridge_path_loss_horizon=0,
-            # Hidden dims for the optional PathResidualNet (forward_bridge_residual).
-            path_residual_hidden_dims=(512, 512, 512),
             idm_loss_weight=1.0,
             idm_hidden_dims=(512, 512, 512),
             value_p_curgoal=0.2,

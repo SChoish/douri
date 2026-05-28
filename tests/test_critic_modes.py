@@ -1,4 +1,4 @@
-"""Smoke tests for the two ``critic_type`` modes (DQC and chunk-IQL).
+"""Smoke tests for the ``critic_type`` modes (DQC, chunk-IQL, and TRL).
 
 Run::
 
@@ -12,7 +12,9 @@ Coverage:
 3. ``CriticSequenceDataset`` always emits the new ``action_chunk_*`` fields with
    the expected shapes regardless of mode.
 4. ``clip_chunk_to_goal=True`` terminates Q backups at in-window same-trajectory goals.
-5. ``score_action_chunks`` works in both modes (IQL forces partial critic).
+5. ``critic_type='trl'`` skips chunk modules and trains action/value transitive
+   midpoint targets.
+6. ``score_action_chunks`` works in all modes (IQL/TRL force partial critic).
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 from agents.critic import CriticAgent, get_config as get_critic_config, validate_config
@@ -56,7 +59,7 @@ def _make_critic_config(critic_type: str):
     cfg.batch_size = BATCH
     cfg.frame_stack = None
     cfg.critic_type = critic_type
-    if critic_type == 'iql':
+    if critic_type in ('iql', 'trl'):
         cfg.use_chunk_critic = False
     return cfg
 
@@ -78,8 +81,8 @@ def _build_critic(cfg, ex_batch):
     )
 
 
-def test_dataset_emits_action_chunk_fields_in_both_modes():
-    for critic_type in ('dqc', 'iql'):
+def test_dataset_emits_action_chunk_fields_in_all_modes():
+    for critic_type in ('dqc', 'iql', 'trl'):
         cfg = _make_critic_config(critic_type)
         ds = _critic_dataset_for(cfg)
         batch = ds.sample(BATCH)
@@ -103,6 +106,38 @@ def test_dataset_emits_action_chunk_fields_in_both_modes():
         assert batch['action_chunk_horizon_per_sample'].shape == (BATCH,)
         assert np.all(batch['action_chunk_horizon_per_sample'] >= 0.0)
         assert np.all(batch['action_chunk_horizon_per_sample'] <= float(cfg.action_chunk_horizon))
+
+
+def test_trl_dataset_emits_midpoint_fields():
+    cfg = _make_critic_config('trl')
+    ds = _critic_dataset_for(cfg)
+    batch = ds.sample(BATCH)
+    for key in (
+        'value_offsets',
+        'trl_base_offsets',
+        'trl_base_goals',
+        'trl_split_observations',
+        'trl_split_goals',
+        'trl_split_action_chunk_actions',
+        'trl_split_offsets',
+        'trl_valid_mask',
+    ):
+        assert key in batch, f'TRL missing batch key {key!r}'
+    assert batch['value_offsets'].shape == (BATCH,)
+    assert batch['trl_base_offsets'].shape == (BATCH,)
+    assert batch['trl_base_goals'].shape == (BATCH, STATE_DIM)
+    assert batch['trl_split_observations'].shape == (BATCH, STATE_DIM)
+    assert batch['trl_split_goals'].shape == (BATCH, STATE_DIM)
+    assert batch['trl_split_action_chunk_actions'].shape == (BATCH, cfg.action_chunk_horizon * ACTION_DIM)
+    assert batch['trl_split_offsets'].shape == (BATCH,)
+    assert batch['trl_valid_mask'].shape == (BATCH,)
+    assert np.all(batch['value_offsets'] > 0.0)
+    assert np.all(batch['trl_base_offsets'] >= 1.0)
+    assert np.all(batch['trl_base_offsets'] <= float(cfg.action_chunk_horizon))
+    valid = batch['trl_valid_mask'] > 0.0
+    if np.any(valid):
+        assert np.all(batch['trl_split_offsets'][valid] >= float(cfg.action_chunk_horizon))
+        assert np.all(batch['trl_split_offsets'][valid] < batch['value_offsets'][valid])
 
 
 def test_critic_dataset_clips_backup_to_in_window_goal_by_default():
@@ -190,8 +225,74 @@ def test_iql_skips_chunk_critic_and_runs_one_update_step():
         assert np.isfinite(v), f'IQL {k!r} not finite: {v}'
 
 
-def test_score_action_chunks_works_in_both_modes():
-    for critic_type in ('dqc', 'iql'):
+def test_trl_skips_dqc_chunk_critics_and_runs_direct_chunk_update_step():
+    cfg = _make_critic_config('trl')
+    ds = _critic_dataset_for(cfg)
+    ex_batch = ds.sample(BATCH)
+    critic = _build_critic(cfg, ex_batch)
+    params = critic.network.params
+    for k in ('modules_chunk_critic', 'modules_target_chunk_critic'):
+        assert k not in params, f'TRL should not init {k!r}'
+    for k in ('modules_action_critic', 'modules_target_action_critic', 'modules_value', 'modules_target_value'):
+        assert k in params, f'TRL missing {k!r}'
+    new_critic, info = critic.update(ex_batch)
+    assert float(info['chunk_critic/critic_loss']) == 0.0
+    for k in (
+        'loss/total',
+        'loss/q_base',
+        'loss/q_tri',
+        'loss/v',
+        'q/base_pred_mean',
+        'q/base_target_mean',
+        'q/tri_pred_mean',
+        'q/tri_target_mean',
+        'v/pred_mean',
+        'v/target_mean',
+        'sampler/valid_tri_fraction',
+        'action_critic/trl_loss',
+        'action_critic/value_loss',
+        'action_critic/q_part_mean',
+        'action_critic/target_v_mean',
+    ):
+        v = float(info[k])
+        assert np.isfinite(v), f'TRL {k!r} not finite: {v}'
+
+
+def test_direct_chunk_trl_head_shapes_and_target_gradients():
+    cfg = _make_critic_config('trl')
+    ds = _critic_dataset_for(cfg)
+    ex_batch = ds.sample(BATCH)
+    critic = _build_critic(cfg, ex_batch)
+    q_logits = critic.network.select('action_critic')(
+        jnp.asarray(ex_batch['observations']),
+        jnp.asarray(ex_batch['value_goals']),
+        jnp.asarray(ex_batch['action_chunk_actions']),
+    )
+    v_logits = critic.network.select('value')(
+        jnp.asarray(ex_batch['observations']),
+        jnp.asarray(ex_batch['value_goals']),
+    )
+    assert q_logits.shape == (int(cfg.num_qs), BATCH)
+    assert v_logits.shape == (BATCH,)
+
+    def loss_fn(params):
+        loss, _ = critic.total_loss(ex_batch, params)
+        return loss
+
+    grads = jax.grad(loss_fn)(critic.network.params)
+
+    def _tree_abs_sum(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        return float(sum(np.asarray(jnp.sum(jnp.abs(x))) for x in leaves))
+
+    assert _tree_abs_sum(grads['modules_action_critic']) > 0.0
+    assert _tree_abs_sum(grads['modules_value']) > 0.0
+    assert _tree_abs_sum(grads['modules_target_action_critic']) == 0.0
+    assert _tree_abs_sum(grads['modules_target_value']) == 0.0
+
+
+def test_score_action_chunks_works_in_all_modes():
+    for critic_type in ('dqc', 'iql', 'trl'):
         cfg = _make_critic_config(critic_type)
         ds = _critic_dataset_for(cfg)
         ex_batch = ds.sample(BATCH)
@@ -211,11 +312,12 @@ def test_score_action_chunks_works_in_both_modes():
         assert np.all(np.isfinite(np.asarray(scores))), f'[{critic_type}] non-finite scores'
 
 
-def test_validate_config_iql_forces_use_chunk_critic_off():
-    cfg = _make_critic_config('iql')
-    cfg.use_chunk_critic = True  # user mistake; validate_config should silently force off
-    validate_config(cfg)
-    assert bool(cfg.use_chunk_critic) is False
+def test_validate_config_iql_and_trl_force_use_chunk_critic_off():
+    for critic_type in ('iql', 'trl'):
+        cfg = _make_critic_config(critic_type)
+        cfg.use_chunk_critic = True  # user mistake; validate_config should silently force off
+        validate_config(cfg)
+        assert bool(cfg.use_chunk_critic) is False
 
 
 def test_validate_config_rejects_unknown_critic_type():
@@ -230,12 +332,15 @@ def test_validate_config_rejects_unknown_critic_type():
 
 
 if __name__ == '__main__':
-    test_dataset_emits_action_chunk_fields_in_both_modes()
+    test_dataset_emits_action_chunk_fields_in_all_modes()
+    test_trl_dataset_emits_midpoint_fields()
     test_critic_dataset_clips_backup_to_in_window_goal_by_default()
     test_critic_dataset_can_disable_goal_clipping()
     test_dqc_init_and_one_update_step()
     test_iql_skips_chunk_critic_and_runs_one_update_step()
-    test_score_action_chunks_works_in_both_modes()
-    test_validate_config_iql_forces_use_chunk_critic_off()
+    test_trl_skips_dqc_chunk_critics_and_runs_direct_chunk_update_step()
+    test_direct_chunk_trl_head_shapes_and_target_gradients()
+    test_score_action_chunks_works_in_all_modes()
+    test_validate_config_iql_and_trl_force_use_chunk_critic_off()
     test_validate_config_rejects_unknown_critic_type()
     print('OK')

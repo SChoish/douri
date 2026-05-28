@@ -103,6 +103,13 @@ class CriticSequenceDataset:
     def _build_full_chunk_indices(self, idxs: np.ndarray) -> np.ndarray:
         return idxs[:, None] + self.full_offsets[None, :]
 
+    def _build_action_chunk_indices(self, idxs: np.ndarray) -> np.ndarray:
+        finals = self._lookup_finals(idxs)
+        last_valid = finals - self.action_chunk_horizon
+        if np.any(idxs > last_valid):
+            raise ValueError('Action chunk start crosses episode boundary.')
+        return idxs[:, None] + self.action_offsets[None, :]
+
     def _chunk_backup(
         self,
         idxs: np.ndarray,
@@ -161,6 +168,63 @@ class CriticSequenceDataset:
         goal_idxs = np.where(np.random.rand(batch_size) < p_cur, idxs, goal_idxs)
         return goal_idxs
 
+    def sample_trl_goals(self, idxs):
+        """Sample strictly future same-trajectory goals required by TRL midpoint targets."""
+        final_state_idxs = self._lookup_finals(
+            idxs,
+            max_goal_steps=self.config.get('max_goal_steps', None),
+        )
+        if bool(self.config['value_geom_sample']):
+            offsets = np.random.geometric(p=1 - float(self.config['discount']), size=len(idxs))
+            return np.minimum(idxs + offsets, final_state_idxs).astype(np.int64)
+
+        distances = np.random.rand(len(idxs))
+        return np.round(
+            (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
+        ).astype(np.int64)
+
+    def _sample_direct_chunk_trl_fields(self, idxs: np.ndarray, value_goal_idxs: np.ndarray) -> dict:
+        """Sample in-trajectory base and transitive tuples for direct chunk TRL.
+
+        Split points obey strict chunk commitment: ``k >= i + H``.  If a sample
+        has no valid split, ``trl_valid_mask`` is zero and the tri-Q loss skips it.
+        """
+        batch_size = len(idxs)
+        horizon = int(self.action_chunk_horizon)
+        finals = self._lookup_finals(idxs)
+
+        base_offsets = np.random.randint(1, horizon + 1, size=batch_size).astype(np.int64)
+        base_goal_idxs = idxs + base_offsets
+
+        split_low = idxs + horizon
+        split_high = np.minimum(value_goal_idxs - 1, finals - horizon)
+        tri_valid = (value_goal_idxs - idxs > horizon) & (split_high >= split_low)
+        split_idxs = np.where(
+            tri_valid,
+            np.asarray(
+                [
+                    np.random.randint(int(lo), int(hi) + 1) if valid else int(lo)
+                    for lo, hi, valid in zip(split_low, split_high, tri_valid)
+                ],
+                dtype=np.int64,
+            ),
+            split_low,
+        )
+        split_idxs = np.minimum(split_idxs, finals - horizon)
+
+        split_chunk_idx = self._build_action_chunk_indices(split_idxs)
+        split_action_chunks = np.asarray(self.dataset['actions'][split_chunk_idx], dtype=np.float32)
+
+        return {
+            'trl_base_offsets': base_offsets.astype(np.float32),
+            'trl_base_goals': np.asarray(self.get_observations(base_goal_idxs), dtype=np.float32),
+            'trl_split_observations': np.asarray(self.get_observations(split_idxs), dtype=np.float32),
+            'trl_split_goals': np.asarray(self.get_observations(split_idxs), dtype=np.float32),
+            'trl_split_action_chunk_actions': split_action_chunks.reshape(split_action_chunks.shape[0], -1),
+            'trl_split_offsets': (split_idxs - idxs).astype(np.float32),
+            'trl_valid_mask': tri_valid.astype(np.float32),
+        }
+
     def augment(self, batch: dict, keys: list[str]) -> None:
         p_aug = self.config.get('p_aug')
         if not p_aug or float(p_aug) <= 0:
@@ -189,7 +253,11 @@ class CriticSequenceDataset:
         full_chunk_actions = full_chunk_actions_3d.reshape(full_chunk_actions_3d.shape[0], -1)
         action_chunk_actions = action_chunk_actions_3d.reshape(action_chunk_actions_3d.shape[0], -1)
 
-        value_goal_idxs = self.sample_goals(idxs)
+        critic_type = str(self.config.get('critic_type', 'dqc')).lower()
+        is_trl = critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl') or str(
+            self.config.get('algorithm', '')
+        ).lower() in ('chunk_trl', 'direct_chunk_trl', 'transitivechunkrl')
+        value_goal_idxs = self.sample_trl_goals(idxs) if is_trl else self.sample_goals(idxs)
         value_goals = np.asarray(self.get_observations(value_goal_idxs), dtype=np.float32)
         full_chunk_rewards, full_chunk_next_observations, full_chunk_horizon, full_chunk_masks = (
             self._chunk_backup(
@@ -230,15 +298,24 @@ class CriticSequenceDataset:
             'valids': valids,
         }
 
-        if not evaluation:
-            self.augment(
-                batch,
-                [
-                    'observations',
-                    'next_observations',
-                    'value_goals',
-                    'full_chunk_next_observations',
-                    'action_chunk_next_observations',
-                ],
+        if is_trl:
+            trl_fields = self._sample_direct_chunk_trl_fields(idxs, value_goal_idxs)
+            batch.update(
+                {
+                    'value_offsets': (value_goal_idxs - idxs).astype(np.float32),
+                    **trl_fields,
+                }
             )
+
+        if not evaluation:
+            aug_keys = [
+                'observations',
+                'next_observations',
+                'value_goals',
+                'full_chunk_next_observations',
+                'action_chunk_next_observations',
+            ]
+            if is_trl:
+                aug_keys.extend(['trl_base_goals', 'trl_split_observations', 'trl_split_goals'])
+            self.augment(batch, aug_keys)
         return batch

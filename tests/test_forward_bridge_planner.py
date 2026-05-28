@@ -48,6 +48,28 @@ def _make_agent(planner_type: str = 'forward_bridge_residual'):
     return DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
 
 
+def _make_state_norm_agent(*, subgoal_mode='absolute', residual_mode='absolute', path_loss_normalized=True):
+    cfg = get_dynamics_config()
+    cfg.dynamics_N = 4
+    cfg.subgoal_steps = 4
+    cfg.rollout_horizon = 2
+    cfg.residual_model_hidden_dims = (32, 32)
+    cfg.subgoal_hidden_dims = (32, 32)
+    cfg.subgoal_value_hidden_dims = (32, 32)
+    cfg.idm_hidden_dims = (32, 32)
+    cfg.path_residual_hidden_dims = (32, 32)
+    cfg.subgoal_goal_representation = 'full'
+    cfg.subgoal_target_mode = subgoal_mode
+    cfg.residual_target_mode = residual_mode
+    cfg.state_normalization = True
+    cfg.state_mean = (1.0, -2.0, 0.5, 3.0)
+    cfg.state_std = (2.0, 0.5, 4.0, 1.5)
+    cfg.path_loss_normalized = path_loss_normalized
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
+    return DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
+
+
 def _make_batch(K: int):
     rng = np.random.default_rng(0)
     obs = rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32)
@@ -214,6 +236,190 @@ def test_forward_bridge_total_loss_finite():
     assert float(info['forward_bridge/endpoint_end_mse']) < 1e-10
 
 
+def test_forward_bridge_without_time_embedding_update_finite():
+    cfg = get_dynamics_config()
+    cfg.dynamics_N = 4
+    cfg.subgoal_steps = 4
+    cfg.rollout_horizon = 2
+    cfg.residual_model_hidden_dims = (32, 32)
+    cfg.subgoal_hidden_dims = (32, 32)
+    cfg.subgoal_value_hidden_dims = (32, 32)
+    cfg.idm_hidden_dims = (32, 32)
+    cfg.path_residual_hidden_dims = (32, 32)
+    cfg.subgoal_goal_representation = 'full'
+    cfg.use_time_embedding = False
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
+    agent = DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
+    _, info = agent.update(_make_batch(int(agent.config['dynamics_N'])))
+    assert np.isfinite(float(info['phase1/loss']))
+    assert float(info['dynamics/use_time_embedding']) == 0.0
+
+
+def test_state_normalization_requires_full_dataset_stats():
+    cfg = get_dynamics_config()
+    cfg.dynamics_N = 4
+    cfg.subgoal_steps = 4
+    cfg.subgoal_goal_representation = 'full'
+    cfg.state_normalization = True
+    cfg.state_mean = ()
+    cfg.state_std = ()
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
+    try:
+        DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
+    except ValueError as e:
+        assert 'state_mean/state_std' in str(e)
+        return
+    raise AssertionError('state_normalization=True must require full-dataset stats')
+
+
+def test_abs_and_delta_normalization_round_trips():
+    agent = _make_state_norm_agent()
+    x_abs = jnp.asarray([[2.0, 10.0, 4.5, 6.0]], dtype=jnp.float32)
+    d_abs = jnp.asarray([[4.0, 9.0, 8.0, 3.0]], dtype=jnp.float32)
+    np.testing.assert_allclose(
+        np.asarray(agent._denormalize_abs_state(agent._normalize_abs_state(x_abs))),
+        np.asarray(x_abs),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(agent._denormalize_delta_state(agent._normalize_delta_state(d_abs))),
+        np.asarray(d_abs),
+        atol=1e-6,
+    )
+
+
+def test_subgoal_abs_from_raw_state_normalized_modes():
+    obs = jnp.asarray([[1.5, -1.0, 2.5, 4.0]], dtype=jnp.float32)
+    target_abs = jnp.asarray([[3.0, 2.0, 6.5, 7.0]], dtype=jnp.float32)
+
+    agent_abs = _make_state_norm_agent(subgoal_mode='absolute')
+    raw_abs = agent_abs._normalize_abs_state(target_abs)
+    np.testing.assert_allclose(
+        np.asarray(agent_abs._subgoal_abs_from_raw(obs, raw_abs)),
+        np.asarray(target_abs),
+        atol=1e-6,
+    )
+
+    agent_disp = _make_state_norm_agent(subgoal_mode='displacement')
+    raw_delta = agent_disp._normalize_delta_state(target_abs - obs)
+    np.testing.assert_allclose(
+        np.asarray(agent_disp._subgoal_abs_from_raw(obs, raw_delta)),
+        np.asarray(target_abs),
+        atol=1e-6,
+    )
+
+
+def test_sample_subgoal_candidates_include_mean_state_normalized_modes():
+    obs = jnp.asarray(np.random.RandomState(11).randn(BATCH, STATE_DIM).astype(np.float32))
+    goals = jnp.asarray(np.random.RandomState(12).randn(BATCH, STATE_DIM).astype(np.float32))
+    for subgoal_mode in ('absolute', 'displacement'):
+        agent = _make_state_norm_agent(subgoal_mode=subgoal_mode)
+        candidates, mu = agent.sample_subgoal_candidates(
+            obs,
+            goals,
+            jax.random.PRNGKey(13),
+            num_candidates=3,
+            include_mean=True,
+        )
+        assert candidates.shape == (BATCH, 3, STATE_DIM)
+        assert mu.shape == (BATCH, STATE_DIM)
+        np.testing.assert_allclose(np.asarray(candidates[:, 0, :]), np.asarray(mu), atol=1e-5)
+        # External contract: returned endpoints are env-scale absolute states.
+        assert np.max(np.abs(np.asarray(mu))) < 100.0
+
+
+def test_idm_inference_uses_normalized_absolute_states():
+    agent = _make_state_norm_agent()
+
+    class RecordingNetwork:
+        def __init__(self):
+            self.prev = None
+            self.next = None
+
+        def select(self, name):
+            assert name == 'idm_net'
+
+            def _call(prev, next_):
+                self.prev = prev
+                self.next = next_
+                return jnp.zeros((prev.shape[0], ACTION_DIM), dtype=jnp.float32)
+
+            return _call
+
+    fake_network = RecordingNetwork()
+    agent = agent.replace(network=fake_network)
+    traj = jnp.asarray(np.random.RandomState(16).randn(BATCH, 3, STATE_DIM).astype(np.float32))
+    _ = agent._idm_actions_from_trajectories(traj, horizon=2)
+    flat_prev = traj[:, :2, :].reshape(-1, STATE_DIM)
+    flat_next = traj[:, 1:3, :].reshape(-1, STATE_DIM)
+    np.testing.assert_allclose(np.asarray(fake_network.prev), np.asarray(agent._normalize_abs_state(flat_prev)))
+    np.testing.assert_allclose(np.asarray(fake_network.next), np.asarray(agent._normalize_abs_state(flat_next)))
+
+
+def test_state_normalization_preserves_external_planner_endpoints():
+    cfg = get_dynamics_config()
+    cfg.dynamics_N = 4
+    cfg.subgoal_steps = 4
+    cfg.rollout_horizon = 2
+    cfg.residual_model_hidden_dims = (32, 32)
+    cfg.subgoal_hidden_dims = (32, 32)
+    cfg.subgoal_value_hidden_dims = (32, 32)
+    cfg.idm_hidden_dims = (32, 32)
+    cfg.path_residual_hidden_dims = (32, 32)
+    cfg.subgoal_goal_representation = 'full'
+    cfg.state_normalization = True
+    cfg.state_mean = (1.0, -2.0, 0.5, 3.0)
+    cfg.state_std = (2.0, 0.5, 4.0, 1.5)
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    ex_act = np.zeros((BATCH, ACTION_DIM), dtype=np.float32)
+    agent = DynamicsAgent.create(seed=0, ex_observations=ex_obs, ex_actions=ex_act, config=cfg)
+
+    obs = jnp.asarray(np.random.RandomState(7).randn(BATCH, STATE_DIM).astype(np.float32))
+    goal = jnp.asarray(np.random.RandomState(8).randn(BATCH, STATE_DIM).astype(np.float32))
+    out = agent.plan(obs, goal)
+    traj = np.asarray(out['trajectory'])
+    np.testing.assert_allclose(traj[:, 0], np.asarray(obs), atol=1e-5)
+    np.testing.assert_allclose(traj[:, -1], np.asarray(goal), atol=1e-5)
+
+    _, info = agent.update(_make_batch(int(agent.config['dynamics_N'])))
+    assert np.isfinite(float(info['phase1/loss']))
+    assert float(info['dynamics/state_normalization']) == 1.0
+    assert float(info['dynamics/path_loss_normalized']) == 1.0
+    assert 'forward_bridge/path_mse_raw' in info
+    assert 'forward_bridge/path_mse_norm' in info
+
+
+def test_state_normalized_plan_contract_in_residual_modes():
+    obs = jnp.asarray(np.random.RandomState(14).randn(BATCH, STATE_DIM).astype(np.float32))
+    goal = jnp.asarray(np.random.RandomState(15).randn(BATCH, STATE_DIM).astype(np.float32))
+    for residual_mode in ('absolute', 'displacement'):
+        agent = _make_state_norm_agent(residual_mode=residual_mode)
+        traj = np.asarray(agent.plan(obs, goal)['trajectory'])
+        np.testing.assert_allclose(traj[:, 0], np.asarray(obs), atol=1e-5)
+        np.testing.assert_allclose(traj[:, -1], np.asarray(goal), atol=1e-5)
+
+
+def test_path_loss_normalized_flag_controls_loss_frame():
+    batch = _make_batch(4)
+    agent_norm = _make_state_norm_agent(path_loss_normalized=True)
+    _, info_norm = agent_norm.update(batch)
+    np.testing.assert_allclose(
+        float(info_norm['forward_bridge/loss_path_next']),
+        float(info_norm['forward_bridge/first_step_l1_fb_path_norm']),
+        rtol=1e-5,
+    )
+
+    agent_raw = _make_state_norm_agent(path_loss_normalized=False)
+    _, info_raw = agent_raw.update(batch)
+    np.testing.assert_allclose(
+        float(info_raw['forward_bridge/loss_path_next']),
+        float(info_raw['forward_bridge/first_step_l1_fb_path_raw']),
+        rtol=1e-5,
+    )
+
+
 if __name__ == '__main__':
     test_forward_bridge_coefficients_endpoints()
     test_forward_bridge_coefficients_use_bridge_gamma_inv()
@@ -221,4 +427,13 @@ if __name__ == '__main__':
     test_agent_forward_bridge_uses_configured_bridge_gamma_inv()
     test_forward_bridge_planner_dispatch()
     test_forward_bridge_total_loss_finite()
+    test_forward_bridge_without_time_embedding_update_finite()
+    test_state_normalization_requires_full_dataset_stats()
+    test_abs_and_delta_normalization_round_trips()
+    test_subgoal_abs_from_raw_state_normalized_modes()
+    test_sample_subgoal_candidates_include_mean_state_normalized_modes()
+    test_idm_inference_uses_normalized_absolute_states()
+    test_state_normalization_preserves_external_planner_endpoints()
+    test_state_normalized_plan_contract_in_residual_modes()
+    test_path_loss_normalized_flag_controls_loss_frame()
     print('OK: all forward_bridge planner smoke tests passed.')

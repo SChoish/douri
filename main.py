@@ -291,6 +291,29 @@ def _update_config(config: Any, updates: dict) -> Any:
     return config
 
 
+def compute_state_normalization_stats(dataset: dict, eps: float = 1e-6) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Compute state-normalization stats from the full offline training dataset."""
+    obs = np.asarray(dataset['observations'], dtype=np.float32)
+    if obs.ndim != 2:
+        raise ValueError(f'state_normalization expects 2D observations, got shape={obs.shape}.')
+    mean = obs.mean(axis=0)
+    std = np.maximum(obs.std(axis=0), float(eps))
+    return tuple(float(x) for x in mean), tuple(float(x) for x in std)
+
+
+def _attach_state_normalization_stats(dynamics_config: Any, train_plain: dict) -> None:
+    """Populate dynamics state-normalization stats from the full offline train set."""
+    if not bool(dynamics_config.get('state_normalization', False)):
+        return
+    obs = np.asarray(train_plain['observations'], dtype=np.float32)
+    if obs.ndim != 2:
+        raise ValueError(f'state_normalization expects 2D observations, got shape={obs.shape}.')
+    eps = float(dynamics_config.get('state_normalization_eps', 1e-6))
+    mean, std = compute_state_normalization_stats(train_plain, eps)
+    dynamics_config['state_mean'] = mean
+    dynamics_config['state_std'] = std
+
+
 def _accumulate_metric_sums(metric_sums: dict, info: dict | None) -> None:
     """Accumulate scalars *on device*; ``float()`` is deferred to log-emit time.
 
@@ -1106,6 +1129,7 @@ def main(_):
         dataset_dir=FLAGS.dataset_dir,
         render_mode='rgb_array',
     )
+    _attach_state_normalization_stats(dynamics_config, train_plain)
     obs_dim_env = int(np.prod(env.observation_space.shape))
     phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
     if not phi_idxs:

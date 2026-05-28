@@ -26,6 +26,21 @@ def _safe_logit(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     return jnp.log(x) - jnp.log1p(-x)
 
 
+def _expectile_loss(diff: jnp.ndarray, tau: float) -> jnp.ndarray:
+    weight = jnp.where(diff > 0.0, float(tau), 1.0 - float(tau))
+    return weight * jnp.square(diff)
+
+
+def _is_direct_chunk_trl_type(critic_type: str, algorithm: str = '') -> bool:
+    critic_type = str(critic_type).lower()
+    algorithm = str(algorithm).lower()
+    return critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl') or algorithm in (
+        'chunk_trl',
+        'direct_chunk_trl',
+        'transitivechunkrl',
+    )
+
+
 class ScalarValueNet(nn.Module):
     hidden_dims: Sequence[int]
     layer_norm: bool = True
@@ -100,11 +115,17 @@ class CriticAgent(flax.struct.PyTreeNode):
     def _critic_type(self) -> str:
         return str(self.config.get('critic_type', 'dqc')).lower()
 
+    def _is_direct_chunk_trl(self) -> bool:
+        return _is_direct_chunk_trl_type(
+            self._critic_type(),
+            str(self.config.get('algorithm', '')),
+        )
+
     def _has_chunk_critic(self) -> bool:
         """True iff ``critic_type='dqc'`` and ``use_chunk_critic`` is enabled.
 
-        IQL mode never instantiates the chunk critic, so any code path gated on this
-        flag must be skipped to avoid touching missing modules.
+        IQL/direct chunk TRL modes never instantiate the separate DQC
+        chunk_critic, so gated paths must skip missing modules.
         """
         return self._critic_type() == 'dqc' and bool(self.config.get('use_chunk_critic', False))
 
@@ -232,6 +253,95 @@ class CriticAgent(flax.struct.PyTreeNode):
             'action_critic/v_min': v.min(),
         }
 
+    def direct_chunk_trl_loss(self, batch: dict, grad_params: dict) -> tuple[jnp.ndarray, dict]:
+        """Direct chunk-level TRL.
+
+        ``action_critic`` is the primary ``Q_H(s, A_H, g)`` head.  ``value`` is
+        only an in-sample expectile readout of the target chunk Q.
+        """
+        valid_mask = self._valid_mask(batch)
+        eps = float(self.config.get('q_value_eps', 1e-6))
+        discount = float(self.config['discount'])
+        tau_q = float(self.config.get('tau_q', 0.7))
+        tau_v = float(self.config.get('tau_v', 0.9))
+        lambda_q_base = float(self.config.get('lambda_q_base', 1.0))
+        lambda_q_tri = float(self.config.get('lambda_q_tri', 1.0))
+        lambda_v = float(self.config.get('lambda_v', 1.0))
+        use_v_in_q_target = bool(self.config.get('use_v_in_q_target', False))
+
+        goals = batch['value_goals']
+        actions = batch['action_chunk_actions']
+        split_obs = batch['trl_split_observations']
+        split_goals = batch['trl_split_goals']
+        split_actions = batch['trl_split_action_chunk_actions']
+
+        q_base_logits = self.network.select('action_critic')(
+            batch['observations'], batch['trl_base_goals'], actions, params=grad_params,
+        )
+        q_base = jnp.clip(jax.nn.sigmoid(q_base_logits), eps, 1.0)
+        base_target = jnp.power(discount, jnp.asarray(batch['trl_base_offsets'], dtype=jnp.float32))
+        loss_q_base_per = jnp.mean(jnp.square(q_base - base_target[None, :]), axis=0)
+        loss_q_base = self._weighted_mean(loss_q_base_per, valid_mask)
+
+        q_tri_logits = self.network.select('action_critic')(
+            batch['observations'], goals, actions, params=grad_params,
+        )
+        q_tri = jnp.clip(jax.nn.sigmoid(q_tri_logits), eps, 1.0)
+        q_left_logits = self.network.select('target_action_critic')(
+            batch['observations'], split_goals, actions,
+        )
+        q_left = jnp.clip(jax.nn.sigmoid(q_left_logits), eps, 1.0)
+        if use_v_in_q_target:
+            v_right_logits = self.network.select('target_value')(split_obs, goals)
+            q_right = jnp.clip(jax.nn.sigmoid(v_right_logits)[None, :], eps, 1.0)
+        else:
+            q_right_logits = self.network.select('target_action_critic')(
+                split_obs, goals, split_actions,
+            )
+            q_right = jnp.clip(jax.nn.sigmoid(q_right_logits), eps, 1.0)
+        target_q_tri = jnp.clip(jax.lax.stop_gradient(q_left * q_right), eps, 1.0)
+        tri_valid = jnp.asarray(batch['trl_valid_mask'], dtype=jnp.float32) * valid_mask
+        loss_q_tri_per = jnp.mean(_expectile_loss(target_q_tri - q_tri, tau_q), axis=0)
+        loss_q_tri = self._weighted_mean(loss_q_tri_per, tri_valid)
+
+        v_logit = self.network.select('value')(batch['observations'], goals, params=grad_params)
+        v = jnp.clip(jax.nn.sigmoid(v_logit), eps, 1.0)
+        target_v_logits = self.network.select('target_action_critic')(
+            batch['observations'], goals, actions,
+        )
+        target_v = self.aggregate_ensemble_q(jnp.clip(jax.nn.sigmoid(target_v_logits), eps, 1.0))
+        target_v = jax.lax.stop_gradient(target_v)
+        loss_v_per = _expectile_loss(target_v - v, tau_v)
+        loss_v = self._weighted_mean(loss_v_per, valid_mask)
+
+        total = lambda_q_base * loss_q_base + lambda_q_tri * loss_q_tri + lambda_v * loss_v
+        q_base_agg = self.aggregate_ensemble_q(q_base)
+        q_tri_agg = self.aggregate_ensemble_q(q_tri)
+        target_tri_agg = self.aggregate_ensemble_q(target_q_tri)
+        return total, {
+            'loss/total': total,
+            'loss/q_base': loss_q_base,
+            'loss/q_tri': loss_q_tri,
+            'loss/v': loss_v,
+            'q/base_pred_mean': q_base_agg.mean(),
+            'q/base_target_mean': base_target.mean(),
+            'q/tri_pred_mean': q_tri_agg.mean(),
+            'q/tri_target_mean': target_tri_agg.mean(),
+            'v/pred_mean': v.mean(),
+            'v/target_mean': target_v.mean(),
+            'sampler/valid_tri_fraction': jnp.mean(jnp.asarray(batch['trl_valid_mask'], dtype=jnp.float32)),
+            # Backward-compatible keys used by existing logging/extraction paths.
+            'action_critic/trl_loss': total,
+            'action_critic/distill_loss': loss_q_tri,
+            'action_critic/value_loss': loss_v,
+            'action_critic/q_part_mean': q_tri_agg.mean(),
+            'action_critic/target_v_mean': target_tri_agg.mean(),
+            'action_critic/adv': (target_v - v).mean(),
+            'action_critic/v_mean': v.mean(),
+            'action_critic/v_max': v.max(),
+            'action_critic/v_min': v.min(),
+        }
+
     def _flatten_action_candidates(self, action_chunk_actions: jnp.ndarray) -> tuple[jnp.ndarray, int]:
         actions = jnp.asarray(action_chunk_actions, dtype=jnp.float32)
         if actions.ndim == 4:
@@ -279,7 +389,7 @@ class CriticAgent(flax.struct.PyTreeNode):
         full_dim = int(self.config['full_chunk_horizon']) * int(self.config['action_dim'])
         critic_type = self._critic_type()
         if use_partial_critic is None:
-            if critic_type == 'iql':
+            if critic_type == 'iql' or self._is_direct_chunk_trl():
                 use_partial_critic = True
             elif flat_actions.shape[-1] == partial_dim and partial_dim != full_dim:
                 use_partial_critic = True
@@ -288,8 +398,8 @@ class CriticAgent(flax.struct.PyTreeNode):
             else:
                 use_partial_critic = True
 
-        # IQL: never call chunk_critic (module not initialized).
-        force_partial = (critic_type == 'iql')
+        # IQL/direct chunk TRL: never call DQC chunk_critic (module not initialized).
+        force_partial = critic_type == 'iql' or self._is_direct_chunk_trl()
         if force_partial or bool(use_partial_critic) or not bool(self.config['use_chunk_critic']):
             logits = self.network.select('action_critic')(obs_rep, goal_rep, flat_actions, params=network_params)
         else:
@@ -302,6 +412,12 @@ class CriticAgent(flax.struct.PyTreeNode):
         batch = jax.tree_util.tree_map(lambda x: jnp.asarray(x), batch)
         info = {}
         total = jnp.asarray(0.0, dtype=jnp.float32)
+        if self._is_direct_chunk_trl():
+            tl, ti = self.direct_chunk_trl_loss(batch, grad_params)
+            info['chunk_critic/critic_loss'] = jnp.asarray(0.0, dtype=jnp.float32)
+            info.update(ti)
+            info['total_loss'] = tl
+            return tl, info
         if self._has_chunk_critic():
             cl, ci = self.chunk_critic_loss(batch, grad_params)
             total = total + cl
@@ -317,7 +433,7 @@ class CriticAgent(flax.struct.PyTreeNode):
         return total, info
 
     def _ema_target_critics(self, network: TrainState, tau: float) -> TrainState:
-        """EMA-update target critics. Skips ``target_chunk_critic`` when not initialized (IQL)."""
+        """EMA-update target critics. Skips ``target_chunk_critic`` when not initialized."""
         updated = dict(network.params)
         if self._has_chunk_critic():
             updated['modules_target_chunk_critic'] = jax.tree_util.tree_map(
@@ -330,6 +446,12 @@ class CriticAgent(flax.struct.PyTreeNode):
             updated['modules_action_critic'],
             updated['modules_target_action_critic'],
         )
+        if self._is_direct_chunk_trl():
+            updated['modules_target_value'] = jax.tree_util.tree_map(
+                lambda p, tp: p * tau + tp * (1.0 - tau),
+                updated['modules_value'],
+                updated['modules_target_value'],
+            )
         return network.replace(params=updated)
 
     @jax.jit
@@ -340,7 +462,10 @@ class CriticAgent(flax.struct.PyTreeNode):
             return self.total_loss(batch, params, rng=loss_rng)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        new_network = self._ema_target_critics(new_network, float(self.config['tau']))
+        new_network = self._ema_target_critics(
+            new_network,
+            float(self.config.get('target_tau', self.config['tau'])),
+        )
         return self.replace(rng=new_rng, network=new_network), info
 
     @classmethod
@@ -373,8 +498,13 @@ class CriticAgent(flax.struct.PyTreeNode):
             env_name=env_name,
         )
         critic_type = str(config.get('critic_type', 'dqc')).lower()
-        if critic_type not in ('dqc', 'iql'):
-            raise ValueError(f"critic_type must be 'dqc' or 'iql', got {critic_type!r}")
+        algorithm = str(config.get('algorithm', '')).lower()
+        if critic_type not in ('dqc', 'iql', 'trl', 'chunk_trl', 'direct_chunk_trl'):
+            raise ValueError(
+                f"critic_type must be one of 'dqc', 'iql', 'trl', 'chunk_trl', or "
+                f"'direct_chunk_trl', got {critic_type!r}"
+            )
+        is_trl = _is_direct_chunk_trl_type(critic_type, algorithm)
 
         value_def = ScalarValueNet(
             hdims,
@@ -393,8 +523,19 @@ class CriticAgent(flax.struct.PyTreeNode):
         network_info = {
             'action_critic': (action_critic_def, (ex_obs, ex_goal, ex_part)),
             'target_action_critic': (target_action_critic_def, (ex_obs, ex_goal, ex_part)),
-            'value': (value_def, (ex_obs, ex_goal)),
         }
+        if not is_trl:
+            network_info['value'] = (value_def, (ex_obs, ex_goal))
+        else:
+            target_value_def = ScalarValueNet(
+                hdims,
+                layer_norm=ln,
+                goal_representation=goal_rep,
+                phi_goal_obs_indices=phi_idxs,
+                env_name=env_name,
+            )
+            network_info['value'] = (value_def, (ex_obs, ex_goal))
+            network_info['target_value'] = (target_value_def, (ex_obs, ex_goal))
 
         if critic_type == 'dqc':
             if ex_full_chunk_actions is None:
@@ -418,6 +559,8 @@ class CriticAgent(flax.struct.PyTreeNode):
         if critic_type == 'dqc':
             network_params['modules_target_chunk_critic'] = network_params['modules_chunk_critic']
         network_params['modules_target_action_critic'] = network_params['modules_action_critic']
+        if is_trl:
+            network_params['modules_target_value'] = network_params['modules_value']
         network = TrainState.create(network_def, network_params, tx=optax.adam(float(config['lr'])))
         cfg_out = dict(config)
         cfg_out['phi_goal_obs_indices'] = phi_idxs
@@ -426,9 +569,17 @@ class CriticAgent(flax.struct.PyTreeNode):
 
 def validate_config(critic_config, actor_config=None) -> None:
     critic_type = str(critic_config.get('critic_type', 'dqc')).lower()
-    if critic_type not in ('dqc', 'iql'):
-        raise ValueError(f"critic_type must be 'dqc' or 'iql', got {critic_type!r}")
+    algorithm = str(critic_config.get('algorithm', '')).lower()
+    if algorithm in ('chunk_trl', 'direct_chunk_trl', 'transitivechunkrl'):
+        critic_type = 'direct_chunk_trl'
+    if critic_type not in ('dqc', 'iql', 'trl', 'chunk_trl', 'direct_chunk_trl'):
+        raise ValueError(
+            f"critic_type must be one of 'dqc', 'iql', 'trl', 'chunk_trl', or "
+            f"'direct_chunk_trl', got {critic_type!r}"
+        )
     critic_config['critic_type'] = critic_type
+    if _is_direct_chunk_trl_type(critic_type, algorithm):
+        critic_config['algorithm'] = 'direct_chunk_trl'
 
     action_chunk_horizon = int(critic_config.get('action_chunk_horizon', 0))
     full_chunk_horizon = int(critic_config.get('full_chunk_horizon', 0))
@@ -439,8 +590,10 @@ def validate_config(critic_config, actor_config=None) -> None:
             f'full_chunk_horizon must be >= action_chunk_horizon, '
             f'got full_chunk_horizon={full_chunk_horizon}, action_chunk_horizon={action_chunk_horizon}.'
         )
-    if critic_type == 'iql' and bool(critic_config.get('use_chunk_critic', False)):
-        # IQL never trains chunk_critic; force the flag off so downstream branches stay sane.
+    if (critic_type == 'iql' or _is_direct_chunk_trl_type(critic_type, algorithm)) and bool(
+        critic_config.get('use_chunk_critic', False)
+    ):
+        # IQL/direct chunk TRL never train DQC chunk_critic; force the flag off.
         critic_config['use_chunk_critic'] = False
     if actor_config is None:
         return
@@ -460,6 +613,7 @@ def get_config():
             lr=3e-4,
             batch_size=256,
             tau=0.005,
+            target_tau=0.005,
             layer_norm=True,
             frame_stack=None,
             p_aug=0.0,
@@ -470,7 +624,9 @@ def get_config():
             # and observation shape after the env is constructed.
             goal_representation='phi',
             phi_goal_obs_indices=(),
-            env_name='',
+            # Default used when constructing agents directly in tests/tools.
+            # ``main.py`` / ``eval_checkpoint.py`` overwrite this from the run env.
+            env_name='antmaze-medium-navigate-v0',
             full_chunk_horizon=25,
             action_chunk_horizon=5,
             # Match dynamics' default clip_path_to_goal semantics for critic backups:
@@ -483,8 +639,19 @@ def get_config():
             num_qs=2,
             # 'dqc' (default): chunk_critic + partial action_critic + value (current behavior).
             # 'iql':           action_critic + value only; Q backup uses V at s_{t+H_action}.
+            # 'direct_chunk_trl'/'chunk_trl'/'trl':
+            #                  direct chunk-level TRL with Q_H as the primary
+            #                  learned object and V as an expectile readout.
+            algorithm='dqc',
             critic_type='dqc',
             use_chunk_critic=True,
+            tau_q=0.7,
+            tau_v=0.9,
+            lambda_q_base=1.0,
+            lambda_q_tri=1.0,
+            lambda_v=1.0,
+            use_v_in_q_target=False,
+            q_value_eps=1e-6,
             distill_method='expectile',
             kappa_d=0.7,
             implicit_backup_type='quantile',

@@ -89,21 +89,28 @@ class PathResidualNet(nn.Module):
 
     Conditioned on ``(s_1, z_K, t_norm)`` with ``s_1`` the absolute current state,
     ``z_K`` the bridge endpoint in the residual frame (``s_K`` or ``Delta``), and
-    ``t_norm = i / K`` (shape ``(B, T)``).  Returns ``(B, T, state_dim)``.
+    ``t_norm = i / K`` (shape ``(B, T)``).  When ``use_time_embedding=False`` the
+    raw scalar ``i/K`` is still concatenated; only the sinusoidal lift is disabled.
+    Returns ``(B, T, state_dim)``.
     """
 
     hidden_dims: Sequence[int]
     state_dim: int
     time_embed_dim: int = 64
+    use_time_embedding: bool = True
     layer_norm: bool = True
 
     @nn.compact
     def __call__(self, s1, zK, t_norm):
         # s1, zK: (B, D);  t_norm: (B, T) in [0, 1].
-        t_emb = SinusoidalEmbedding(self.time_embed_dim)(t_norm)
         s1_b = jnp.broadcast_to(s1[:, None, :], (s1.shape[0], t_norm.shape[1], s1.shape[1]))
         zK_b = jnp.broadcast_to(zK[:, None, :], (zK.shape[0], t_norm.shape[1], zK.shape[1]))
-        inp = jnp.concatenate([s1_b, zK_b, t_emb], axis=-1)
+        xs = [s1_b, zK_b]
+        if self.use_time_embedding:
+            xs.append(SinusoidalEmbedding(self.time_embed_dim)(t_norm))
+        else:
+            xs.append(t_norm[..., None].astype(jnp.float32))
+        inp = jnp.concatenate(xs, axis=-1)
         return MLP(
             hidden_dims=(*self.hidden_dims, self.state_dim),
             activate_final=False,
@@ -235,11 +242,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     # ------------------------------------------------------------------
-    # Displacement-frame helpers (``subgoal_target_mode='displacement'``)
+    # Displacement-frame helpers (``residual_target_mode='displacement'``)
     # ------------------------------------------------------------------
     #
     # In displacement mode the bridge / residual net are trained and queried in
-    # the local frame ``s' = s - s_t`` so that ``s_T' = 0`` and ``s_0' = Delta``.
+    # the local frame ``s' = s - s_t`` so that ``x_0 = 0`` and ``x_K = Delta``.
     # External APIs (``plan``, ``predict_subgoal``, etc.) still expose absolute
     # states; the helpers below centralise the affine shift.
 
@@ -248,6 +255,51 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
     def _is_residual_displacement_mode(self) -> bool:
         return _residual_target_mode(self.config) == 'displacement'
+
+    def _state_normalization_enabled(self) -> bool:
+        return bool(self.config.get('state_normalization', False))
+
+    def _state_norm_stats(self, dtype=jnp.float32) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Return broadcastable state-normalization stats."""
+        eps = float(self.config.get('state_normalization_eps', 1e-6))
+        mean = jnp.asarray(self.config.get('state_mean', ()), dtype=dtype)
+        std = jnp.asarray(self.config.get('state_std', ()), dtype=dtype)
+        std = jnp.maximum(std, jnp.asarray(eps, dtype=dtype))
+        return mean, std
+
+    def _normalize_abs_state(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x, dtype=jnp.float32)
+        if not self._state_normalization_enabled():
+            return x
+        mean, std = self._state_norm_stats(dtype=jnp.float32)
+        return (x - mean) / std
+
+    def _denormalize_abs_state(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x, dtype=jnp.float32)
+        if not self._state_normalization_enabled():
+            return x
+        mean, std = self._state_norm_stats(dtype=jnp.float32)
+        return x * std + mean
+
+    def _normalize_delta_state(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x, dtype=jnp.float32)
+        if not self._state_normalization_enabled():
+            return x
+        _, std = self._state_norm_stats(dtype=jnp.float32)
+        return x / std
+
+    def _denormalize_delta_state(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x, dtype=jnp.float32)
+        if not self._state_normalization_enabled():
+            return x
+        _, std = self._state_norm_stats(dtype=jnp.float32)
+        return x * std
+
+    def _normalize_planner_state(self, x: jnp.ndarray) -> jnp.ndarray:
+        return self._normalize_delta_state(x) if self._is_residual_displacement_mode() else self._normalize_abs_state(x)
+
+    def _denormalize_planner_state(self, x: jnp.ndarray) -> jnp.ndarray:
+        return self._denormalize_delta_state(x) if self._is_residual_displacement_mode() else self._denormalize_abs_state(x)
 
     def _displacement_origin(self, current_state: jnp.ndarray) -> jnp.ndarray:
         """Origin to subtract for the displacement frame.
@@ -266,20 +318,32 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
     def _subgoal_abs_from_raw(self, observations: jnp.ndarray, raw: jnp.ndarray) -> jnp.ndarray:
         """Map raw ``subgoal_net`` output to an absolute next-K state.
 
-        ``raw`` is interpreted as ``Delta`` in displacement mode and as
-        ``s_{t+K}`` in absolute mode.
+        ``raw`` is interpreted as a normalized/raw-frame ``Delta`` in
+        displacement mode and as a normalized/raw-frame absolute state in
+        absolute mode.
         """
         if self._is_displacement_mode():
-            return jnp.asarray(observations, dtype=raw.dtype) + raw
-        return raw
+            raw_delta = self._denormalize_delta_state(raw)
+            return jnp.asarray(observations, dtype=raw_delta.dtype) + raw_delta
+        return self._denormalize_abs_state(raw)
+
+    def _subgoal_candidates_abs_from_raw(self, observations: jnp.ndarray, raw: jnp.ndarray) -> jnp.ndarray:
+        """Map raw subgoal candidates ``[B, N, D]`` to absolute env-scale endpoints."""
+        if self._is_displacement_mode():
+            return (
+                jnp.asarray(observations, dtype=jnp.float32)[:, None, :]
+                + self._denormalize_delta_state(raw)
+            )
+        return self._denormalize_abs_state(raw)
 
     def _subgoal_target_for_loss(
         self, observations: jnp.ndarray, target_abs: jnp.ndarray,
     ) -> jnp.ndarray:
         """Convert the absolute ``high_actor_targets`` into the subgoal-net's loss frame."""
         if self._is_displacement_mode():
-            return jnp.asarray(target_abs, dtype=jnp.float32) - jnp.asarray(observations, dtype=jnp.float32)
-        return jnp.asarray(target_abs, dtype=jnp.float32)
+            delta = jnp.asarray(target_abs, dtype=jnp.float32) - jnp.asarray(observations, dtype=jnp.float32)
+            return self._normalize_delta_state(delta)
+        return self._normalize_abs_state(target_abs)
 
     def _idm_loss_term(self, batch, grad_params):
         idm_w = float(self.config.get('idm_loss_weight', 1.0))
@@ -288,7 +352,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         o = jnp.asarray(batch['observations'], dtype=jnp.float32)
         on = jnp.asarray(batch['next_observations'], dtype=jnp.float32)
         a = jnp.asarray(batch['actions'], dtype=jnp.float32)
-        pred = self.network.select('idm_net')(o, on, params=grad_params)
+        pred = self.network.select('idm_net')(
+            self._normalize_abs_state(o),
+            self._normalize_abs_state(on),
+            params=grad_params,
+        )
         mse = jnp.mean((pred - a) ** 2)
         return idm_w * mse, mse
 
@@ -381,20 +449,22 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             raise ValueError(f'num_steps must be in [1, {n_total}], got {K}.')
 
         a, b, std = self.forward_bridge_coefficients(K)
-        mu = a[None, :, None] * z0[:, None, :] + b[None, :, None] * zK[:, None, :]
+        z0_n = self._normalize_planner_state(z0)
+        zK_n = self._normalize_planner_state(zK)
+        mu = a[None, :, None] * z0_n[:, None, :] + b[None, :, None] * zK_n[:, None, :]
 
         if sample and float(noise_scale) > 0.0:
             if rng is None:
                 raise ValueError('forward_bridge_plan(sample=True, noise_scale>0) requires an rng.')
             noise = jax.random.normal(rng, mu.shape)
-            path = mu + jnp.asarray(noise_scale, dtype=jnp.float32) * std[None, :, None] * noise
+            path_n = mu + jnp.asarray(noise_scale, dtype=jnp.float32) * std[None, :, None] * noise
             # Endpoint clamp - keeps ``path[:, 0] = z0`` and ``path[:, -1] = zK``
             # exact even after the independent-marginal noise injection.
-            path = path.at[:, 0, :].set(z0).at[:, -1, :].set(zK)
+            path_n = path_n.at[:, 0, :].set(z0_n).at[:, -1, :].set(zK_n)
         else:
-            path = mu
+            path_n = mu
 
-        return path
+        return self._denormalize_planner_state(path_n)
 
     def forward_bridge_residual_plan(
         self,
@@ -425,7 +495,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             raise ValueError(f'num_steps must be in [1, {n_total}], got {K}.')
 
         a, b, std = self.forward_bridge_coefficients(K)
-        mu = a[None, :, None] * z0[:, None, :] + b[None, :, None] * zK[:, None, :]
+        z0_n = self._normalize_planner_state(z0)
+        zK_n = self._normalize_planner_state(zK)
+        mu = a[None, :, None] * z0_n[:, None, :] + b[None, :, None] * zK_n[:, None, :]
 
         idx = jnp.arange(K + 1, dtype=jnp.float32)
         w = idx * (float(K) - idx) / float(K * K)
@@ -441,22 +513,23 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             # so it is the natural anchor fallback.
             anchor = z0
         t_norm = jnp.broadcast_to(idx[None, :] / float(K), (z0.shape[0], K + 1))
+        anchor_n = self._normalize_abs_state(anchor)
         residual = self.network.select('path_residual_net')(
-            anchor, zK, t_norm, params=params,
+            anchor_n, zK_n, t_norm, params=params,
         )
-        path = mu + w[None, :, None] * residual
+        path_n = mu + w[None, :, None] * residual
 
         if sample and float(noise_scale) > 0.0:
             if rng is None:
                 raise ValueError('forward_bridge_residual_plan(sample=True, noise_scale>0) requires an rng.')
-            noise = jax.random.normal(rng, path.shape)
-            path = path + jnp.asarray(noise_scale, dtype=jnp.float32) * std[None, :, None] * noise
+            noise = jax.random.normal(rng, path_n.shape)
+            path_n = path_n + jnp.asarray(noise_scale, dtype=jnp.float32) * std[None, :, None] * noise
 
         # Endpoint clamp - safety net; ``w_0 = w_K = 0`` already preserves
         # endpoints in the deterministic case, but the explicit ``set`` keeps
         # things exact under sampled noise and floating-point round-off.
-        path = path.at[:, 0, :].set(z0).at[:, -1, :].set(zK)
-        return path
+        path_n = path_n.at[:, 0, :].set(z0_n).at[:, -1, :].set(zK_n)
+        return self._denormalize_planner_state(path_n)
 
     def _forward_bridge_path_at_indices(
         self,
@@ -473,7 +546,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         a, b, _ = self.forward_bridge_coefficients(N)
         idx = jnp.asarray(indices, dtype=jnp.int32)
         idx_f = idx.astype(jnp.float32)
-        mu = a[idx][None, :, None] * z0[:, None, :] + b[idx][None, :, None] * zK[:, None, :]
+        z0_n = self._normalize_planner_state(z0)
+        zK_n = self._normalize_planner_state(zK)
+        mu = a[idx][None, :, None] * z0_n[:, None, :] + b[idx][None, :, None] * zK_n[:, None, :]
         if anchor is None:
             if self._is_residual_displacement_mode():
                 raise ValueError(
@@ -481,14 +556,15 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 )
             anchor = z0
         t_norm = jnp.broadcast_to(idx_f[None, :] / float(N), (z0.shape[0], idx.shape[0]))
+        anchor_n = self._normalize_abs_state(anchor)
         residual = self.network.select('path_residual_net')(
-            anchor, zK, t_norm, params=params,
+            anchor_n, zK_n, t_norm, params=params,
         )
         w = idx_f * (float(N) - idx_f) / float(N * N)
-        path = mu + w[None, :, None] * residual
-        path = jnp.where((idx == 0)[None, :, None], z0[:, None, :], path)
-        path = jnp.where((idx == N)[None, :, None], zK[:, None, :], path)
-        return path
+        path_n = mu + w[None, :, None] * residual
+        path_n = jnp.where((idx == 0)[None, :, None], z0_n[:, None, :], path_n)
+        path_n = jnp.where((idx == N)[None, :, None], zK_n[:, None, :], path_n)
+        return self._denormalize_planner_state(path_n)
 
     def _shift_to_displacement_frame(
         self, current_state: jnp.ndarray, desired_endpoint: jnp.ndarray,
@@ -496,7 +572,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         """Return ``(origin, z0, zK, anchor)`` for the underlying planner.
 
         In displacement mode the bridge / residual chain is trained with
-        ``x_T = 0`` and ``x_0 = Delta``; we shift the planner inputs accordingly
+        ``x_0 = 0`` and ``x_K = Delta``; we shift the planner inputs accordingly
         and recover absolute states later by adding ``origin``.  ``anchor`` is
         the absolute current state that we feed to the residual nets so they
         can break translation invariance in displacement mode.
@@ -617,7 +693,11 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         tuple (diag_gaussian mode).  Used internally; external callers should
         prefer ``infer_subgoal`` / ``infer_subgoal_distribution``.
         """
-        return self.network.select('subgoal_net')(observations, high_actor_goals, params=params)
+        return self.network.select('subgoal_net')(
+            self._normalize_abs_state(observations),
+            self._normalize_abs_state(high_actor_goals),
+            params=params,
+        )
 
     @jax.jit
     def predict_subgoal(self, observations, high_actor_goals):
@@ -654,9 +734,10 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         """Distributional API: returns ``(mu, log_std)``.
 
         ``mu`` is always an *absolute* next-K state (so downstream callers do
-        not need to know about ``subgoal_target_mode``).  ``log_std`` is the
-        same in either frame because the displacement shift ``s_t`` is
-        deterministic.  In deterministic mode ``log_std`` is filled with
+        not need to know about ``subgoal_target_mode``).  ``log_std`` is also
+        returned in env-scale absolute endpoint units.  In displacement mode the
+        shift by ``s_t`` is deterministic, so only the delta std is mapped by
+        ``state_std``.  In deterministic mode ``log_std`` is filled with
         ``log_std_min`` so the distribution degenerates to a point mass under
         any sampler.
         """
@@ -672,6 +753,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             log_std_min = float(self.config.get('subgoal_log_std_min', -5.0))
             log_std = jnp.full_like(mu, log_std_min)
         mu = self._subgoal_abs_from_raw(observations, mu)
+        if self._state_normalization_enabled():
+            _, std = self._state_norm_stats(dtype=log_std.dtype)
+            log_std = log_std + jnp.log(std)
         if squeeze:
             mu = mu[0]
             log_std = log_std[0]
@@ -728,15 +812,10 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
                 mu_raw[:, None, :], (mu_raw.shape[0], num_candidates, mu_raw.shape[-1])
             )
 
-        # In displacement mode the raw output is ``Delta``; convert candidates
-        # back to absolute states so downstream callers (``sample_plan*`` /
-        # rescoring) always see absolute endpoints.
-        if self._is_displacement_mode():
-            mu = obs + mu_raw
-            candidates = obs[:, None, :] + candidates_raw
-        else:
-            mu = mu_raw
-            candidates = candidates_raw
+        # Convert normalized/raw-frame candidates back to env-scale absolute
+        # endpoints so downstream planning/rescoring APIs stay frame-agnostic.
+        mu = self._subgoal_abs_from_raw(obs, mu_raw)
+        candidates = self._subgoal_candidates_abs_from_raw(obs, candidates_raw)
 
         if squeeze:
             mu = mu[0]
@@ -753,7 +832,10 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         next_states = trajectories[:, 1 : horizon + 1, :]
         flat_prev = prev_states.reshape(-1, prev_states.shape[-1])
         flat_next = next_states.reshape(-1, next_states.shape[-1])
-        pred = self.network.select('idm_net')(flat_prev, flat_next)
+        pred = self.network.select('idm_net')(
+            self._normalize_abs_state(flat_prev),
+            self._normalize_abs_state(flat_next),
+        )
         return jnp.asarray(pred, dtype=jnp.float32).reshape(trajectories.shape[0], horizon, -1)
 
     @partial(jax.jit, static_argnames=('proposal_horizon', 'plan_candidates', 'sample_noise_scale'))
@@ -893,6 +975,35 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
 
         state_dim = ex_observations.shape[-1]
         action_dim = int(ex_actions.shape[-1])
+        state_norm = bool(config.get('state_normalization', False))
+        cfg_state_mean = config.get('state_mean', None)
+        cfg_state_std = config.get('state_std', None)
+        eps = float(config.get('state_normalization_eps', 1e-6))
+        if state_norm:
+            # State stats must be computed from the full train dataset outside
+            # DynamicsAgent.create; example batches are too small and can
+            # produce near-zero std.
+            missing_stats = (
+                cfg_state_mean is None
+                or cfg_state_std is None
+                or len(cfg_state_mean) == 0
+                or len(cfg_state_std) == 0
+            )
+            if missing_stats:
+                raise ValueError(
+                    'state_normalization=True requires state_mean/state_std computed '
+                    'from the full training dataset. Do not compute them from ex_observations.'
+                )
+            if len(cfg_state_mean) != int(state_dim) or len(cfg_state_std) != int(state_dim):
+                raise ValueError(
+                    f'state_mean/state_std must have length {int(state_dim)}, got '
+                    f'{len(cfg_state_mean)} and {len(cfg_state_std)}.'
+                )
+            state_mean = tuple(float(x) for x in cfg_state_mean)
+            state_std = tuple(max(float(x), eps) for x in cfg_state_std)
+        else:
+            state_mean = tuple(0.0 for _ in range(int(state_dim)))
+            state_std = tuple(1.0 for _ in range(int(state_dim)))
         phi_idxs = normalize_phi_goal_obs_indices(config.get('phi_goal_obs_indices', ()))
         env_name_for_phi = str(config.get('env_name', ''))
         sg_rep = str(config.get('subgoal_goal_representation', config.get('goal_representation', 'full'))).lower()
@@ -969,6 +1080,8 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         )
 
         batch_size = ex_observations.shape[0]
+        # Dummy inputs are shape-only for module initialization; runtime wrappers
+        # apply normalization before calling the networks.
         dummy_x = ex_observations
         dummy_g = ex_observations
         dummy_next = jnp.zeros_like(ex_observations)
@@ -985,6 +1098,7 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             hidden_dims=residual_hidden,
             state_dim=state_dim,
             time_embed_dim=int(config['time_embed_dim']),
+            use_time_embedding=bool(config.get('use_time_embedding', True)),
             layer_norm=bool(config['layer_norm']),
         )
         horizon = int(config['dynamics_N']) + 1
@@ -1008,6 +1122,9 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             'idm_action_dim': action_dim,
             'idm_hidden_dims': idm_hidden,
             'phi_goal_obs_indices': phi_idxs,
+            'state_normalization': state_norm,
+            'state_mean': state_mean,
+            'state_std': state_std,
         }
         return cls(
             rng=rng,
@@ -1138,7 +1255,11 @@ class DynamicsAgent(_DynamicsAgentCore):
 
         if sub_mode == 'diag_gaussian':
             stochastic_loss = _subgoal_stochastic_loss(self.config)
-            pred_mu, pred_log_std = self.network.select('subgoal_net')(s, g_high, params=grad_params)
+            pred_mu, pred_log_std = self.network.select('subgoal_net')(
+                self._normalize_abs_state(s),
+                self._normalize_abs_state(g_high),
+                params=grad_params,
+            )
             pred_std = jnp.exp(pred_log_std)
             inv_var = jnp.exp(-2.0 * pred_log_std)
             mean_diff = target - pred_mu
@@ -1203,7 +1324,11 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
             }
         else:
-            pred_sg = self.network.select('subgoal_net')(s, g_high, params=grad_params)
+            pred_sg = self.network.select('subgoal_net')(
+                self._normalize_abs_state(s),
+                self._normalize_abs_state(g_high),
+                params=grad_params,
+            )
             subgoal_mse = jnp.mean((pred_sg - target) ** 2, axis=-1)
             pred_sg_abs = self._subgoal_abs_from_raw(s, pred_sg)
             (
@@ -1318,16 +1443,24 @@ class DynamicsAgent(_DynamicsAgentCore):
                 )
             segment_path = segment
 
+        path_loss_normalized = bool(self.config.get('path_loss_normalized', True))
+        if path_loss_normalized:
+            path_pred_loss = self._normalize_planner_state(path_pred)
+            segment_path_loss = self._normalize_planner_state(segment_path)
+        else:
+            path_pred_loss = path_pred
+            segment_path_loss = segment_path
+
         path_steps = int(path_pred.shape[1]) - 1
         has_endpoint = path_loss_horizon <= 0 or path_loss_horizon >= N
         interior_stop = -1 if has_endpoint else path_pred.shape[1]
         if path_pred.shape[1] > 2:
-            diff_interior = path_pred[:, 1:interior_stop, :] - segment_path[:, 1:interior_stop, :]
+            diff_interior = path_pred_loss[:, 1:interior_stop, :] - segment_path_loss[:, 1:interior_stop, :]
             loss_fb_interior = jnp.mean(jnp.abs(diff_interior).sum(axis=-1))
         else:
             loss_fb_interior = jnp.zeros((), dtype=jnp.float32)
 
-        diff_next = path_pred[:, 1, :] - segment_path[:, 1, :]
+        diff_next = path_pred_loss[:, 1, :] - segment_path_loss[:, 1, :]
         loss_fb_next = jnp.mean(jnp.abs(diff_next).sum(axis=-1))
 
         use_path = bool(self.config.get('forward_bridge_use_path_loss', True))
@@ -1343,13 +1476,23 @@ class DynamicsAgent(_DynamicsAgentCore):
 
         if path_pred.shape[1] > 2:
             bridge_path_mse = jnp.mean((path_pred[:, 1:interior_stop, :] - segment_path[:, 1:interior_stop, :]) ** 2)
+            bridge_path_mse_norm = jnp.mean(
+                (path_pred_loss[:, 1:interior_stop, :] - segment_path_loss[:, 1:interior_stop, :]) ** 2
+            )
         else:
             bridge_path_mse = zero
+            bridge_path_mse_norm = zero
         bridge_next_mse = jnp.mean((path_pred[:, 1, :] - segment_path[:, 1, :]) ** 2)
         bridge_final_mse = jnp.mean((path_pred[:, -1, :] - segment_path[:, -1, :]) ** 2)
         bridge_endpoint_start_mse = jnp.mean((path_pred[:, 0, :] - segment_path[:, 0, :]) ** 2)
         bridge_endpoint_end_mse = bridge_final_mse
+        bridge_next_mse_norm = jnp.mean((path_pred_loss[:, 1, :] - segment_path_loss[:, 1, :]) ** 2)
+        bridge_final_mse_norm = jnp.mean((path_pred_loss[:, -1, :] - segment_path_loss[:, -1, :]) ** 2)
+        bridge_endpoint_start_mse_norm = jnp.mean((path_pred_loss[:, 0, :] - segment_path_loss[:, 0, :]) ** 2)
+        bridge_endpoint_end_mse_norm = bridge_final_mse_norm
 
+        # dist_to_subgoal is computed in planner frame; in displacement mode
+        # both operands are local deltas, not env absolute states.
         dist_per_step = jnp.linalg.norm(path_pred - zK[:, None, :], axis=-1).mean(axis=0)
         first_idx = 1 if path_steps >= 1 else 0
         mid_idx = max(1, path_steps // 2)
@@ -1357,6 +1500,9 @@ class DynamicsAgent(_DynamicsAgentCore):
 
         s1 = segment_path[:, 1, :]
         first_step_l1_fb = jnp.mean(jnp.abs(path_pred[:, 1, :] - s1).sum(axis=-1))
+        first_step_l1_fb_norm = jnp.mean(
+            jnp.abs(path_pred_loss[:, 1, :] - segment_path_loss[:, 1, :]).sum(axis=-1)
+        )
         idx_xy = jnp.asarray(self._path_eval_slice(), dtype=jnp.int32)
         d_xy_fb = path_pred[:, 1, :][:, idx_xy] - s1[:, idx_xy]
         first_step_xy_l2_fb = jnp.sqrt(jnp.mean(d_xy_fb ** 2))
@@ -1366,15 +1512,28 @@ class DynamicsAgent(_DynamicsAgentCore):
             'forward_bridge/loss_path_interior': loss_fb_interior,
             'forward_bridge/loss_path_next': loss_fb_next,
             'forward_bridge/first_step_l1_fb_path': first_step_l1_fb,
+            'forward_bridge/first_step_l1_fb_path_raw': first_step_l1_fb,
+            'forward_bridge/first_step_l1_fb_path_norm': first_step_l1_fb_norm,
             'forward_bridge/first_step_xy_l2_fb_path': first_step_xy_l2_fb,
+            'forward_bridge/first_step_xy_l2_fb_path_raw': first_step_xy_l2_fb,
+            # Backward-compatible metric keys remain raw/planner-frame for interpretability.
             'forward_bridge/path_mse': bridge_path_mse,
             'forward_bridge/next_mse': bridge_next_mse,
             'forward_bridge/final_mse': bridge_final_mse,
+            'forward_bridge/path_mse_raw': bridge_path_mse,
+            'forward_bridge/next_mse_raw': bridge_next_mse,
+            'forward_bridge/final_mse_raw': bridge_final_mse,
+            'forward_bridge/path_mse_norm': bridge_path_mse_norm,
+            'forward_bridge/next_mse_norm': bridge_next_mse_norm,
+            'forward_bridge/final_mse_norm': bridge_final_mse_norm,
             'forward_bridge/endpoint_start_mse': bridge_endpoint_start_mse,
             'forward_bridge/endpoint_end_mse': bridge_endpoint_end_mse,
+            'forward_bridge/endpoint_start_mse_norm': bridge_endpoint_start_mse_norm,
+            'forward_bridge/endpoint_end_mse_norm': bridge_endpoint_end_mse_norm,
             'forward_bridge/dist_to_subgoal_step_1': dist_per_step[first_idx],
             'forward_bridge/dist_to_subgoal_step_mid': dist_per_step[mid_idx],
             'forward_bridge/dist_to_subgoal_step_last': dist_per_step[last_idx],
+            'forward_bridge/dist_to_endpoint_step_1_planner_frame': dist_per_step[first_idx],
         }
         info = {
             'phase1/loss': loss,
@@ -1424,6 +1583,22 @@ class DynamicsAgent(_DynamicsAgentCore):
         info['dynamics/subgoal_target_mode'] = jnp.asarray(
             _subgoal_target_mode_id(self.config), dtype=jnp.float32
         )
+        info['dynamics/use_time_embedding'] = jnp.asarray(
+            1.0 if bool(self.config.get('use_time_embedding', True)) else 0.0,
+            dtype=jnp.float32,
+        )
+        info['dynamics/state_normalization'] = jnp.asarray(
+            1.0 if self._state_normalization_enabled() else 0.0,
+            dtype=jnp.float32,
+        )
+        info['dynamics/path_loss_normalized'] = jnp.asarray(
+            1.0 if path_loss_normalized else 0.0,
+            dtype=jnp.float32,
+        )
+        _, state_std = self._state_norm_stats(dtype=jnp.float32)
+        info['dynamics/state_std_mean'] = jnp.mean(state_std)
+        info['dynamics/state_std_min'] = jnp.min(state_std)
+        info['dynamics/state_std_max'] = jnp.max(state_std)
         info.update(self._theta_schedule_info())
         return loss, info
 
@@ -1482,6 +1657,15 @@ def _get_common_config():
             progress_alpha=0.8,
             residual_model_hidden_dims=(512, 512, 512),
             time_embed_dim=64,
+            use_time_embedding=True,
+            # Dynamics-only state normalization.  External APIs still consume
+            # and return environment-scale states; the agent normalizes internal
+            # network inputs/targets when enabled.
+            state_normalization=False,
+            state_normalization_eps=1e-6,
+            state_mean=(),
+            state_std=(),
+            path_loss_normalized=True,
             layer_norm=True,
             subgoal_loss_weight=1.0,
             subgoal_value_alpha=0.3,
@@ -1566,6 +1750,9 @@ def _get_common_config():
             gc_negative=True,
             p_aug=0.0,
             frame_stack=ml_collections.config_dict.placeholder(int),
+            # Default used when constructing agents directly in tests/tools.
+            # ``main.py`` overwrites this from FLAGS.env_name for real runs.
+            env_name='antmaze-medium-navigate-v0',
         )
     )
 

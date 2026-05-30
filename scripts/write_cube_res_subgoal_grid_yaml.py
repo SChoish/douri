@@ -223,7 +223,6 @@ def main() -> None:
     )
 
     dyn = cfg.get('dynamics') or {}
-    cri = cfg.get('critic_agent') or {}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, 'w', encoding='utf-8') as f:
         f.write(

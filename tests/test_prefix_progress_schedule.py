@@ -18,7 +18,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import numpy as np
 
 import jax  # noqa: F401  (imported to ensure JAX is available for the agent tests)
-import jax.numpy as jnp
 
 from utils.dynamics import (
     forward_bridge_coefficients,

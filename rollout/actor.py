@@ -47,8 +47,6 @@ from rollout.plot import (
     overlay_rgb_frames_obs2d_panel,
     write_rgb_array_mp4,
 )
-from rollout.common import align_action_to_env
-from rollout.maze_navigator import MazeNavigatorMap
 from utils.run_io import (
     get_trajectory,
     list_checkpoint_suffixes,

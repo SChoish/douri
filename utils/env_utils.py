@@ -1,7 +1,6 @@
 import collections
 import glob
 import os
-import platform
 import time
 
 import gymnasium

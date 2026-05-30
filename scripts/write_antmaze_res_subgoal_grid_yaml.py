@@ -35,7 +35,6 @@ from sweep_res_subgoal_grid_lib import (  # noqa: E402
     apply_grid_modes,
     douri_run_config_path,
     load_yaml,
-    sanitize_dynamics,
 )
 
 _DEFAULT_DOURI = _REPO.parent / 'douri'

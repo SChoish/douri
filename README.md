@@ -10,7 +10,7 @@ OGBench 기반 오프라인 제어 실험 코드입니다. 메인 경로는 **li
 
 ## 프로젝트 구조
 
-작업 디렉터리는 항상 저장소 루트(`Pathbridger`)이며, 실행 전 `PYTHONPATH=.`을 설정합니다.
+작업 디렉터리는 항상 저장소 루트(`PathBridger`)이며, 실행 전 `PYTHONPATH=.`을 설정합니다.
 
 | 경로 | 역할 |
 |------|------|
@@ -21,7 +21,9 @@ OGBench 기반 오프라인 제어 실험 코드입니다. 메인 경로는 **li
 | `agents/critic.py` | DQC/IQL/direct chunk TRL critic |
 | `agents/actor.py` | SPI actor |
 | `eval_checkpoint.py` | 체크포인트에서 환경 평가만 재실행 |
-| `rollout/` | checkpoint 기반 `subgoal`, `idm`, `actor` rollout/시각화 |
+| `rollout/run.py` | checkpoint rollout 통합 엔트리포인트 (`subgoal`/`idm`/`actor`, maze/manip 자동 분기) |
+| `rollout/episode_runner.py` | main eval과 rollout 스크립트가 공유하는 chunked episode loop |
+| `rollout/env.py`, `rollout/plot.py`, `rollout/common.py` | 환경 state sync, 렌더/plot, env-family 공통 헬퍼 |
 | `tests/` | 핵심 수치/분기 회귀 테스트 (`test_*.py`) |
 | `config/` | 실험 YAML |
 | `scripts/` | sweep / eval summary / heatmap 스크립트 |
@@ -97,7 +99,7 @@ dynamics:
 | `subgoal_stochastic_loss` | `mse` | `diag_gaussian` 학습 loss. `mse`는 PDF Eq. (51)에 가까운 reparameterized sample-MSE, `nll`은 일부 실험에서 의도적으로 쓰는 value-gap-weighted Gaussian NLL |
 | `subgoal_target_mode` | `absolute` | `absolute`: raw subgoal output/teacher가 $s_{t+K}$. `displacement`: raw output/teacher가 $\Delta=s_{t+K}-s_t$이고 bridge는 local frame에서 학습/계획 |
 | `subgoal_loss_weight` | `1.0` | subgoal regression/value loss 가중치 |
-| `subgoal_value_alpha` | `0.5` | subgoal loss의 $V(\hat s_{t+K}, g)$ critic value bonus 계수. `0`이면 비활성화 |
+| `subgoal_value_alpha` | `0.5` | subgoal loss의 critic value bonus 계수. DQC/IQL에서는 `alpha * V(\hat s_{t+K}, g)`. `direct_chunk_trl`에서는 `alpha * V(s_t, \hat s_{t+K}) * V(\hat s_{t+K}, g)`. `0`이면 비활성화 |
 | `subgoal_value_style` | `exponential` | subgoal regression/NLL value-gap weight 방식. `exponential`은 $\exp(c\Delta V)$, `expectile`은 $\Delta V>0$이면 `subgoal_value_expectile`, 아니면 `1-subgoal_value_expectile` |
 | `subgoal_value_expectile` | `0.7` | `subgoal_value_style=expectile`일 때 양의 value gap에 주는 weight |
 | `subgoal_value_gap_scale` | `1.0` | $\Delta V=V(s_{t+K}^{D}, g)-V(s_t, g)$에 곱하는 scale $c$ |
@@ -160,7 +162,16 @@ actor:
 | `iql` | DQC chunk critic 없이 action chunk critic + value만 사용 |
 | `direct_chunk_trl` / `chunk_trl` / `trl` | direct chunk-level Transitive RL. primary head는 `Q_H(s, A_H, g)`이며, `V(s,g)`는 in-sample expectile readout |
 
-Direct chunk TRL의 기본 target은 Q-only transitive target입니다.
+Direct chunk TRL semantics (current implementation):
+
+- `Q_H(s, A_H, g)` is learned directly on `action_critic`.
+- `V(s, g)` is an expectile readout of target `Q_H`, not an independent Bellman TD value.
+- Default transitive target is `Q_H(s_i, A_i, s_k) * Q_H(s_k, A_k, s_j)` (`use_v_in_q_target=false`).
+- Valid split `k` must be after the committed chunk: `k >= i + H`, `k < j`, `k + H <= T`.
+- `use_v_in_q_target` exists only as an ablation and defaults to `false`.
+- Distance/offset reweighting (`trl_distance_reweight`) is enabled by default for `direct_chunk_trl`.
+
+Example config: `config/antmaze_large_direct_chunk_trl.yaml`.
 
 ```yaml
 critic_agent:
@@ -172,26 +183,27 @@ critic_agent:
   lambda_q_base: 1.0
   lambda_q_tri: 1.0
   lambda_v: 1.0
-  use_v_in_q_target: false   # 기본값. true일 때만 Q_H * V target 사용
+  use_v_in_q_target: false   # ablation only
+  trl_distance_reweight: true
   target_tau: 0.005
   q_value_eps: 1.0e-6
 ```
 
-Sampler는 같은 trajectory에서만 `i, j, k`를 뽑고, transitive split은 반드시 `k >= i + H`, `k < j`, `k + H <= T`를 만족해야 합니다. valid split이 없으면 `trl_valid_mask=0`으로 Q-tri loss에서 제외합니다.
+Sampler는 같은 trajectory에서만 `i, j, k`를 뽑습니다. valid split이 없으면 `trl_valid_mask=0`으로 tri-Q loss에서 제외합니다.
 
 ## 학습 실행
 
 ```bash
-cd /path/to/Pathbridger
+cd /path/to/PathBridger
 export PYTHONPATH=.
-python main.py --run_config=config/antmaze_large_navigate.yaml
+python main.py --run_config=config/antmaze_medium_navigate.yaml
 ```
 
 Resume:
 
 ```bash
 python main.py \
-  --run_config=config/antmaze_large_navigate.yaml \
+  --run_config=config/antmaze_medium_navigate.yaml \
   --resume_run_dir=runs/<run_dir> \
   --resume_epoch=200
 ```
@@ -200,26 +212,15 @@ Resume 로그는 `run_resume_from<E>_<timestamp>.log`로 따로 저장됩니다.
 
 ## 현재 Config 레이아웃
 
-환경마다 baseline config 1개씩 운영합니다. 알고리즘 default(`forward_bridge_residual` + `prefix_progress` + `spi_tau` baseline)는 yaml에서 생략하고, **환경별 critic 차이만 yaml에 명시**합니다.
+현재 저장소의 `config/`에는 antmaze-medium 중심 baseline과 goal-representation/target-mode table ablation YAML만 포함되어 있습니다. 다른 환경(cube/puzzle/humanoid/large/giant/teleport) YAML은 현재 코드 트리에 없으며, 필요하면 `scripts/write_*_res_subgoal_grid_yaml.py` 또는 `scripts/write_sweep_run_yaml.py`로 생성하는 구조입니다.
 
-| Config | 환경 | 비고 |
-|--------|------|------|
-| `antmaze_medium_navigate.yaml` | antmaze-medium-navigate-v0 | `train_epochs=200` |
-| `antmaze_large_navigate.yaml` | antmaze-large-navigate-v0 | |
-| `antmaze_giant_navigate.yaml` | antmaze-giant-navigate-v0 | `discount=0.995` |
-| `antmaze_teleport_navigate.yaml` | antmaze-teleport-navigate-v0 | `discount=0.995` |
-| `humanoidmaze_giant_navigate.yaml` | humanoidmaze-giant-navigate-v0 | 100M shards, `kappa_b=0.5`, `kappa_d=0.8` |
-| `cube_single.yaml` | cube-single-play-v0 | `kappa_b=0.93`, `kappa_d=0.8` |
-| `cube_double.yaml` | cube-double-play-v0 | 동일 |
-| `cube_triple.yaml` | cube-triple-play-v0 | 100M shards |
-| `cube_quadruple.yaml` | cube-quadruple-play-v0 | 100M shards |
-| `cube_octuple.yaml` | cube-octuple-play-v0 | 100M shards, `kappa_d=0.5` |
-| `puzzle_3x3.yaml` | puzzle-3x3-play-v0 | `kappa_b=0.9`, `kappa_d=0.5` |
-| `puzzle_4x4.yaml` | puzzle-4x4-play-v0 | 동일 |
-| `puzzle_4x5.yaml` | puzzle-4x5-play-v0 | 100M shards |
-| `puzzle_4x6.yaml` | puzzle-4x6-play-v0 | 100M shards, `kappa_b=0.7` |
-
-알고리즘 ablation을 돌리려면 위 baseline yaml을 복제해 dynamics/actor 키를 override하세요.
+| Config | 환경/용도 | 비고 |
+|--------|-----------|------|
+| `antmaze_medium_navigate.yaml` | `antmaze-medium-navigate-v0` baseline | 기본 학습 config |
+| `antmaze_medium_navigate_table_full_abs.yaml` | medium table ablation | full goal + absolute target |
+| `antmaze_medium_navigate_table_full_disp.yaml` | medium table ablation | full goal + displacement target |
+| `antmaze_medium_navigate_table_phi_abs.yaml` | medium table ablation | phi goal + absolute target |
+| `antmaze_medium_navigate_table_phi_disp.yaml` | medium table ablation | phi goal + displacement target |
 
 ## Run Directory
 
@@ -245,7 +246,7 @@ Dynamics agent는 다음 손실을 함께 학습합니다.
 - `phase1/loss_dynamics`: reverse mean matching (또는 `forward_bridge*` 모드의 forward bridge mean matching)
 - `phase1/loss_path_step`: dataset segment와 step-aligned path loss
 - `phase1/loss_roll`: short rollout consistency
-- `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 `subgoal_stochastic_loss=mse`이면 reparameterized sample에 대해 `stopgrad(w(Delta V)) * MSE(sample, target) - alpha * V(sample_abs, g)`를 쓰고, `subgoal_stochastic_loss=nll`이면 `stopgrad(w(Delta V)) * NLL(target | mu, log_std) - alpha * V(sample_abs, g)`를 씁니다. `nll`은 PDF의 stochastic subgoal 식과 다른 의도적 구현 옵션입니다. `subgoal_value_style=exponential`이면 `w(Delta V)=exp(c * (V(target_abs, g) - V(s, g)))`, `expectile`이면 gap이 양수일 때 `subgoal_value_expectile`, 그 외에는 `1-subgoal_value_expectile`
+- `phase1/loss_subgoal`: deterministic은 target-value-gap-weighted point MSE와 critic value bonus. `diag_gaussian`은 `subgoal_stochastic_loss=mse`이면 reparameterized sample에 대해 `stopgrad(w(Delta V)) * MSE(sample, target) - alpha * bonus`를 쓰고, `subgoal_stochastic_loss=nll`이면 `stopgrad(w(Delta V)) * NLL(target | mu, log_std) - alpha * bonus`를 씁니다. 기본 bonus는 `V(sample_abs, g)`이며, `direct_chunk_trl`일 때는 `V(s, sample_abs) * V(sample_abs, g)`입니다. `nll`은 PDF의 stochastic subgoal 식과 다른 의도적 구현 옵션입니다. `subgoal_value_style=exponential`이면 `w(Delta V)=exp(c * (V(target_abs, g) - V(s, g)))`, `expectile`이면 gap이 양수일 때 `subgoal_value_expectile`, 그 외에는 `1-subgoal_value_expectile`
 - `phase1/loss_idm`: embedded inverse dynamics MSE
 
 Critic + SPI actor:
@@ -292,36 +293,46 @@ PYTHONPATH=. MUJOCO_GL=egl python -m rollout.run \
 - maze 시각화는 항상 navigator snap 모드입니다 (벽 통과 옵션은 더 이상 제공하지 않습니다).
 - maze 단일 모드는 `python -m rollout.subgoal|idm|actor`로, manip 통합 실행은 `python -m rollout.manip_play_rollouts`로도 직접 호출할 수 있습니다 (별도 cube/puzzle wrapper 스크립트는 더 이상 제공하지 않습니다).
 
-CPU 일괄 rollout 헬퍼 (3종 한 번에):
+직접 호출 가능한 rollout 엔트리포인트:
 
 ```bash
-# Maze 계열 (antmaze-*-navigate / antmaze-*-teleport / humanoidmaze-*)
-RUN_DIR=runs/<run_dir> CHECKPOINT_EPOCH=500 \
-  ./scripts/rollout_maze_cpu_three.sh
+# Maze/manip 자동 분기 통합 실행
+PYTHONPATH=. MUJOCO_GL=egl python -m rollout.run --run_dir=runs/<run_dir> --checkpoint_epoch=300 --mode=all
 
-# Manip play (cube-*-play / puzzle-*-play) — IDM/Actor MP4
-RUN_DIR=runs/<run_dir> CHECKPOINT_EPOCH=1000 \
-  ./scripts/rollout_cube_play_cpu_three.sh
+# Maze 단일 모드
+PYTHONPATH=. MUJOCO_GL=egl python -m rollout.subgoal --run_dir=runs/<run_dir> --checkpoint_epoch=300
+PYTHONPATH=. MUJOCO_GL=egl python -m rollout.idm --run_dir=runs/<run_dir> --checkpoint_epoch=300
+PYTHONPATH=. MUJOCO_GL=egl python -m rollout.actor --run_dir=runs/<run_dir> --checkpoint_epoch=300
+
+# Manip play 전용 상태/episode rollout
+PYTHONPATH=. MUJOCO_GL=egl python -m rollout.manip_play_rollouts --run_dir=runs/<run_dir> --checkpoint_epoch=300
+PYTHONPATH=. MUJOCO_GL=egl python -m rollout.manip_play_state_rollout --run_dir=runs/<run_dir> --checkpoint_epoch=300
 ```
 
 ## scripts/
 
+현재 `scripts/` 디렉터리는 sweep YAML 생성/실행/요약 도구 중심입니다. README에 있던 `run_configs_sequential_nohup.sh`, `rollout_maze_cpu_three.sh`, `rollout_cube_play_cpu_three.sh` 같은 wrapper는 현재 코드 트리에 없습니다.
+
 | 스크립트 | 역할 |
 |----------|------|
-| `run_configs_sequential_nohup.sh` | 여러 yaml을 nohup + wait로 순차 학습 |
-| `run_cube_single_detached.sh` | 단일 yaml을 setsid로 분리 실행 (default `config/cube_single.yaml`) |
-| `run_giant_nav_teleport_u4_u8_resume.sh` | giant/teleport baseline을 가장 최근 checkpoint에서 resume |
-| `rollout_maze_cpu_three.sh` | maze run의 subgoal/idm/actor CPU rollout 일괄 (RUN_DIR 필수) |
-| `rollout_cube_play_cpu_three.sh` | manip cube/puzzle CPU rollout 일괄 |
-| `rollout_cube_single_cpu_three.sh` | 위 스크립트의 cube-single default wrapper |
-| `profile_proposal_build.py` | `build_actor_proposals` 마이크로 프로파일러 |
+| `write_antmaze_res_subgoal_grid_yaml.py` | antmaze residual-subgoal grid YAML 생성 |
+| `write_cube_res_subgoal_grid_yaml.py` | cube/manip residual-subgoal grid YAML 생성 |
+| `write_sweep_run_yaml.py` | sweep 실행 YAML 생성 |
+| `sweep_res_subgoal_grid_lib.py` | sweep YAML 생성 공통 라이브러리 |
+| `sweep_antmaze_res_subgoal_grid_600ep.sh` | antmaze residual-subgoal grid sweep 실행 |
+| `sweep_cube_res_subgoal_grid_600ep.sh` | cube residual-subgoal grid sweep 실행 |
+| `sweep_antmaze_medium_goalrep_targetmode.sh` | antmaze-medium goal representation/target mode sweep 실행 |
+| `sweep_puzzle_humanoid_hparams_500ep.sh` | puzzle/humanoid hparam sweep 실행 |
+| `nohup_sweep_res_subgoal_grid_all.sh` | residual-subgoal grid 전체 sweep nohup 실행 |
+| `kill_sweep_when_run_done.sh` | sweep 완료 감지 후 관련 job 정리 |
+| `sweep_res_subgoal_cell_status.py` | sweep cell 진행/완료 상태 요약 |
 
 ## 테스트
 
 핵심 회귀 테스트는 `tests/`에 있습니다. JAX가 깔린 환경(`offrl` conda 등)에서 그냥 파일을 직접 실행합니다.
 
 ```bash
-cd /path/to/Pathbridger
+cd /path/to/PathBridger
 PYTHONPATH=. python tests/test_exact_residual_dynamics.py
 PYTHONPATH=. python tests/test_distributional_subgoal.py
 PYTHONPATH=. python tests/test_forward_bridge_planner.py

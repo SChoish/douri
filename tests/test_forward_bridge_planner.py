@@ -358,6 +358,36 @@ def test_idm_inference_uses_normalized_absolute_states():
     np.testing.assert_allclose(np.asarray(fake_network.next), np.asarray(agent._normalize_abs_state(flat_next)))
 
 
+def test_main_idm_actions_from_trajectories_normalizes_for_state_norm_agent():
+    from main import _idm_actions_from_trajectories
+
+    agent = _make_state_norm_agent()
+
+    class RecordingNetwork:
+        def __init__(self):
+            self.prev = None
+            self.next = None
+
+        def select(self, name):
+            assert name == 'idm_net'
+
+            def _call(prev, next_):
+                self.prev = prev
+                self.next = next_
+                return jnp.zeros((prev.shape[0], ACTION_DIM), dtype=jnp.float32)
+
+            return _call
+
+    fake_network = RecordingNetwork()
+    agent = agent.replace(network=fake_network)
+    traj = jnp.asarray(np.random.RandomState(16).randn(BATCH, 3, STATE_DIM).astype(np.float32))
+    _ = _idm_actions_from_trajectories(agent, np.asarray(traj), horizon=2)
+    flat_prev = traj[:, :2, :].reshape(-1, STATE_DIM)
+    flat_next = traj[:, 1:3, :].reshape(-1, STATE_DIM)
+    np.testing.assert_allclose(np.asarray(fake_network.prev), np.asarray(agent._normalize_abs_state(flat_prev)))
+    np.testing.assert_allclose(np.asarray(fake_network.next), np.asarray(agent._normalize_abs_state(flat_next)))
+
+
 def test_state_normalization_preserves_external_planner_endpoints():
     cfg = get_dynamics_config()
     cfg.dynamics_N = 4

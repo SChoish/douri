@@ -1,0 +1,63 @@
+# direct_chunk_trl on antmaze-large-navigate-v0 (gap0 / alpha1 ablation).
+# Same as antmaze_large_direct_chunk_trl te0/sn0, except:
+#   subgoal_value_gap_scale: 0  -> uniform subgoal MSE weight (no exp(c*gap))
+#   subgoal_value_alpha: 1.0    -> TRL bonus alpha * V(s, sg) * V(sg, g)
+
+env_name: antmaze-large-navigate-v0
+run_group: antmaze_large_direct_chunk_trl_te0_sn0_gap0_alpha1
+train_epochs: 600
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+horizon: 25
+plan_candidates: 4
+
+dynamics:
+  max_goal_steps_from_env: true
+  clip_path_to_goal: true
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 1
+  subgoal_value_alpha: 1.0
+  subgoal_value_gap_scale: 0.0
+  subgoal_goal_representation: phi
+  subgoal_target_mode: absolute
+  planner_type: forward_bridge_residual
+  forward_bridge_path_loss_horizon: 5
+  theta_schedule: prefix_progress
+  theta_total: 1.0
+  progress_alpha: 0.8
+  residual_target_mode: displacement
+  use_time_embedding: false
+  state_normalization: false
+
+critic_agent:
+  algorithm: direct_chunk_trl
+  critic_type: direct_chunk_trl
+  use_chunk_critic: false
+  action_chunk_horizon: 5
+  full_chunk_horizon: 25
+  discount: 0.995
+  tau_q: 0.7
+  tau_v: 0.9
+  lambda_q_base: 1.0
+  lambda_q_tri: 1.0
+  lambda_v: 1.0
+  use_v_in_q_target: false
+  trl_distance_reweight: true
+  trl_distance_weight_power: 1.0
+  trl_distance_weight_clip_min: 0.05
+  trl_distance_weight_clip_max: 1.0
+  trl_distance_weight_mode: inverse_value_offset
+  q_value_eps: 1.0e-6
+  goal_representation: phi
+  kappa_b: 0.9
+  kappa_d: 0.9
+  max_goal_steps_from_env: true
+  clip_chunk_to_goal: true
+
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0
+
+batch_size: 1024
+eval_freq: 100

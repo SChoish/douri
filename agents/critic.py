@@ -21,6 +21,53 @@ from utils.goal_representation import assert_phi_goal_obs_indices, goal_represen
 from utils.networks import MLP
 
 
+_VALID_CRITIC_TYPES = (
+    'dqc',
+    'iql',
+    'trl',
+    'chunk_trl',
+    'direct_chunk_trl',
+    'state_transitive',
+    'transitive_v_local_q',
+)
+_DIRECT_CHUNK_TRL_ALGORITHMS = ('chunk_trl', 'direct_chunk_trl', 'transitivechunkrl')
+_STATE_TRANSITIVE_ALGORITHMS = ('state_transitive', 'transitive_v_local_q')
+
+
+def _canonicalize_critic_config(config: dict) -> tuple[str, str, bool]:
+    """Normalize critic mode aliases in-place and return mode flags."""
+    critic_type = str(config.get('critic_type', 'dqc')).lower()
+    algorithm = str(config.get('algorithm', '')).lower()
+    if algorithm in _DIRECT_CHUNK_TRL_ALGORITHMS:
+        critic_type = 'direct_chunk_trl'
+    if algorithm in _STATE_TRANSITIVE_ALGORITHMS:
+        critic_type = 'state_transitive'
+    if critic_type not in _VALID_CRITIC_TYPES:
+        raise ValueError(
+            f"critic_type must be one of {', '.join(repr(x) for x in _VALID_CRITIC_TYPES)}, got {critic_type!r}"
+        )
+    is_state_transitive = critic_type in ('state_transitive', 'transitive_v_local_q')
+    is_trl = (
+        critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl')
+        or algorithm in _DIRECT_CHUNK_TRL_ALGORITHMS
+    )
+    if is_state_transitive:
+        config['critic_type'] = 'state_transitive'
+        config['algorithm'] = 'state_transitive'
+        config['use_chunk_critic'] = False
+        config['proposal_score_mode'] = 'q_plus_v'
+        config['subgoal_value_bonus_type'] = 'transitive_ratio'
+    elif is_trl:
+        config['critic_type'] = 'direct_chunk_trl'
+        config['algorithm'] = 'direct_chunk_trl'
+        config['use_chunk_critic'] = False
+    elif critic_type == 'iql' and bool(config.get('use_chunk_critic', False)):
+        config['use_chunk_critic'] = False
+    else:
+        config['critic_type'] = critic_type
+    return str(config['critic_type']), str(config.get('algorithm', algorithm)), (is_trl or is_state_transitive)
+
+
 def _safe_logit(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     x = jnp.clip(x, eps, 1.0 - eps)
     return jnp.log(x) - jnp.log1p(-x)
@@ -34,11 +81,13 @@ def _expectile_loss(diff: jnp.ndarray, tau: float) -> jnp.ndarray:
 def _is_direct_chunk_trl_type(critic_type: str, algorithm: str = '') -> bool:
     critic_type = str(critic_type).lower()
     algorithm = str(algorithm).lower()
-    return critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl') or algorithm in (
-        'chunk_trl',
-        'direct_chunk_trl',
-        'transitivechunkrl',
-    )
+    return critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl') or algorithm in _DIRECT_CHUNK_TRL_ALGORITHMS
+
+
+def _is_state_transitive_type(critic_type: str, algorithm: str = '') -> bool:
+    critic_type = str(critic_type).lower()
+    algorithm = str(algorithm).lower()
+    return critic_type in ('state_transitive', 'transitive_v_local_q') or algorithm in _STATE_TRANSITIVE_ALGORITHMS
 
 
 class ScalarValueNet(nn.Module):
@@ -124,6 +173,12 @@ class CriticAgent(flax.struct.PyTreeNode):
             str(self.config.get('algorithm', '')),
         )
 
+    def _is_state_transitive(self) -> bool:
+        return _is_state_transitive_type(
+            self._critic_type(),
+            str(self.config.get('algorithm', '')),
+        )
+
     def _has_chunk_critic(self) -> bool:
         """True iff ``critic_type='dqc'`` and ``use_chunk_critic`` is enabled.
 
@@ -132,6 +187,7 @@ class CriticAgent(flax.struct.PyTreeNode):
         """
         return (
             (not self._is_direct_chunk_trl())
+            and (not self._is_state_transitive())
             and self._critic_type() == 'dqc'
             and bool(self.config.get('use_chunk_critic', False))
         )
@@ -311,7 +367,40 @@ class CriticAgent(flax.struct.PyTreeNode):
         target_q_tri = jnp.clip(jax.lax.stop_gradient(q_left * q_right), eps, 1.0)[None, :]
         tri_valid = jnp.asarray(batch['trl_valid_mask'], dtype=jnp.float32) * valid_mask
         loss_q_tri_per = jnp.mean(_expectile_loss(target_q_tri - q_tri, tau_q), axis=0)
-        loss_q_tri = self._weighted_mean(loss_q_tri_per, tri_valid)
+
+        if bool(self.config.get('trl_distance_reweight', True)):
+            value_offsets = jnp.asarray(batch.get('value_offsets', jnp.ones_like(tri_valid)), dtype=jnp.float32)
+            split_offsets = jnp.asarray(
+                batch.get('trl_split_offsets', value_offsets),
+                dtype=jnp.float32,
+            )
+            mode = str(self.config.get('trl_distance_weight_mode', 'inverse_value_offset')).lower()
+            H = float(self.config['action_chunk_horizon'])
+            power = float(self.config.get('trl_distance_weight_power', 1.0))
+            clip_min = float(self.config.get('trl_distance_weight_clip_min', 0.05))
+            clip_max = float(self.config.get('trl_distance_weight_clip_max', 1.0))
+            if mode == 'inverse_value_offset':
+                dist = jnp.maximum(value_offsets, 1.0)
+                dist_w = jnp.power(H / dist, power)
+            elif mode == 'inverse_split_balance':
+                d_total = jnp.maximum(value_offsets, 1.0)
+                d_left = jnp.maximum(split_offsets, 1.0)
+                d_right = jnp.maximum(value_offsets - split_offsets, 1.0)
+                balance = 4.0 * d_left * d_right / jnp.maximum(d_total * d_total, 1.0)
+                dist_w = jnp.power(H / d_total, power) * balance
+            else:
+                raise ValueError(
+                    "trl_distance_weight_mode must be 'inverse_value_offset' or "
+                    f"'inverse_split_balance', got {mode!r}"
+                )
+            dist_w = jnp.clip(dist_w, clip_min, clip_max)
+            dist_w = jax.lax.stop_gradient(dist_w)
+            tri_weights = tri_valid * dist_w
+        else:
+            dist_w = jnp.ones_like(tri_valid)
+            tri_weights = tri_valid
+
+        loss_q_tri = self._weighted_mean(loss_q_tri_per, tri_weights)
 
         v_logit = self.network.select('value')(batch['observations'], goals, params=grad_params)
         v = jnp.clip(jax.nn.sigmoid(v_logit), eps, 1.0)
@@ -339,6 +428,19 @@ class CriticAgent(flax.struct.PyTreeNode):
             'v/target_mean': target_v.mean(),
             'sampler/trl_valid_fraction_raw': jnp.mean(jnp.asarray(batch['trl_valid_mask'], dtype=jnp.float32)),
             'sampler/valid_tri_fraction': jnp.mean(tri_valid),
+            'q/tri_distance_weight_mean': dist_w.mean(),
+            'q/tri_distance_weight_min': dist_w.min(),
+            'q/tri_distance_weight_max': dist_w.max(),
+            'sampler/value_offset_mean': jnp.mean(
+                jnp.asarray(batch.get('value_offsets', jnp.zeros_like(tri_valid)), dtype=jnp.float32)
+            ),
+            'sampler/split_offset_mean': jnp.mean(
+                jnp.asarray(batch.get('trl_split_offsets', jnp.zeros_like(tri_valid)), dtype=jnp.float32)
+            ),
+            'sampler/valid_split_offset_mean': self._weighted_mean(
+                jnp.asarray(batch.get('trl_split_offsets', jnp.zeros_like(tri_valid)), dtype=jnp.float32),
+                tri_valid,
+            ),
             # Backward-compatible keys used by existing logging/extraction paths.
             'action_critic/trl_loss': total,
             'action_critic/distill_loss': loss_q_tri,
@@ -349,6 +451,120 @@ class CriticAgent(flax.struct.PyTreeNode):
             'action_critic/v_mean': v.mean(),
             'action_critic/v_max': v.max(),
             'action_critic/v_min': v.min(),
+        }
+
+    def state_transitive_loss(self, batch: dict, grad_params: dict) -> tuple[jnp.ndarray, dict]:
+        """State-pair transitive V plus local subgoal-conditioned action Q.
+
+        In this mode ``value`` is the primary state-space critic.  The local
+        action critic is trained from target V, and no value target is derived
+        from action Q.
+        """
+        valid_mask = self._valid_mask(batch)
+        eps = float(self.config.get('q_value_eps', 1e-6))
+        discount = float(self.config['discount'])
+        tau_v = float(self.config.get('tau_v', 0.9))
+        lambda_v_base = float(self.config.get('lambda_v_base', 1.0))
+        lambda_v_tri = float(self.config.get('lambda_v_tri', 1.0))
+        lambda_q_local = float(self.config.get('lambda_q_local', 1.0))
+
+        observations = batch['observations']
+        goals = batch['value_goals']
+        split_obs = batch['trans_v_split_observations']
+
+        v_base_logits = self.network.select('value')(
+            observations, batch['value_base_goals'], params=grad_params,
+        )
+        v_base = jnp.clip(jax.nn.sigmoid(v_base_logits), eps, 1.0)
+        base_target = jnp.power(discount, jnp.asarray(batch['value_base_offsets'], dtype=jnp.float32))
+        loss_v_base_per = jnp.square(v_base - base_target)
+        loss_v_base = self._weighted_mean(loss_v_base_per, valid_mask)
+
+        v_tri_logits = self.network.select('value')(observations, goals, params=grad_params)
+        v_tri = jnp.clip(jax.nn.sigmoid(v_tri_logits), eps, 1.0)
+        target_left_logits = self.network.select('target_value')(observations, batch['trans_v_left_goals'])
+        target_right_logits = self.network.select('target_value')(split_obs, batch['trans_v_right_goals'])
+        target_v_left = jnp.clip(jax.nn.sigmoid(target_left_logits), eps, 1.0)
+        target_v_right = jnp.clip(jax.nn.sigmoid(target_right_logits), eps, 1.0)
+        target_v_tri = jax.lax.stop_gradient(jnp.clip(target_v_left * target_v_right, eps, 1.0))
+        tri_valid = jnp.asarray(batch['trans_v_valid_mask'], dtype=jnp.float32) * valid_mask
+        loss_v_tri_per = _expectile_loss(target_v_tri - v_tri, tau_v)
+
+        if bool(self.config.get('value_transitive_reweight', True)):
+            value_offsets = jnp.asarray(batch.get('value_offsets', jnp.ones_like(tri_valid)), dtype=jnp.float32)
+            split_offsets = jnp.asarray(
+                batch.get('trans_v_split_offsets', value_offsets),
+                dtype=jnp.float32,
+            )
+            horizon = jnp.asarray(float(self.config['action_chunk_horizon']), dtype=jnp.float32)
+            dist = jnp.maximum(value_offsets, 1.0)
+            balance = 4.0 * jnp.maximum(split_offsets, 1.0) * jnp.maximum(value_offsets - split_offsets, 1.0)
+            balance = balance / jnp.maximum(dist * dist, 1.0)
+            power = float(self.config.get('value_distance_weight_power', 1.0))
+            dist_w = jnp.power(horizon / dist, power) * balance
+            dist_w = jnp.clip(
+                dist_w,
+                float(self.config.get('value_distance_weight_clip_min', 0.05)),
+                float(self.config.get('value_distance_weight_clip_max', 1.0)),
+            )
+            dist_w = jax.lax.stop_gradient(dist_w)
+            tri_weights = tri_valid * dist_w
+        else:
+            dist_w = jnp.ones_like(tri_valid)
+            tri_weights = tri_valid
+        loss_v_tri = self._weighted_mean(loss_v_tri_per, tri_weights)
+
+        q_goals = batch.get('q_goals', goals)
+        q_logits = self.network.select('action_critic')(
+            observations, q_goals, batch['action_chunk_actions'], params=grad_params,
+        )
+        q_pred = jnp.clip(jax.nn.sigmoid(q_logits), eps, 1.0)
+        q_offsets = jnp.asarray(batch.get('q_goal_offsets', batch['value_offsets']), dtype=jnp.float32)
+        h = jnp.asarray(float(self.config['action_chunk_horizon']), dtype=jnp.float32)
+        target_v_logits = self.network.select('target_value')(
+            batch['action_chunk_next_observations'], q_goals,
+        )
+        target_v_next = jnp.clip(jax.nn.sigmoid(target_v_logits), eps, 1.0)
+        reached = (q_offsets >= 1.0) & (q_offsets <= h)
+        reached_target = jnp.power(discount, q_offsets)
+        bootstrap_target = jnp.power(discount, h) * target_v_next
+        target_q = jax.lax.stop_gradient(jnp.clip(jnp.where(reached, reached_target, bootstrap_target), eps, 1.0))
+        loss_q_per = jnp.mean(optax.sigmoid_binary_cross_entropy(q_logits, target_q[None, :]), axis=0)
+        loss_q = self._weighted_mean(loss_q_per, valid_mask)
+
+        total = lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri + lambda_q_local * loss_q
+        q_agg = self.aggregate_ensemble_q(q_pred)
+        return total, {
+            'loss/total': total,
+            'value/loss': lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri,
+            'value/base_loss': loss_v_base,
+            'value/tri_loss': loss_v_tri,
+            'value/base_pred_mean': v_base.mean(),
+            'value/base_target_mean': base_target.mean(),
+            'value/tri_pred_mean': v_tri.mean(),
+            'value/tri_target_mean': target_v_tri.mean(),
+            'value/trans_valid_fraction': jnp.mean(tri_valid),
+            'value/value_offset_mean': jnp.mean(
+                jnp.asarray(batch.get('value_offsets', jnp.zeros_like(tri_valid)), dtype=jnp.float32)
+            ),
+            'value/split_offset_mean': jnp.mean(
+                jnp.asarray(batch.get('trans_v_split_offsets', jnp.zeros_like(tri_valid)), dtype=jnp.float32)
+            ),
+            'value/tri_distance_weight_mean': dist_w.mean(),
+            'local_q/loss': loss_q,
+            'local_q/pred_mean': q_agg.mean(),
+            'local_q/target_mean': target_q.mean(),
+            'local_q/target_v_mean': target_v_next.mean(),
+            # Compatibility with existing logging/extraction paths.
+            'action_critic/trl_loss': total,
+            'action_critic/distill_loss': loss_q,
+            'action_critic/value_loss': lambda_v_base * loss_v_base + lambda_v_tri * loss_v_tri,
+            'action_critic/q_part_mean': q_agg.mean(),
+            'action_critic/target_v_mean': target_q.mean(),
+            'action_critic/adv': (target_q - q_agg).mean(),
+            'action_critic/v_mean': v_tri.mean(),
+            'action_critic/v_max': v_tri.max(),
+            'action_critic/v_min': v_tri.min(),
         }
 
     def _flatten_action_candidates(self, action_chunk_actions: jnp.ndarray) -> tuple[jnp.ndarray, int]:
@@ -407,8 +623,8 @@ class CriticAgent(flax.struct.PyTreeNode):
             else:
                 use_partial_critic = True
 
-        # IQL/direct chunk TRL: never call DQC chunk_critic (module not initialized).
-        force_partial = critic_type == 'iql' or self._is_direct_chunk_trl()
+        # IQL/TRL/state-transitive: never call DQC chunk_critic (module not initialized).
+        force_partial = critic_type == 'iql' or self._is_direct_chunk_trl() or self._is_state_transitive()
         if force_partial or bool(use_partial_critic) or not bool(self.config['use_chunk_critic']):
             logits = self.network.select('action_critic')(obs_rep, goal_rep, flat_actions, params=network_params)
         else:
@@ -416,11 +632,46 @@ class CriticAgent(flax.struct.PyTreeNode):
         qs = jax.nn.sigmoid(logits).reshape(logits.shape[0], obs.shape[0], num_candidates)
         return self.aggregate_ensemble_q(qs).reshape(obs.shape[0], num_candidates)
 
+    @partial(jax.jit, static_argnames=())
+    def score_transitive_subgoals(
+        self,
+        observations: jnp.ndarray,
+        subgoals: jnp.ndarray,
+        goals: jnp.ndarray,
+        network_params: dict | None = None,
+    ) -> jnp.ndarray:
+        eps = jnp.asarray(float(self.config.get('subgoal_value_ratio_eps', 1e-6)), dtype=jnp.float32)
+        obs = jnp.asarray(observations, dtype=jnp.float32)
+        z = jnp.asarray(subgoals, dtype=jnp.float32)
+        g = jnp.asarray(goals, dtype=jnp.float32)
+        num_candidates = z.shape[1] if z.ndim == 3 else 1
+        obs_rep = jnp.repeat(obs[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
+        if z.ndim == 3:
+            z_flat = z.reshape(z.shape[0] * num_candidates, -1)
+        else:
+            z_flat = z
+        if g.ndim == 3:
+            g_flat = g.reshape(g.shape[0] * num_candidates, -1)
+        else:
+            g_flat = jnp.repeat(g[:, None, :], num_candidates, axis=1).reshape(obs.shape[0] * num_candidates, -1)
+
+        v_s_z = jax.nn.sigmoid(self.network.select('value')(obs_rep, z_flat, params=network_params))
+        v_z_g = jax.nn.sigmoid(self.network.select('value')(z_flat, g_flat, params=network_params))
+        v_s_g = jax.nn.sigmoid(self.network.select('value')(obs_rep, g_flat, params=network_params))
+        ratio = (v_s_z * v_z_g) / (v_s_g + eps)
+        return ratio.reshape(obs.shape[0], num_candidates)
+
     @jax.jit
     def total_loss(self, batch: dict, grad_params: dict, rng=None):
         batch = jax.tree_util.tree_map(lambda x: jnp.asarray(x), batch)
         info = {}
         total = jnp.asarray(0.0, dtype=jnp.float32)
+        if self._is_state_transitive():
+            tl, ti = self.state_transitive_loss(batch, grad_params)
+            info['chunk_critic/critic_loss'] = jnp.asarray(0.0, dtype=jnp.float32)
+            info.update(ti)
+            info['total_loss'] = tl
+            return tl, info
         if self._is_direct_chunk_trl():
             tl, ti = self.direct_chunk_trl_loss(batch, grad_params)
             info['chunk_critic/critic_loss'] = jnp.asarray(0.0, dtype=jnp.float32)
@@ -455,7 +706,7 @@ class CriticAgent(flax.struct.PyTreeNode):
             updated['modules_action_critic'],
             updated['modules_target_action_critic'],
         )
-        if self._is_direct_chunk_trl():
+        if self._is_direct_chunk_trl() or self._is_state_transitive():
             updated['modules_target_value'] = jax.tree_util.tree_map(
                 lambda p, tp: p * tau + tp * (1.0 - tau),
                 updated['modules_value'],
@@ -464,6 +715,24 @@ class CriticAgent(flax.struct.PyTreeNode):
         return network.replace(params=updated)
 
     def _validate_direct_chunk_trl_batch(self, batch: dict) -> None:
+        if self._is_state_transitive():
+            required = (
+                'observations',
+                'value_goals',
+                'action_chunk_actions',
+                'action_chunk_next_observations',
+                'value_offsets',
+                'value_base_goals',
+                'value_base_offsets',
+                'trans_v_split_observations',
+                'trans_v_left_goals',
+                'trans_v_right_goals',
+                'trans_v_valid_mask',
+            )
+            missing = [key for key in required if key not in batch]
+            if missing:
+                raise KeyError(f"state_transitive batch missing required keys: {missing}")
+            return
         if not self._is_direct_chunk_trl():
             return
         required = (
@@ -529,20 +798,7 @@ class CriticAgent(flax.struct.PyTreeNode):
             where='CriticAgent.create (critic goal_representation)',
             env_name=env_name,
         )
-        critic_type = str(config.get('critic_type', 'dqc')).lower()
-        algorithm = str(config.get('algorithm', '')).lower()
-        if _is_direct_chunk_trl_type(critic_type, algorithm):
-            config['algorithm'] = 'direct_chunk_trl'
-            config['critic_type'] = 'direct_chunk_trl'
-            config['use_chunk_critic'] = False
-            critic_type = 'direct_chunk_trl'
-            algorithm = 'direct_chunk_trl'
-        if critic_type not in ('dqc', 'iql', 'trl', 'chunk_trl', 'direct_chunk_trl'):
-            raise ValueError(
-                f"critic_type must be one of 'dqc', 'iql', 'trl', 'chunk_trl', or "
-                f"'direct_chunk_trl', got {critic_type!r}"
-            )
-        is_trl = _is_direct_chunk_trl_type(critic_type, algorithm)
+        critic_type, _algorithm, is_trl = _canonicalize_critic_config(config)
 
         value_def = ScalarValueNet(
             hdims,
@@ -606,18 +862,7 @@ class CriticAgent(flax.struct.PyTreeNode):
 
 
 def validate_config(critic_config, actor_config=None) -> None:
-    critic_type = str(critic_config.get('critic_type', 'dqc')).lower()
-    algorithm = str(critic_config.get('algorithm', '')).lower()
-    if algorithm in ('chunk_trl', 'direct_chunk_trl', 'transitivechunkrl'):
-        critic_type = 'direct_chunk_trl'
-    if critic_type not in ('dqc', 'iql', 'trl', 'chunk_trl', 'direct_chunk_trl'):
-        raise ValueError(
-            f"critic_type must be one of 'dqc', 'iql', 'trl', 'chunk_trl', or "
-            f"'direct_chunk_trl', got {critic_type!r}"
-        )
-    critic_config['critic_type'] = critic_type
-    if _is_direct_chunk_trl_type(critic_type, algorithm):
-        critic_config['algorithm'] = 'direct_chunk_trl'
+    _canonicalize_critic_config(critic_config)
 
     action_chunk_horizon = int(critic_config.get('action_chunk_horizon', 0))
     full_chunk_horizon = int(critic_config.get('full_chunk_horizon', 0))
@@ -628,11 +873,6 @@ def validate_config(critic_config, actor_config=None) -> None:
             f'full_chunk_horizon must be >= action_chunk_horizon, '
             f'got full_chunk_horizon={full_chunk_horizon}, action_chunk_horizon={action_chunk_horizon}.'
         )
-    if (critic_type == 'iql' or _is_direct_chunk_trl_type(critic_type, algorithm)) and bool(
-        critic_config.get('use_chunk_critic', False)
-    ):
-        # IQL/direct chunk TRL never train DQC chunk_critic; force the flag off.
-        critic_config['use_chunk_critic'] = False
     if actor_config is None:
         return
     if int(actor_config.get('actor_chunk_horizon', 0)) < 1:
@@ -680,6 +920,9 @@ def get_config():
             # 'direct_chunk_trl'/'chunk_trl'/'trl':
             #                  direct chunk-level TRL with Q_H as the primary
             #                  learned object and V as an expectile readout.
+            # 'state_transitive'/'transitive_v_local_q':
+            #                  primary state-pair transitive V plus local
+            #                  subgoal-conditioned action Q trained from V.
             algorithm='dqc',
             critic_type='dqc',
             use_chunk_critic=True,
@@ -689,6 +932,26 @@ def get_config():
             lambda_q_tri=1.0,
             lambda_v=1.0,
             use_v_in_q_target=False,
+            lambda_v_base=1.0,
+            lambda_v_tri=1.0,
+            value_base_horizon=5,
+            value_transitive_reweight=True,
+            value_distance_weight_power=1.0,
+            value_distance_weight_clip_min=0.05,
+            value_distance_weight_clip_max=1.0,
+            lambda_q_local=1.0,
+            q_target_from_value=True,
+            subgoal_value_bonus_type='single_value',
+            subgoal_value_ratio_eps=1e-6,
+            proposal_score_mode='q_only',
+            proposal_q_weight=1.0,
+            proposal_v_weight=1.0,
+            trl_distance_reweight=True,
+            trl_distance_weight_power=1.0,
+            trl_distance_weight_clip_min=0.05,
+            trl_distance_weight_clip_max=1.0,
+            trl_distance_weight_mode='inverse_value_offset',
+            rescore_single_candidate=False,
             q_value_eps=1e-6,
             distill_method='expectile',
             kappa_d=0.7,

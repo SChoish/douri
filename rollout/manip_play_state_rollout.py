@@ -40,7 +40,6 @@ if 'JAX_PLATFORMS' not in os.environ:
 
 import argparse
 import contextlib
-import json
 from pathlib import Path
 
 import jax

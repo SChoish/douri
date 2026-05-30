@@ -558,6 +558,158 @@ def test_displacement_mode_build_actor_proposals_returns_absolute_goals():
     assert cand_goals.shape[-1] == STATE_DIM
 
 
+def _make_trl_critic_agent():
+    cfg = get_critic_config()
+    cfg.critic_type = 'direct_chunk_trl'
+    cfg.algorithm = 'direct_chunk_trl'
+    cfg.use_chunk_critic = False
+    cfg.goal_representation = 'full'
+    cfg.action_chunk_horizon = 2
+    cfg.full_chunk_horizon = 4
+    cfg.value_hidden_dims = (32, 32)
+    cfg.action_dim = ACTION_DIM
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    ex_part = np.zeros((BATCH, cfg.action_chunk_horizon * ACTION_DIM), dtype=np.float32)
+    return CriticAgent.create(
+        seed=0,
+        ex_observations=ex_obs,
+        ex_full_chunk_actions=None,
+        ex_action_chunk_actions=ex_part,
+        config=cfg,
+        ex_goals=ex_obs,
+    )
+
+
+def _subgoal_value_test_config_updates() -> dict:
+    return {
+        'subgoal_value_goal_representation': 'full',
+        'subgoal_value_hidden_dims': (32, 32),
+    }
+
+
+def test_trl_subgoal_value_bonus_uses_product_form():
+    critic = _make_trl_critic_agent()
+    value_params = critic.network.params['modules_value']
+    agent = _make_dynamics_agent(
+        'diag_gaussian',
+        config_updates={
+            **_subgoal_value_test_config_updates(),
+            'critic_type': 'direct_chunk_trl',
+            'algorithm': 'direct_chunk_trl',
+            'subgoal_value_alpha': 1.0,
+        },
+    )
+    rng = np.random.default_rng(17)
+    s = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    sg = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    target = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+
+    (
+        pred_value,
+        _obs_value,
+        _target_value,
+        bonus,
+        _mse_weight,
+        _gap,
+        _adv_logit,
+        v_s_sg,
+        v_sg_g,
+    ) = agent._subgoal_value_terms(s, sg, target, g, value_params)
+
+    v_s_sg_expected = agent._subgoal_values(s, sg, value_params)
+    v_sg_g_expected = pred_value
+    np.testing.assert_allclose(np.asarray(v_s_sg), np.asarray(v_s_sg_expected), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(v_sg_g), np.asarray(v_sg_g_expected), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(bonus),
+        np.asarray(v_s_sg_expected * v_sg_g_expected),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_state_transitive_subgoal_bonus_ratio_and_gradients():
+    critic = _make_trl_critic_agent()
+    value_params = critic.network.params['modules_value']
+    agent = _make_dynamics_agent(
+        'diag_gaussian',
+        config_updates={
+            **_subgoal_value_test_config_updates(),
+            'critic_type': 'state_transitive',
+            'algorithm': 'state_transitive',
+            'subgoal_value_alpha': 1.0,
+            'subgoal_value_bonus_type': 'transitive_ratio',
+            'subgoal_value_ratio_eps': 1e-6,
+        },
+    )
+    rng = np.random.default_rng(23)
+    s = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    sg = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    target = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+
+    pred_value, obs_value, _, bonus, _, _, _, v_s_sg, v_sg_g = agent._subgoal_value_terms(
+        s, sg, target, g, value_params,
+    )
+    expected_ratio = v_s_sg * v_sg_g / (obs_value + 1e-6)
+    assert np.all(np.isfinite(np.asarray(expected_ratio)))
+    np.testing.assert_allclose(np.asarray(bonus), np.asarray(expected_ratio), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(v_sg_g), np.asarray(pred_value), rtol=1e-5, atol=1e-6)
+
+    def bonus_sum(z, params):
+        _, _, _, b, _, _, _, _, _ = agent._subgoal_value_terms(s, z, target, g, params)
+        return jnp.sum(b)
+
+    grad_sg, grad_params = jax.grad(bonus_sum, argnums=(0, 1))(sg, value_params)
+    assert float(jnp.sum(jnp.abs(grad_sg))) > 0.0
+    param_grad_sum = sum(float(jnp.sum(jnp.abs(x))) for x in jax.tree_util.tree_leaves(grad_params))
+    assert param_grad_sum == 0.0
+
+
+def test_dqc_subgoal_value_bonus_uses_single_value_form():
+    critic = _make_critic_agent()
+    critic_cfg = get_critic_config()
+    critic_cfg.goal_representation = 'full'
+    critic_cfg.value_hidden_dims = (32, 32)
+    critic_cfg.action_chunk_horizon = 2
+    critic_cfg.full_chunk_horizon = 4
+    critic_cfg.action_dim = ACTION_DIM
+    ex_obs = np.zeros((BATCH, STATE_DIM), dtype=np.float32)
+    ex_full = np.zeros((BATCH, critic_cfg.full_chunk_horizon * ACTION_DIM), dtype=np.float32)
+    ex_part = np.zeros((BATCH, critic_cfg.action_chunk_horizon * ACTION_DIM), dtype=np.float32)
+    critic = CriticAgent.create(
+        seed=0,
+        ex_observations=ex_obs,
+        ex_full_chunk_actions=ex_full,
+        ex_action_chunk_actions=ex_part,
+        config=critic_cfg,
+        ex_goals=ex_obs,
+    )
+    value_params = critic.network.params['modules_value']
+    agent = _make_dynamics_agent(
+        'diag_gaussian',
+        config_updates={
+            **_subgoal_value_test_config_updates(),
+            'critic_type': 'dqc',
+            'algorithm': 'dqc',
+            'subgoal_value_alpha': 0.5,
+        },
+    )
+    rng = np.random.default_rng(19)
+    s = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    sg = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    target = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+    g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
+
+    pred_value, _, _, bonus, _, _, _, v_s_sg, v_sg_g = agent._subgoal_value_terms(
+        s, sg, target, g, value_params,
+    )
+    np.testing.assert_allclose(np.asarray(bonus), 0.5 * np.asarray(pred_value), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(v_s_sg), 0.0, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(v_sg_g), np.asarray(pred_value), rtol=1e-5, atol=1e-6)
+
+
 if __name__ == '__main__':
     failures = []
     for name, fn in list(globals().items()):

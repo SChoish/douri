@@ -31,10 +31,8 @@ import argparse
 import pickle
 from pathlib import Path
 
-import flax
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
 
 from agents.dynamics import DynamicsAgent
@@ -145,7 +143,15 @@ def rollout_dynamics_idm_env(
 
         o_prev = jnp.asarray(chunk_traj_raw[:-1], dtype=jnp.float32)
         o_next = jnp.asarray(chunk_traj_raw[1:], dtype=jnp.float32)
-        actions = np.asarray(jax.device_get(_idm_actions(idm_params, o_prev, o_next)), dtype=np.float32)
+        actions = np.asarray(
+            jax.device_get(
+                agent._idm_actions_from_trajectories(
+                    jnp.asarray(chunk_traj_raw[None, ...], dtype=jnp.float32),
+                    int(action_chunk_horizon),
+                )
+            ),
+            dtype=np.float32,
+        )[0]
 
         n_exec = min(int(actions.shape[0]), max(1, int(action_chunk_horizon)))
         for _ in range(n_exec):

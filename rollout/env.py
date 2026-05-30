@@ -8,6 +8,8 @@ import os
 
 import numpy as np
 
+from rollout.maze_navigator import MazeNavigatorMap
+
 
 def configure_mujoco_gl(mujoco_gl: str) -> None:
     """Set ``MUJOCO_GL`` before creating MuJoCo-backed envs (headless ``rgb_array`` rollouts).
@@ -22,8 +24,6 @@ def configure_mujoco_gl(mujoco_gl: str) -> None:
         os.environ['MUJOCO_GL'] = s
     elif not (os.environ.get('DISPLAY') or '').strip():
         os.environ.setdefault('MUJOCO_GL', 'egl')
-
-from rollout.maze_navigator import MazeNavigatorMap
 
 
 def sync_env_state_from_obs_vector(env, obs: np.ndarray, goal_obs: np.ndarray) -> np.ndarray:
@@ -143,24 +143,31 @@ def sync_env_state_from_compact_manip_obs(env, obs: np.ndarray) -> np.ndarray:
         )
 
     p = 0
-    arm_qpos = obs[p:p + J]; p += J
-    arm_qvel = obs[p:p + J]; p += J
+    arm_qpos = obs[p:p + J]
+    p += J
+    arm_qvel = obs[p:p + J]
+    p += J
     p += 3 + 1 + 1  # skip effector_pos / cos/sin yaw (FK).
-    grip_open_scaled = float(obs[p]); p += 1
+    grip_open_scaled = float(obs[p])
+    p += 1
     p += 1  # skip gripper_contact (sensor).
 
     cube_pos_quat: list[tuple[np.ndarray, np.ndarray]] = []
     for _ in range(n_cubes):
-        c_pos_scaled = obs[p:p + 3]; p += 3
-        c_quat = obs[p:p + 4]; p += 4
+        c_pos_scaled = obs[p:p + 3]
+        p += 3
+        c_quat = obs[p:p + 4]
+        p += 4
         p += 1 + 1  # skip cos/sin yaw.
         cube_pos_quat.append((c_pos_scaled, c_quat))
 
     button_states = np.zeros((n_buttons,), dtype=np.int64)
     button_pos: list[np.ndarray] = []
     for i in range(n_buttons):
-        oh = obs[p:p + n_button_states]; p += n_button_states
-        bp = obs[p:p + b0_pos_dim]; p += b0_pos_dim
+        oh = obs[p:p + n_button_states]
+        p += n_button_states
+        bp = obs[p:p + b0_pos_dim]
+        p += b0_pos_dim
         p += b0_vel_dim  # button_vel ignored (qvel zeroed below).
         button_states[i] = int(np.argmax(oh))
         button_pos.append(np.asarray(bp, dtype=np.float64) / _MANIP_BUTTON_SCALER)

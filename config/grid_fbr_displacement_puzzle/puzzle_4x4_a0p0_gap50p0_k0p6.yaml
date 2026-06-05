@@ -1,0 +1,32 @@
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0
+batch_size: 1024
+critic_agent:
+  action_chunk_horizon: 5
+  clip_chunk_to_goal: true
+  discount: 0.99
+  goal_representation: phi
+  kappa_b: 0.6
+  kappa_d: 0.6
+  max_goal_steps_from_env: true
+dynamics:
+  clip_path_to_goal: true
+  forward_bridge_path_loss_horizon: 5
+  max_goal_steps_from_env: true
+  planner_type: forward_bridge_residual
+  subgoal_distribution: diag_gaussian
+  subgoal_goal_representation: phi
+  subgoal_num_samples: 4
+  subgoal_stochastic_loss: nll
+  subgoal_target_mode: displacement
+  subgoal_value_alpha: 0.0
+  subgoal_value_gap_scale: 50.0
+env_name: puzzle-4x4-play-v0
+eval_freq: 100
+horizon: 25
+log_every_n_epochs: 10
+plan_candidates: 1
+run_group: grid_fbr_disp_puzzle_4x4_a0p0_gap50p0_k0p6
+save_every_n_epochs: 100
+train_epochs: 400

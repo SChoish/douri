@@ -5,4 +5,5 @@ dynamics:
   subgoal_num_samples: 4
   subgoal_flow_steps: 8
   subgoal_flow_use_value_bonus: false
+  subgoal_flow_noise_scale: 1.0
   subgoal_value_alpha: 0.0

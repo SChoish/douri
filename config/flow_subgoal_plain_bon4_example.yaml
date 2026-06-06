@@ -1,0 +1,22 @@
+dynamics:
+  subgoal_distribution: flow
+  subgoal_target_mode: displacement
+  residual_target_mode: displacement
+
+  # Plain Flow-BC: no value tilting, no generated endpoint value bonus.
+  subgoal_flow_energy_weighted: false
+  subgoal_flow_use_value_bonus: false
+  subgoal_value_alpha: 0.0
+
+  # Flow sampler.
+  subgoal_flow_steps: 8
+  subgoal_flow_t_min: 1.0e-4
+
+  # Training actor proposal diversity.
+  subgoal_num_samples: 4
+
+  # Eval-time endpoint selection.
+  subgoal_eval_selection: best_of_n_value
+  subgoal_eval_num_samples: 4
+  subgoal_eval_include_zero_candidate: false
+  subgoal_eval_seed: 0

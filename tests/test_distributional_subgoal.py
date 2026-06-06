@@ -33,7 +33,7 @@ from agents.dynamics import (
     get_dynamics_config,
 )
 from agents.critic import CriticAgent, get_config as get_critic_config
-from main import _rescore_actor_batch_for_update
+from main import _rescore_actor_batch_for_update, _select_eval_subgoal
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +168,44 @@ def test_distributional_subgoal_sampling_shapes():
     assert mu2.shape == (BATCH, STATE_DIM)
     # In diag_gaussian mode candidate 0 is pinned to the mean when include_mean=True.
     np.testing.assert_allclose(np.asarray(cand[:, 0, :]), np.asarray(mu2), rtol=1e-5, atol=1e-6)
+
+
+def test_flow_subgoal_sampling_shapes_and_mean_pin():
+    agent = _make_dynamics_agent(
+        'flow',
+        subgoal_num_samples=3,
+        config_updates={'subgoal_flow_steps': 2, 'subgoal_flow_use_value_bonus': False},
+    )
+    obs = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
+    g = jnp.zeros((BATCH, STATE_DIM), dtype=jnp.float32)
+    pred = agent.predict_subgoal(obs, g)
+    assert pred.shape == (BATCH, STATE_DIM)
+    mu, log_std = agent.infer_subgoal_distribution(obs, g)
+    assert mu.shape == (BATCH, STATE_DIM)
+    assert log_std.shape == (BATCH, STATE_DIM)
+    np.testing.assert_allclose(np.asarray(mu), np.asarray(pred), rtol=1e-5, atol=1e-6)
+
+    cand, mu2 = agent.sample_subgoal_candidates(
+        obs, g, jax.random.PRNGKey(0), num_candidates=5, include_mean=True,
+    )
+    assert cand.shape == (BATCH, 5, STATE_DIM)
+    assert mu2.shape == (BATCH, STATE_DIM)
+    np.testing.assert_allclose(np.asarray(cand[:, 0, :]), np.asarray(mu2), rtol=1e-5, atol=1e-6)
+
+
+def test_flow_build_actor_proposals_subgoal_samples_times_plan_candidates():
+    subgoal_samples = 3
+    plan_candidates = 4
+    agent = _make_dynamics_agent(
+        'flow',
+        subgoal_num_samples=subgoal_samples,
+        config_updates={'subgoal_flow_steps': 2, 'subgoal_flow_use_value_bonus': False},
+    )
+    _check_build_actor_proposals(
+        agent,
+        plan_candidates=plan_candidates,
+        expected_candidates=subgoal_samples * plan_candidates,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +371,85 @@ def test_distributional_subgoal_loss_is_finite():
     assert float(info['phase1/subgoal_stochastic_loss_mode']) == 0.0
 
 
+def test_flow_subgoal_loss_is_finite():
+    agent = _make_dynamics_agent(
+        'flow',
+        config_updates={'subgoal_flow_steps': 2, 'subgoal_flow_use_value_bonus': False},
+    )
+    batch = _make_phase1_batch()
+    _, info = agent.update(batch, critic_value_params=None)
+    for k, v in info.items():
+        assert np.all(np.isfinite(np.asarray(v))), f'non-finite log value at {k}: {v}'
+    for required in (
+        'phase1/subgoal_flow_loss',
+        'phase1/subgoal_flow_fm_raw',
+        'phase1/subgoal_flow_weighted_fm',
+        'phase1/subgoal_flow_weight_mean',
+        'phase1/subgoal_flow_weight_max',
+        'phase1/subgoal_flow_value_gap_mean',
+        'phase1/subgoal_flow_t_mean',
+        'phase1/subgoal_flow_velocity_norm',
+        'phase1/subgoal_flow_velocity_reg',
+        'phase1/subgoal_flow_energy_weighted',
+        'phase1/subgoal_flow_energy_weight_mean',
+        'phase1/subgoal_flow_energy_weight_max',
+        'phase1/subgoal_stochastic_loss',
+        'phase1/subgoal_stochastic_loss_mode',
+        'phase1/subgoal_weighted_mse',
+        'phase1/subgoal_weighted_nll',
+        'phase1/subgoal_mode',
+    ):
+        assert required in info, f'missing log key {required}'
+    assert float(info['phase1/subgoal_mode']) == 2.0
+    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 2.0
+    np.testing.assert_allclose(
+        np.asarray(info['phase1/subgoal_stochastic_loss']),
+        np.asarray(info['phase1/subgoal_weighted_mse']),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_plain_flow_bc_loss_uses_unit_weights_and_eval_goal_l2_selector():
+    agent = _make_dynamics_agent(
+        'flow',
+        subgoal_num_samples=4,
+        config_updates={
+            'subgoal_flow_steps': 2,
+            'subgoal_flow_energy_weighted': False,
+            'subgoal_flow_use_value_bonus': False,
+            'subgoal_target_mode': 'displacement',
+            'residual_target_mode': 'displacement',
+            'subgoal_eval_selection': 'best_of_n_goal_l2',
+            'subgoal_eval_num_samples': 4,
+            'subgoal_eval_include_zero_candidate': False,
+        },
+    )
+    batch = _make_phase1_batch()
+    _, info = agent.update(batch, critic_value_params=None)
+    assert float(info['phase1/subgoal_flow_energy_weighted']) == 0.0
+    np.testing.assert_allclose(np.asarray(info['phase1/subgoal_flow_energy_weight_mean']), 1.0, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(info['phase1/subgoal_flow_energy_weight_max']), 1.0, rtol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(info['phase1/subgoal_flow_fm_raw']),
+        np.asarray(info['phase1/subgoal_flow_weighted_fm']),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    candidates, _ = agent.sample_subgoal_candidates(
+        batch['observations'], batch['high_actor_goals'], jax.random.PRNGKey(42),
+        num_candidates=4, include_mean=False,
+    )
+    assert candidates.shape == (BATCH, 4, STATE_DIM)
+    selected, stats, _ = _select_eval_subgoal(
+        agent, None, np.asarray(batch['observations'][0]), np.asarray(batch['high_actor_goals'][0]), jax.random.PRNGKey(7),
+    )
+    assert selected.shape == (STATE_DIM,)
+    assert stats['eval/subgoal_selection_mode_id'] == 3.0
+    assert stats['eval/subgoal_selection_num_candidates'] == 4.0
+
+
 def test_distributional_subgoal_nll_loss_option_is_finite():
     agent = _make_dynamics_agent('diag_gaussian', config_updates={'subgoal_stochastic_loss': 'nll'})
     batch = _make_phase1_batch()
@@ -384,6 +501,15 @@ def test_dynamics_config_defaults_are_usable():
     assert str(cfg.subgoal_stochastic_loss) == 'mse'
     assert bool(cfg.subgoal_use_mean_for_actor_goal) is True
     assert int(cfg.subgoal_num_samples) == 1
+    assert int(cfg.subgoal_flow_steps) == 8
+    assert float(cfg.subgoal_flow_t_min) == 1e-4
+    assert bool(cfg.subgoal_flow_use_value_bonus) is False
+    assert bool(cfg.subgoal_flow_energy_weighted) is True
+    assert str(cfg.subgoal_eval_selection) == 'zero'
+    assert int(cfg.subgoal_eval_num_samples) == 1
+    assert bool(cfg.subgoal_eval_include_zero_candidate) is True
+    assert int(cfg.subgoal_eval_seed) == 0
+    assert float(cfg.subgoal_flow_noise_scale) == 1.0
     assert str(cfg.subgoal_value_style) == 'exponential'
     assert float(cfg.subgoal_value_expectile) == 0.7
     assert float(cfg.subgoal_value_gap_scale) == 1.0

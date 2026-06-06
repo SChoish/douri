@@ -963,6 +963,96 @@ def _idm_action_chunk(
     return action_chunk[0]
 
 
+def _select_eval_subgoal(
+    dynamics_agent: DynamicsAgent,
+    critic_value_params: Any | None,
+    obs: np.ndarray,
+    goal: np.ndarray,
+    rng,
+) -> tuple[np.ndarray, dict[str, float], Any]:
+    """Select a subgoal endpoint for eval-time flow policies."""
+    obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+    goal = np.asarray(goal, dtype=np.float32).reshape(-1)
+    sub_mode = str(dynamics_agent.config.get('subgoal_distribution', 'deterministic')).lower()
+    if sub_mode != 'flow':
+        pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+        return pred, {}, rng
+
+    selection = str(dynamics_agent.config.get('subgoal_eval_selection', 'zero')).lower()
+    mode_ids = {
+        'zero': 0.0,
+        'mean': 0.0,
+        'deterministic': 0.0,
+        'sample': 1.0,
+        'best_of_n_value': 2.0,
+        'best_of_n_goal_l2': 3.0,
+    }
+    if selection not in mode_ids:
+        raise ValueError(
+            "subgoal_eval_selection must be one of 'zero', 'mean', 'deterministic', "
+            f"'sample', 'best_of_n_value', or 'best_of_n_goal_l2', got {selection!r}."
+        )
+
+    new_rng, sample_rng = jax.random.split(rng)
+    if selection in ('zero', 'mean', 'deterministic'):
+        pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+        stats = {
+            'eval/subgoal_selection_mode_id': 0.0,
+            'eval/subgoal_selection_num_candidates': 1.0,
+            'eval/subgoal_selection_selected_idx': 0.0,
+            'eval/subgoal_selection_score_mean': 0.0,
+            'eval/subgoal_selection_score_max': 0.0,
+            'eval/subgoal_selection_score_std': 0.0,
+            'eval/subgoal_selection_candidate_diversity_l2': 0.0,
+        }
+        return pred, stats, new_rng
+
+    if selection == 'sample':
+        num_candidates = 1
+        include_zero = False
+    else:
+        num_candidates = max(1, int(dynamics_agent.config.get('subgoal_eval_num_samples', 1)))
+        include_zero = bool(dynamics_agent.config.get('subgoal_eval_include_zero_candidate', True))
+
+    candidates, _ = dynamics_agent.sample_subgoal_candidates(
+        jnp.asarray(obs[None, :], dtype=jnp.float32),
+        jnp.asarray(goal[None, :], dtype=jnp.float32),
+        sample_rng,
+        num_candidates=num_candidates,
+        include_mean=include_zero,
+    )
+    candidates = np.asarray(jax.device_get(candidates), dtype=np.float32).reshape(num_candidates, -1)
+    if selection == 'best_of_n_value':
+        if critic_value_params is None:
+            raise RuntimeError(
+                "subgoal_eval_selection='best_of_n_value' requires critic value params; "
+                "pass critic_agent to _evaluate_env_tasks or use 'best_of_n_goal_l2'."
+            )
+        repeated_goal = jnp.repeat(jnp.asarray(goal[None, :], dtype=jnp.float32), num_candidates, axis=0)
+        scores = dynamics_agent._subgoal_values(
+            jnp.asarray(candidates, dtype=jnp.float32), repeated_goal, critic_value_params,
+        )
+        scores = np.asarray(jax.device_get(scores), dtype=np.float32).reshape(num_candidates)
+    elif selection == 'best_of_n_goal_l2':
+        scores = -np.mean((candidates - goal[None, :]) ** 2, axis=-1)
+    else:  # selection == 'sample'
+        scores = np.zeros((num_candidates,), dtype=np.float32)
+
+    selected_idx = int(np.argmax(scores))
+    candidate_mean = np.mean(candidates, axis=0, keepdims=True)
+    diversity = 0.0 if num_candidates <= 1 else float(np.mean(np.linalg.norm(candidates - candidate_mean, axis=-1)))
+    stats = {
+        'eval/subgoal_selection_mode_id': float(mode_ids[selection]),
+        'eval/subgoal_selection_num_candidates': float(num_candidates),
+        'eval/subgoal_selection_selected_idx': float(selected_idx),
+        'eval/subgoal_selection_score_mean': float(np.mean(scores)),
+        'eval/subgoal_selection_score_max': float(np.max(scores)),
+        'eval/subgoal_selection_score_std': float(np.std(scores)),
+        'eval/subgoal_selection_candidate_diversity_l2': diversity,
+    }
+    return candidates[selected_idx].astype(np.float32), stats, new_rng
+
+
 def _evaluate_env_tasks(
     env,
     dynamics_agent: DynamicsAgent,
@@ -978,6 +1068,7 @@ def _evaluate_env_tasks(
     video_fps: int = 15,
     wandb_enabled: bool = False,
     subgoal_override_goal: bool = False,
+    critic_agent: Any | None = None,
 ) -> dict[str, Any]:
     """OGBench-style eval: success is decided **only** by ``info['success']`` (any step). No tolerance diagnostic."""
     if not task_ids:
@@ -991,6 +1082,13 @@ def _evaluate_env_tasks(
     idm_task_successes: list[float] = []
     metrics: dict[str, Any] = {}
     wandb_media: dict[str, Any] = {}
+    critic_value_params = _extract_critic_value_params(critic_agent) if critic_agent is not None else None
+    eval_rng_box = [jax.random.PRNGKey(int(dynamics_agent.config.get('subgoal_eval_seed', 0)))]
+    subgoal_selection_stats: list[dict[str, float]] = []
+
+    def _next_eval_rng():
+        eval_rng_box[0], sub = jax.random.split(eval_rng_box[0])
+        return sub
 
     num_eval = max(0, int(episodes_per_task))
     num_video = max(0, int(video_episodes_per_task))
@@ -1007,14 +1105,22 @@ def _evaluate_env_tasks(
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
-            pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+            pred, select_stats, _ = _select_eval_subgoal(
+                dynamics_agent, critic_value_params, obs, goal, _next_eval_rng(),
+            )
+            if select_stats:
+                subgoal_selection_stats.append(select_stats)
         return np.asarray(actor_agent.sample_actions(obs, pred), dtype=np.float32).reshape(actor_horizon, -1)
 
     def _idm_chunk(obs: np.ndarray, goal: np.ndarray) -> np.ndarray:
         if bool(subgoal_override_goal):
             pred = np.asarray(goal, dtype=np.float32).reshape(-1)
         else:
-            pred = np.asarray(dynamics_agent.infer_subgoal(obs, goal), dtype=np.float32).reshape(-1)
+            pred, select_stats, _ = _select_eval_subgoal(
+                dynamics_agent, critic_value_params, obs, goal, _next_eval_rng(),
+            )
+            if select_stats:
+                subgoal_selection_stats.append(select_stats)
         return _idm_action_chunk(dynamics_agent, obs, pred, idm_horizon)
 
     for task_id in task_ids:
@@ -1101,6 +1207,23 @@ def _evaluate_env_tasks(
     metrics['eval/episodes_per_task'] = float(num_eval)
     metrics['eval/video_episodes_per_task'] = float(num_video)
     metrics['eval/total_episodes_per_task'] = float(total_eps)
+    if subgoal_selection_stats:
+        metrics['eval/subgoal_selection_mode_id'] = float(np.mean([
+            x['eval/subgoal_selection_mode_id'] for x in subgoal_selection_stats
+        ]))
+        metrics['eval/subgoal_selection_num_candidates'] = float(np.mean([
+            x['eval/subgoal_selection_num_candidates'] for x in subgoal_selection_stats
+        ]))
+        metrics['eval/subgoal_selection_selected_idx_mean'] = float(np.mean([
+            x['eval/subgoal_selection_selected_idx'] for x in subgoal_selection_stats
+        ]))
+        for key in (
+            'eval/subgoal_selection_score_mean',
+            'eval/subgoal_selection_score_max',
+            'eval/subgoal_selection_score_std',
+            'eval/subgoal_selection_candidate_diversity_l2',
+        ):
+            metrics[key] = float(np.mean([x[key] for x in subgoal_selection_stats]))
 
     if wandb_enabled and num_video > 0 and len(actor_video_by_task) == len(task_ids) == len(idm_video_by_task):
         n_cols = max(1, len(task_ids))
@@ -1295,7 +1418,7 @@ def main(_):
         float(dynamics_config.get('dynamics_beta_max', 0.0)),
     )
     run_logger.info(
-        'subgoal mode=%s stochastic_loss=%s target_mode=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g value_weight_max=%.4g use_mean_for_actor_goal=%s',
+        'subgoal mode=%s stochastic_loss=%s target_mode=%s steps=%d samples_U=%d plan_candidates_N=%d total_proposals=%d temperature=%.4g value_alpha=%.4g value_style=%s value_expectile=%.4g value_gap_scale=%.4g value_weight_max=%.4g use_mean_for_actor_goal=%s flow_energy_weighted=%s flow_use_value_bonus=%s eval_subgoal_selection=%s eval_subgoal_num_samples=%d eval_subgoal_include_zero_candidate=%s',
         str(dynamics_config.get('subgoal_distribution', '')),
         str(dynamics_config.get('subgoal_stochastic_loss', 'mse')),
         str(dynamics_config.get('subgoal_target_mode', 'absolute')),
@@ -1310,6 +1433,11 @@ def main(_):
         float(dynamics_config.get('subgoal_value_gap_scale', 1.0)),
         float(dynamics_config.get('subgoal_value_weight_max', 0.0)),
         bool(dynamics_config.get('subgoal_use_mean_for_actor_goal', True)),
+        bool(dynamics_config.get('subgoal_flow_energy_weighted', True)),
+        bool(dynamics_config.get('subgoal_flow_use_value_bonus', False)),
+        str(dynamics_config.get('subgoal_eval_selection', 'zero')),
+        int(dynamics_config.get('subgoal_eval_num_samples', 1)),
+        bool(dynamics_config.get('subgoal_eval_include_zero_candidate', True)),
     )
     run_logger.info(
         'planner_sampling plan_noise_scale=%.4g forward_bridge_mode=%s forward_bridge_use_path_loss=%s path_loss_weight=%.4g rollout_horizon=%d rollout_loss_weight=%.4g',
@@ -1505,6 +1633,7 @@ def main(_):
                         video_fps=int(FLAGS.eval_video_fps),
                         wandb_enabled=bool(FLAGS.use_wandb),
                         subgoal_override_goal=bool(FLAGS.subgoal_override_goal),
+                        critic_agent=critic_agent,
                     )
                 )
             if measure_timing:

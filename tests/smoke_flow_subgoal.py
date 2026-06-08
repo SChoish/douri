@@ -36,6 +36,8 @@ def _config(mode: str):
     cfg.subgoal_distribution = mode
     cfg.subgoal_num_samples = 3
     cfg.subgoal_flow_steps = 2
+    cfg.subgoal_flow_energy_weighted = False
+    cfg.subgoal_flow_use_value_bonus = False
     cfg.subgoal_value_alpha = 0.0
     cfg.subgoal_target_mode = 'displacement'
     cfg.residual_target_mode = 'displacement'
@@ -70,6 +72,19 @@ def _create(mode: str):
     return agent
 
 
+def _create_with_eval_selection(mode: str, eval_selection: str):
+    batch_size = 4
+    state_dim = 5
+    action_dim = 2
+    cfg = _config(mode)
+    cfg.subgoal_eval_selection = eval_selection
+    cfg.subgoal_eval_num_samples = 4
+    cfg.subgoal_eval_include_zero_candidate = False
+    ex_observations = jnp.zeros((batch_size, state_dim), dtype=jnp.float32)
+    ex_actions = jnp.zeros((batch_size, action_dim), dtype=jnp.float32)
+    return DynamicsAgent.create(0, ex_observations, cfg, ex_actions=ex_actions)
+
+
 def main() -> None:
     for mode in ('deterministic', 'diag_gaussian', 'flow'):
         _create(mode)
@@ -92,6 +107,22 @@ def main() -> None:
     loss = info['phase1/loss']
     assert bool(jnp.isfinite(loss)), loss
     assert bool(jnp.isfinite(info['phase1/subgoal_flow_loss'])), info['phase1/subgoal_flow_loss']
+    # Plain Flow-BC defaults: no energy weighting, unit weights.
+    assert float(info['phase1/subgoal_flow_energy_weighted']) == 0.0, info['phase1/subgoal_flow_energy_weighted']
+    assert abs(float(info['phase1/subgoal_flow_energy_weight_mean']) - 1.0) < 1e-5, (
+        info['phase1/subgoal_flow_energy_weight_mean']
+    )
+
+    # Eval selector without a critic via goal-L2 best-of-N.
+    eval_agent = _create_with_eval_selection('flow', 'best_of_n_goal_l2')
+    sel = eval_agent.infer_subgoal_for_eval(
+        batch['observations'][0],
+        batch['high_actor_goals'][0],
+        critic_agent=None,
+        rng=jax.random.PRNGKey(7),
+    )
+    assert sel.shape == (5,), sel.shape
+    assert bool(jnp.all(jnp.isfinite(sel))), sel
     print('flow smoke passed')
 
 

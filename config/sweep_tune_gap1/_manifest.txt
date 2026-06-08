@@ -1,0 +1,21 @@
+# 20 configs (5 envs × 4 gap1 variants)
+config/sweep_tune_gap1/p3_w5_g999.yaml
+config/sweep_tune_gap1/p3_w5_g995.yaml
+config/sweep_tune_gap1/p3_w10_g999.yaml
+config/sweep_tune_gap1/p3_w10_g995.yaml
+config/sweep_tune_gap1/p4_w5_g999.yaml
+config/sweep_tune_gap1/p4_w5_g995.yaml
+config/sweep_tune_gap1/p4_w10_g999.yaml
+config/sweep_tune_gap1/p4_w10_g995.yaml
+config/sweep_tune_gap1/ct_w5_g999.yaml
+config/sweep_tune_gap1/ct_w5_g995.yaml
+config/sweep_tune_gap1/ct_w10_g999.yaml
+config/sweep_tune_gap1/ct_w10_g995.yaml
+config/sweep_tune_gap1/ag_w5_g999.yaml
+config/sweep_tune_gap1/ag_w5_g995.yaml
+config/sweep_tune_gap1/ag_w10_g999.yaml
+config/sweep_tune_gap1/ag_w10_g995.yaml
+config/sweep_tune_gap1/hg_w5_g999.yaml
+config/sweep_tune_gap1/hg_w5_g995.yaml
+config/sweep_tune_gap1/hg_w10_g999.yaml
+config/sweep_tune_gap1/hg_w10_g995.yaml

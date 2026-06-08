@@ -1,0 +1,70 @@
+# gap1 sweep: TRL + diag_gaussian
+# env=cube-triple-play-v0 gap=1.0 wmax=10.0 gamma=0.999
+env_name: cube-triple-play-v0
+run_group: tune_g1_ct_w10_g999
+train_epochs: 600
+log_every_n_epochs: 10
+save_every_n_epochs: 100
+horizon: 25
+plan_candidates: 1
+plan_noise_scale: 1.0
+eval_freq: 100
+eval_task_ids: 1,2,3,4,5
+eval_episodes_per_task: 10
+final_eval_episodes_per_task: 25
+eval_max_chunks: 200
+eval_video_episodes_per_task: 0
+dynamics:
+  max_goal_steps_from_env: false
+  clip_path_to_goal: true
+  subgoal_distribution: diag_gaussian
+  subgoal_stochastic_loss: nll
+  subgoal_num_samples: 1
+  subgoal_value_alpha: 0.0
+  subgoal_value_gap_scale: 1.0
+  subgoal_value_weight_max: 10.0
+  subgoal_goal_representation: phi
+  subgoal_target_mode: displacement
+  planner_type: forward_bridge_residual
+  forward_bridge_path_loss_horizon: 5
+  theta_schedule: prefix_progress
+  theta_total: 1.0
+  progress_alpha: 0.8
+  residual_target_mode: displacement
+  actor_p_curgoal: 0.0
+  actor_p_trajgoal: 1.0
+  actor_p_randomgoal: 0.0
+  actor_geom_sample: false
+critic_agent:
+  algorithm: trl
+  critic_type: trl
+  use_chunk_critic: false
+  action_chunk_horizon: 5
+  full_chunk_horizon: 25
+  discount: 0.999
+  tau_v: 0.7
+  lambda_v_self: 1.0
+  lambda_v_base: 1.0
+  lambda_v_tri: 1.0
+  value_base_horizon: 5
+  value_transitive_reweight: true
+  value_distance_weight_power: 1.0
+  lambda_q_local: 1.0
+  q_target_from_value: true
+  goal_representation: full
+  kappa_b: 0.9
+  kappa_d: 0.9
+  max_goal_steps_from_env: false
+  clip_chunk_to_goal: true
+  subgoal_value_bonus_type: transitive_product
+  subgoal_value_log_eps: 1.0e-06
+  subgoal_value_ratio_eps: 0.001
+  subgoal_value_ratio_clip: 5.0
+  value_p_curgoal: 0.0
+  value_p_trajgoal: 1.0
+  value_p_randomgoal: 0.0
+  value_geom_sample: true
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0
+batch_size: 4096

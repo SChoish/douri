@@ -1,0 +1,21 @@
+# 20 configs (5 envs × 4 Set-A variants)
+config/sweep_tune_v2/p3_gap3.yaml
+config/sweep_tune_v2/p3_gap5.yaml
+config/sweep_tune_v2/p3_wmax3.yaml
+config/sweep_tune_v2/p3_altg.yaml
+config/sweep_tune_v2/p4_gap3.yaml
+config/sweep_tune_v2/p4_gap5.yaml
+config/sweep_tune_v2/p4_wmax3.yaml
+config/sweep_tune_v2/p4_altg.yaml
+config/sweep_tune_v2/ct_gap3.yaml
+config/sweep_tune_v2/ct_gap5.yaml
+config/sweep_tune_v2/ct_wmax3.yaml
+config/sweep_tune_v2/ct_altg.yaml
+config/sweep_tune_v2/ag_gap3.yaml
+config/sweep_tune_v2/ag_gap5.yaml
+config/sweep_tune_v2/ag_wmax3.yaml
+config/sweep_tune_v2/ag_altg.yaml
+config/sweep_tune_v2/hg_gap3.yaml
+config/sweep_tune_v2/hg_gap5.yaml
+config/sweep_tune_v2/hg_wmax3.yaml
+config/sweep_tune_v2/hg_altg.yaml

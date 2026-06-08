@@ -117,7 +117,7 @@ flags.DEFINE_boolean(
 flags.DEFINE_string('run_group', 'Debug', 'W&B group.')
 flags.DEFINE_integer('seed', 0, 'Seed.')
 flags.DEFINE_string('env_name', 'antmaze-medium-navigate-v0', 'OGBench env / dataset name.')
-flags.DEFINE_integer('train_epochs', 1000, 'Training epochs.')
+flags.DEFINE_integer('train_epochs', 600, 'Training epochs.')
 flags.DEFINE_integer('log_every_n_epochs', 10, 'Log interval (epochs).')
 flags.DEFINE_integer('save_every_n_epochs', 100, 'Checkpoint interval.')
 flags.DEFINE_boolean('use_wandb', False, 'W&B.')
@@ -143,7 +143,7 @@ flags.DEFINE_string('eval_task_ids', '1,2,3,4,5', 'Comma-separated OGBench task 
 flags.DEFINE_integer('eval_episodes_per_task', 10, 'Number of env evaluation episodes to run for each task id.')
 flags.DEFINE_integer(
     'final_eval_episodes_per_task',
-    50,
+    25,
     'If > 0, override eval_episodes_per_task for the final training epoch evaluation only.',
 )
 flags.DEFINE_integer('eval_max_chunks', 200, 'Maximum action chunks to execute per evaluation episode.')
@@ -797,10 +797,8 @@ def _rescore_actor_batch_for_update(actor_batch: dict, critic_agent: Any, actor_
     else:
         critic_goals = goals  # [B, D] - shared
     force_rescore_single = False
-    if hasattr(critic_agent, '_is_direct_chunk_trl'):
-        force_rescore_single = bool(critic_agent._is_direct_chunk_trl())
-    if hasattr(critic_agent, '_is_state_transitive'):
-        force_rescore_single = force_rescore_single or bool(critic_agent._is_state_transitive())
+    if hasattr(critic_agent, '_is_trl'):
+        force_rescore_single = bool(critic_agent._is_trl())
     force_rescore_single = force_rescore_single or bool(
         critic_agent.config.get('rescore_single_candidate', False)
     )
@@ -893,14 +891,16 @@ def _prepare_configs(dynamics_updates: dict, critic_updates: dict, actor_updates
     )
     dynamics_config['critic_type'] = str(critic_config.get('critic_type', 'dqc'))
     dynamics_config['algorithm'] = str(critic_config.get('algorithm', 'dqc'))
-    if str(critic_config.get('critic_type', 'dqc')).lower() in ('state_transitive', 'transitive_v_local_q') or str(
-        critic_config.get('algorithm', 'dqc')
-    ).lower() in ('state_transitive', 'transitive_v_local_q'):
-        bonus_type = str(critic_config.get('subgoal_value_bonus_type', 'transitive_ratio')).lower()
-        dynamics_config['subgoal_value_bonus_type'] = (
-            'transitive_ratio' if bonus_type == 'single_value' else bonus_type
+    from agents.critic import _is_trl_type
+
+    if _is_trl_type(
+        str(critic_config.get('critic_type', 'dqc')),
+        str(critic_config.get('algorithm', 'dqc')),
+    ):
+        dynamics_config['subgoal_value_bonus_type'] = str(
+            critic_config.get('subgoal_value_bonus_type', 'transitive_product')
         )
-        dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-6))
+        dynamics_config['subgoal_value_ratio_eps'] = float(critic_config.get('subgoal_value_ratio_eps', 1e-3))
     phi_idxs = normalize_phi_goal_obs_indices(critic_config.get('phi_goal_obs_indices', ()))
     critic_config['phi_goal_obs_indices'] = phi_idxs
     dynamics_config['phi_goal_obs_indices'] = phi_idxs
@@ -945,7 +945,7 @@ def _create_actor_agent(seed: int, ex_dynamics: dict, actor_config):
 def _extract_critic_value_params(critic_agent: Any) -> Any | None:
     if critic_agent is None:
         return None
-    if hasattr(critic_agent, '_is_state_transitive') and bool(critic_agent._is_state_transitive()):
+    if hasattr(critic_agent, '_is_trl') and bool(critic_agent._is_trl()):
         return critic_agent.network.params.get('modules_target_value', None)
     return critic_agent.network.params.get('modules_value', None)
 
@@ -1004,7 +1004,8 @@ def _evaluate_env_tasks(
     actor_video_by_task: dict[int, np.ndarray] = {}
     idm_video_by_task: dict[int, np.ndarray] = {}
     eval_selection = str(dynamics_agent.config.get('subgoal_eval_selection', 'zero_noise')).lower()
-    use_eval_bon = eval_selection == 'best_of_n_value' and critic_agent is not None
+    # 'sample' and 'best_of_n_goal_l2' do not need a critic; 'best_of_n_value' does.
+    use_eval_bon = eval_selection in ('best_of_n_value', 'best_of_n_goal_l2', 'sample')
     eval_seed_base = int(dynamics_agent.config.get('subgoal_eval_seed', 0))
 
     def _eval_subgoal(obs: np.ndarray, goal: np.ndarray, *, ep_ix: int) -> np.ndarray:
@@ -1329,6 +1330,16 @@ def main(_):
         float(dynamics_config.get('subgoal_value_gap_scale', 1.0)),
         float(dynamics_config.get('subgoal_value_weight_max', 0.0)),
         bool(dynamics_config.get('subgoal_use_mean_for_actor_goal', True)),
+    )
+    run_logger.info(
+        'subgoal_flow energy_weighted=%s use_value_bonus=%s noise_scale=%.4g '
+        'eval_selection=%s eval_num_samples=%d eval_include_zero_candidate=%s',
+        bool(dynamics_config.get('subgoal_flow_energy_weighted', False)),
+        bool(dynamics_config.get('subgoal_flow_use_value_bonus', False)),
+        float(dynamics_config.get('subgoal_flow_noise_scale', 1.0)),
+        str(dynamics_config.get('subgoal_eval_selection', 'zero_noise')),
+        int(dynamics_config.get('subgoal_eval_num_samples', 1)),
+        bool(dynamics_config.get('subgoal_eval_include_zero_candidate', True)),
     )
     run_logger.info(
         'planner_sampling plan_noise_scale=%.4g forward_bridge_mode=%s forward_bridge_use_path_loss=%s path_loss_weight=%.4g rollout_horizon=%d rollout_loss_weight=%.4g',

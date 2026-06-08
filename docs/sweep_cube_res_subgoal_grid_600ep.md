@@ -1,5 +1,7 @@
 # Cube-play residual × subgoal grid (@600 ep)
 
+> **보관용 문서 (2026-06):** 이 sweep을 돌리던 스크립트(`write_cube_res_subgoal_grid_yaml.py`, `sweep_cube_res_subgoal_grid_600ep.sh` 등)는 저장소에서 제거되었습니다. 동일 축의 고정 YAML은 `config/grid_targetmode/`에 남아 있습니다.
+
 triple / double / single 각 **상위 2개 gap·κ** × **residual × subgoal 4조합** = **24 runs**.
 
 ## 베이스 gap·κ (고정)

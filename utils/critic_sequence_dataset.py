@@ -8,6 +8,7 @@ from typing import Any
 import jax
 import numpy as np
 
+from agents.critic import _is_trl_type
 from utils.datasets import (
     Dataset,
     augment_batch_images,
@@ -183,71 +184,7 @@ class CriticSequenceDataset:
             (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
         ).astype(np.int64)
 
-    def _validate_direct_chunk_trl_splits(
-        self,
-        idxs: np.ndarray,
-        value_goal_idxs: np.ndarray,
-        split_idxs: np.ndarray,
-        finals: np.ndarray,
-        horizon: int,
-        tri_valid: np.ndarray,
-    ) -> None:
-        valid = np.asarray(tri_valid, dtype=bool)
-        if not np.any(valid):
-            return
-        if np.any(split_idxs[valid] < idxs[valid] + horizon):
-            raise ValueError('direct_chunk_trl: split_idxs must satisfy k >= i + H for valid samples.')
-        if np.any(split_idxs[valid] >= value_goal_idxs[valid]):
-            raise ValueError('direct_chunk_trl: split_idxs must satisfy k < j for valid samples.')
-        if np.any(split_idxs[valid] + horizon > finals[valid]):
-            raise ValueError('direct_chunk_trl: split_idxs must satisfy k + H <= final_state_idx.')
-
-    def _sample_direct_chunk_trl_fields(self, idxs: np.ndarray, value_goal_idxs: np.ndarray) -> dict:
-        """Sample in-trajectory base and transitive tuples for direct chunk TRL.
-
-        Split points obey strict chunk commitment: ``k >= i + H``.  If a sample
-        has no valid split, ``trl_valid_mask`` is zero and the tri-Q loss skips it.
-        """
-        batch_size = len(idxs)
-        horizon = int(self.action_chunk_horizon)
-        finals = self._lookup_finals(idxs)
-
-        base_offsets = np.random.randint(1, horizon + 1, size=batch_size).astype(np.int64)
-        base_goal_idxs = idxs + base_offsets
-
-        split_low = idxs + horizon
-        split_high = np.minimum(value_goal_idxs - 1, finals - horizon)
-        tri_valid = (value_goal_idxs - idxs > horizon) & (split_high >= split_low)
-
-        safe_max = finals - horizon
-        safe_min = idxs
-        dummy = np.minimum(np.maximum(idxs, safe_min), safe_max)
-
-        split_idxs = dummy.copy()
-        if np.any(tri_valid):
-            lo = split_low[tri_valid]
-            hi = split_high[tri_valid]
-            split_idxs[tri_valid] = lo + np.random.randint(0, hi - lo + 1, size=int(np.sum(tri_valid)))
-
-        self._validate_direct_chunk_trl_splits(
-            idxs, value_goal_idxs, split_idxs, finals, horizon, tri_valid
-        )
-
-        split_chunk_idx = self._build_action_chunk_indices(split_idxs)
-        split_action_chunks = np.asarray(self.dataset['actions'][split_chunk_idx], dtype=np.float32)
-
-        return {
-            'trl_base_offsets': base_offsets.astype(np.float32),
-            'trl_base_goals': np.asarray(self.get_observations(base_goal_idxs), dtype=np.float32),
-            'trl_split_observations': np.asarray(self.get_observations(split_idxs), dtype=np.float32),
-            'trl_split_goals': np.asarray(self.get_observations(split_idxs), dtype=np.float32),
-            'trl_split_action_chunk_actions': split_action_chunks.reshape(split_action_chunks.shape[0], -1),
-            'trl_split_offsets': (split_idxs - idxs).astype(np.float32),
-            'trl_valid_mask': tri_valid.astype(np.float32),
-            'trl_split_is_semantic_valid': tri_valid.astype(np.float32),
-        }
-
-    def _sample_state_transitive_fields(self, idxs: np.ndarray, value_goal_idxs: np.ndarray) -> dict:
+    def _sample_trl_fields(self, idxs: np.ndarray, value_goal_idxs: np.ndarray) -> dict:
         """Sample state-pair transitive value tuples ``i < k < j`` and local Q goals."""
         batch_size = len(idxs)
         finals = self._lookup_finals(idxs)
@@ -272,11 +209,11 @@ class CriticSequenceDataset:
         valid = np.asarray(tri_valid, dtype=bool)
         if np.any(valid):
             if np.any(split_idxs[valid] <= idxs[valid]):
-                raise ValueError('state_transitive: split_idxs must satisfy i < k for valid samples.')
+                raise ValueError('trl: split_idxs must satisfy i < k for valid samples.')
             if np.any(split_idxs[valid] >= value_goal_idxs[valid]):
-                raise ValueError('state_transitive: split_idxs must satisfy k < j for valid samples.')
+                raise ValueError('trl: split_idxs must satisfy k < j for valid samples.')
             if np.any(value_goal_idxs[valid] > finals[valid]):
-                raise ValueError('state_transitive: value goals must stay within trajectory.')
+                raise ValueError('trl: value goals must stay within trajectory.')
 
         split_obs = np.asarray(self.get_observations(split_idxs), dtype=np.float32)
         value_goals = np.asarray(self.get_observations(value_goal_idxs), dtype=np.float32)
@@ -324,16 +261,8 @@ class CriticSequenceDataset:
 
         critic_type = str(self.config.get('critic_type', 'dqc')).lower()
         algorithm = str(self.config.get('algorithm', '')).lower()
-        is_trl = critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl') or algorithm in (
-            'chunk_trl',
-            'direct_chunk_trl',
-            'transitivechunkrl',
-        )
-        is_state_transitive = critic_type in ('state_transitive', 'transitive_v_local_q') or algorithm in (
-            'state_transitive',
-            'transitive_v_local_q',
-        )
-        value_goal_idxs = self.sample_trl_goals(idxs) if (is_trl or is_state_transitive) else self.sample_goals(idxs)
+        is_trl = _is_trl_type(critic_type, algorithm)
+        value_goal_idxs = self.sample_trl_goals(idxs) if is_trl else self.sample_goals(idxs)
         value_goals = np.asarray(self.get_observations(value_goal_idxs), dtype=np.float32)
         full_chunk_rewards, full_chunk_next_observations, full_chunk_horizon, full_chunk_masks = (
             self._chunk_backup(
@@ -375,19 +304,11 @@ class CriticSequenceDataset:
         }
 
         if is_trl:
-            trl_fields = self._sample_direct_chunk_trl_fields(idxs, value_goal_idxs)
+            trl_fields = self._sample_trl_fields(idxs, value_goal_idxs)
             batch.update(
                 {
                     'value_offsets': (value_goal_idxs - idxs).astype(np.float32),
                     **trl_fields,
-                }
-            )
-        elif is_state_transitive:
-            state_trans_fields = self._sample_state_transitive_fields(idxs, value_goal_idxs)
-            batch.update(
-                {
-                    'value_offsets': (value_goal_idxs - idxs).astype(np.float32),
-                    **state_trans_fields,
                 }
             )
 
@@ -400,8 +321,6 @@ class CriticSequenceDataset:
                 'action_chunk_next_observations',
             ]
             if is_trl:
-                aug_keys.extend(['trl_base_goals', 'trl_split_observations', 'trl_split_goals'])
-            elif is_state_transitive:
                 aug_keys.extend(
                     [
                         'value_base_goals',

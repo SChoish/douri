@@ -1,0 +1,9 @@
+# Deferred: cube-triple target-mode grid (8 configs)
+config/grid_targetmode/cube_triple_a0p0_gap5p0_k0p8_resdisp_sgdisp.yaml
+config/grid_targetmode/cube_triple_a0p0_gap5p0_k0p8_resdisp_sgabs.yaml
+config/grid_targetmode/cube_triple_a0p0_gap5p0_k0p8_resabs_sgdisp.yaml
+config/grid_targetmode/cube_triple_a0p0_gap5p0_k0p8_resabs_sgabs.yaml
+config/grid_targetmode/cube_triple_a0p0_gap5p0_k0p6_resdisp_sgdisp.yaml
+config/grid_targetmode/cube_triple_a0p0_gap5p0_k0p6_resdisp_sgabs.yaml
+config/grid_targetmode/cube_triple_a0p0_gap5p0_k0p6_resabs_sgdisp.yaml
+config/grid_targetmode/cube_triple_a0p0_gap5p0_k0p6_resabs_sgabs.yaml

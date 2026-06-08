@@ -328,9 +328,9 @@ def test_distributional_subgoal_loss_is_finite():
         'dynamics/gamma_inv',
     ):
         assert required in info, f'missing log key {required}'
-    # subgoal_mode == 1.0 in diag_gaussian mode.
+    # subgoal_mode == 1.0 in diag_gaussian mode; default stochastic loss is NLL.
     assert float(info['phase1/subgoal_mode']) == 1.0
-    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 0.0
+    assert float(info['phase1/subgoal_stochastic_loss_mode']) == 1.0
 
 
 def test_distributional_subgoal_nll_loss_option_is_finite():
@@ -380,13 +380,17 @@ def test_subgoal_expectile_value_style_weights_by_gap_sign():
 
 def test_dynamics_config_defaults_are_usable():
     cfg = get_dynamics_config()
-    assert str(cfg.subgoal_distribution) == 'deterministic'
-    assert str(cfg.subgoal_stochastic_loss) == 'mse'
+    assert str(cfg.subgoal_distribution) == 'diag_gaussian'
+    assert str(cfg.subgoal_stochastic_loss) == 'nll'
     assert bool(cfg.subgoal_use_mean_for_actor_goal) is True
     assert int(cfg.subgoal_num_samples) == 1
     assert str(cfg.subgoal_value_style) == 'exponential'
     assert float(cfg.subgoal_value_expectile) == 0.7
-    assert float(cfg.subgoal_value_gap_scale) == 1.0
+    assert float(cfg.subgoal_value_gap_scale) == 10.0
+    assert float(cfg.subgoal_value_weight_max) == 5.0
+    assert float(cfg.subgoal_value_alpha) == 0.0
+    assert str(cfg.subgoal_target_mode) == 'displacement'
+    assert bool(cfg.max_goal_steps_from_env) is False
 
 
 def test_invalid_subgoal_stochastic_loss_rejected():
@@ -414,7 +418,10 @@ def test_displacement_mode_predict_subgoal_returns_absolute_state():
     # mode the raw network output is Delta and the agent adds ``observations``
     # internally so callers cannot tell the difference.
     agent_disp = _displacement_agent()
-    agent_abs = _make_dynamics_agent('deterministic')
+    agent_abs = _make_dynamics_agent(
+        'deterministic',
+        config_updates={'subgoal_target_mode': 'absolute'},
+    )
     rng = np.random.default_rng(0)
     obs = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
     g = jnp.asarray(rng.standard_normal((BATCH, STATE_DIM)).astype(np.float32))
@@ -474,7 +481,10 @@ def test_displacement_mode_loss_is_finite_and_target_mode_logged():
         assert np.all(np.isfinite(v)), f'non-finite log at {k}: {v}'
     assert float(info['dynamics/subgoal_target_mode']) == 1.0
 
-    agent_abs = _make_dynamics_agent('deterministic')
+    agent_abs = _make_dynamics_agent(
+        'deterministic',
+        config_updates={'subgoal_target_mode': 'absolute'},
+    )
     _, info_abs = agent_abs.update(batch, critic_value_params=None)
     assert float(info_abs['dynamics/subgoal_target_mode']) == 0.0
 
@@ -560,8 +570,8 @@ def test_displacement_mode_build_actor_proposals_returns_absolute_goals():
 
 def _make_trl_critic_agent():
     cfg = get_critic_config()
-    cfg.critic_type = 'direct_chunk_trl'
-    cfg.algorithm = 'direct_chunk_trl'
+    cfg.critic_type = 'trl'
+    cfg.algorithm = 'trl'
     cfg.use_chunk_critic = False
     cfg.goal_representation = 'full'
     cfg.action_chunk_horizon = 2
@@ -594,8 +604,8 @@ def test_trl_subgoal_value_bonus_uses_product_form():
         'diag_gaussian',
         config_updates={
             **_subgoal_value_test_config_updates(),
-            'critic_type': 'direct_chunk_trl',
-            'algorithm': 'direct_chunk_trl',
+            'critic_type': 'trl',
+            'algorithm': 'trl',
             'subgoal_value_alpha': 1.0,
         },
     )
@@ -636,8 +646,8 @@ def test_state_transitive_subgoal_bonus_ratio_and_gradients():
         'diag_gaussian',
         config_updates={
             **_subgoal_value_test_config_updates(),
-            'critic_type': 'state_transitive',
-            'algorithm': 'state_transitive',
+            'critic_type': 'trl',
+            'algorithm': 'trl',
             'subgoal_value_alpha': 1.0,
             'subgoal_value_bonus_type': 'transitive_ratio',
             'subgoal_value_ratio_eps': 1e-6,

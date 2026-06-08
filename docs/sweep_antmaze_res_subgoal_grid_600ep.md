@@ -1,5 +1,7 @@
 # Antmaze residual × subgoal target-mode grid (@600 ep)
 
+> **보관용 문서 (2026-06):** 이 sweep을 돌리던 스크립트(`write_antmaze_res_subgoal_grid_yaml.py`, `sweep_antmaze_res_subgoal_grid_600ep.sh`, `nohup_sweep_res_subgoal_grid_all.sh` 등)는 저장소에서 제거되었습니다. 동일 축의 고정 YAML은 `config/grid_targetmode/`에 남아 있고, TRL 하이퍼파라미터 sweep은 `scripts/run_tune_sweep.sh` + `config/sweep_tune_*`를 사용하세요.
+
 각 환경 scale의 **상위 2개 hparam 설정**에 대해  
 `residual_target_mode` × `subgoal_target_mode` **2×2 = 4 runs** → 총 **6×4 = 24 runs**.
 

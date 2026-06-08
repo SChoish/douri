@@ -1,0 +1,42 @@
+# Plain Flow-BC on top of TRL + displacement baseline.
+# Defaults in agents/dynamics.py + agents/critic.py match tune_sweep_common.
+env_name: puzzle-3x3-play-v0
+run_group: flow_plain_bon4_example
+seed: 0
+train_epochs: 600
+plan_candidates: 1
+eval_freq: 100
+eval_task_ids: '1,2,3,4,5'
+eval_episodes_per_task: 10
+final_eval_episodes_per_task: 25
+eval_max_chunks: 200
+dynamics:
+  subgoal_distribution: flow
+  subgoal_flow_energy_weighted: false
+  subgoal_flow_use_value_bonus: false
+  subgoal_value_alpha: 0.0
+  subgoal_value_gap_scale: 5.0
+  subgoal_value_weight_max: 5.0
+  subgoal_flow_steps: 8
+  subgoal_flow_t_min: 1.0e-4
+  subgoal_flow_noise_scale: 1.0
+  subgoal_temperature: 1.0
+  subgoal_num_samples: 4
+  subgoal_eval_selection: best_of_n_value
+  subgoal_eval_num_samples: 4
+  subgoal_eval_include_zero_candidate: false
+  subgoal_eval_seed: 0
+  subgoal_stochastic_loss: mse
+  actor_p_curgoal: 0.0
+  actor_p_trajgoal: 0.5
+  actor_p_randomgoal: 0.5
+  actor_geom_sample: true
+critic_agent:
+  discount: 0.99
+  value_distance_weight_power: 0.5
+  trl_distance_weight_power: 0.5
+  kappa_b: 0.6
+  kappa_d: 0.6
+actor:
+  spi_beta: 1.0
+  spi_tau: 5.0

@@ -795,9 +795,20 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         critic_agent=None,
         rng=None,
     ):
-        """Eval-time subgoal endpoint selection (zero-noise mean or value BoN)."""
+        """Eval-time subgoal endpoint selection.
+
+        Supported ``subgoal_eval_selection`` modes:
+
+        - ``'zero'`` / ``'zero_noise'`` / ``'mean'`` / ``'deterministic'``:
+          zero-noise flow endpoint (backward-compatible pseudo-mean).
+        - ``'sample'``: a single random flow endpoint (no scoring).
+        - ``'best_of_n_value'``: best of ``subgoal_eval_num_samples`` endpoints
+          under the critic transitive-value score. Requires ``critic_agent``.
+        - ``'best_of_n_goal_l2'``: best of N endpoints under negative L2 distance
+          to ``high_actor_goals`` (no critic needed).
+        """
         selection = str(self.config.get('subgoal_eval_selection', 'zero_noise')).lower()
-        if selection != 'best_of_n_value' or critic_agent is None:
+        if selection in ('zero', 'zero_noise', 'mean', 'deterministic'):
             return self.predict_subgoal(observations, high_actor_goals)
 
         squeeze = observations.ndim == 1
@@ -806,6 +817,19 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             high_actor_goals = high_actor_goals[None]
         if rng is None:
             rng = jax.random.PRNGKey(int(self.config.get('subgoal_eval_seed', 0)))
+
+        if selection == 'sample':
+            candidates, _ = self.sample_subgoal_candidates(
+                observations,
+                high_actor_goals,
+                rng,
+                num_candidates=1,
+                include_mean=False,
+            )
+            best = candidates[:, 0, :]
+            if squeeze:
+                best = best[0]
+            return best
 
         num_samples = max(1, int(self.config.get('subgoal_eval_num_samples', 4)))
         include_zero = bool(self.config.get('subgoal_eval_include_zero_candidate', True))
@@ -816,12 +840,27 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
             num_candidates=num_samples,
             include_mean=include_zero,
         )
-        scores = critic_agent.score_transitive_subgoals(
-            observations,
-            candidates,
-            high_actor_goals,
-            network_params=critic_agent.network.params,
-        )
+        if selection == 'best_of_n_goal_l2':
+            scores = -jnp.mean(
+                (candidates - high_actor_goals[:, None, :]) ** 2, axis=-1
+            )
+        elif selection == 'best_of_n_value':
+            if critic_agent is None:
+                raise RuntimeError(
+                    "subgoal_eval_selection='best_of_n_value' requires a critic "
+                    'agent providing value params (score_transitive_subgoals).'
+                )
+            scores = critic_agent.score_transitive_subgoals(
+                observations,
+                candidates,
+                high_actor_goals,
+                network_params=critic_agent.network.params,
+            )
+        else:
+            return self.predict_subgoal(
+                observations[0] if squeeze else observations,
+                high_actor_goals[0] if squeeze else high_actor_goals,
+            )
         best_idx = jnp.argmax(scores, axis=1)
         best = jnp.take_along_axis(
             candidates,
@@ -913,9 +952,10 @@ class _DynamicsAgentCore(flax.struct.PyTreeNode):
         if sub_mode == 'flow':
             B, D = obs.shape
             noise_scale = float(self.config.get('subgoal_flow_noise_scale', 1.0))
+            temperature = float(self.config.get('subgoal_temperature', 1.0))
             n_rand = num_candidates - 1 if include_mean else num_candidates
             z0 = jnp.zeros((B, 1 if include_mean else 0, D), dtype=jnp.float32)
-            z_rand = jax.random.normal(rng, (B, n_rand, D), dtype=jnp.float32) * noise_scale
+            z_rand = jax.random.normal(rng, (B, n_rand, D), dtype=jnp.float32) * (noise_scale * temperature)
             z = jnp.concatenate([z0, z_rand], axis=1)
             flat_obs = jnp.repeat(obs[:, None, :], num_candidates, axis=1).reshape(B * num_candidates, D)
             flat_goals = jnp.repeat(goals[:, None, :], num_candidates, axis=1).reshape(B * num_candidates, D)
@@ -1318,20 +1358,12 @@ class DynamicsAgent(_DynamicsAgentCore):
                 )
         return super().create(seed, ex_observations, config, ex_actions=ex_actions)
 
-    def _is_direct_chunk_trl_mode(self) -> bool:
-        critic_type = str(self.config.get('critic_type', 'dqc')).lower()
-        algorithm = str(self.config.get('algorithm', '')).lower()
-        return (
-            critic_type in ('trl', 'chunk_trl', 'direct_chunk_trl')
-            or algorithm in ('chunk_trl', 'direct_chunk_trl', 'transitivechunkrl')
-        )
+    def _is_trl_mode(self) -> bool:
+        from agents.critic import _is_trl_type
 
-    def _is_state_transitive_mode(self) -> bool:
-        critic_type = str(self.config.get('critic_type', 'dqc')).lower()
-        algorithm = str(self.config.get('algorithm', '')).lower()
-        return (
-            critic_type in ('state_transitive', 'transitive_v_local_q')
-            or algorithm in ('state_transitive', 'transitive_v_local_q')
+        return _is_trl_type(
+            str(self.config.get('critic_type', 'dqc')),
+            str(self.config.get('algorithm', '')),
         )
 
     def _subgoal_mse_weight_from_gap(self, gap: jnp.ndarray) -> jnp.ndarray:
@@ -1372,14 +1404,9 @@ class DynamicsAgent(_DynamicsAgentCore):
     def _subgoal_bonus_type_id(self) -> jnp.ndarray:
         bonus_type = self.config.get('subgoal_value_bonus_type', None)
         if bonus_type is None:
-            if self._is_state_transitive_mode():
-                bonus_type = 'transitive_ratio'
-            elif self._is_direct_chunk_trl_mode():
-                bonus_type = 'transitive_product'
-            else:
-                bonus_type = 'single_value'
+            bonus_type = 'transitive_product' if self._is_trl_mode() else 'single_value'
         bonus_type = str(bonus_type).lower()
-        if self._is_direct_chunk_trl_mode() and not self._is_state_transitive_mode() and bonus_type == 'single_value':
+        if self._is_trl_mode() and bonus_type == 'single_value':
             bonus_type = 'transitive_product'
         ids = {
             'none': 0.0,
@@ -1444,19 +1471,12 @@ class DynamicsAgent(_DynamicsAgentCore):
         alpha = jnp.asarray(float(self.config.get('subgoal_value_alpha', 0.0)), dtype=jnp.float32)
         bonus_type = self.config.get('subgoal_value_bonus_type', None)
         if bonus_type is None:
-            if self._is_state_transitive_mode():
-                bonus_type = 'transitive_ratio'
-            elif self._is_direct_chunk_trl_mode():
-                bonus_type = 'transitive_product'
-            else:
-                bonus_type = 'single_value'
+            bonus_type = 'transitive_product' if self._is_trl_mode() else 'single_value'
         bonus_type = str(bonus_type).lower()
-        if self._is_direct_chunk_trl_mode() and not self._is_state_transitive_mode() and bonus_type == 'single_value':
-            # Preserve the historical direct_chunk_trl default despite the shared
-            # dynamics config defaulting non-TRL modes to single_value.
+        if self._is_trl_mode() and bonus_type == 'single_value':
             bonus_type = 'transitive_product'
 
-        if (self._is_direct_chunk_trl_mode() or self._is_state_transitive_mode()) and critic_value_params is not None:
+        if self._is_trl_mode() and critic_value_params is not None:
             v_s_sg = self._subgoal_values(observations, pred_subgoals, critic_value_params)
             v_sg_g = pred_value
             transitive_product = v_s_sg * v_sg_g
@@ -1564,7 +1584,9 @@ class DynamicsAgent(_DynamicsAgentCore):
             subgoal_adv_logit = self._subgoal_adv_logit_from_gap(subgoal_value_gap)
             subgoal_mse_weight = self._subgoal_mse_weight_from_gap(subgoal_value_gap)
             subgoal_weight = jax.lax.stop_gradient(subgoal_mse_weight)
-            energy_weighted = bool(self.config.get('subgoal_flow_energy_weighted', True))
+            # PathBridger default: plain Flow-BC (no value-gap tilting). This
+            # diverges from douri, where the default was energy-weighted.
+            energy_weighted = bool(self.config.get('subgoal_flow_energy_weighted', False))
             if energy_weighted:
                 weighted_subgoal_mse = subgoal_weight * subgoal_mse
                 loss_fm = jnp.mean(weighted_subgoal_mse)
@@ -1616,6 +1638,8 @@ class DynamicsAgent(_DynamicsAgentCore):
                 ),
                 'phase1/subgoal_flow_weight_mean': jnp.mean(subgoal_mse_weight),
                 'phase1/subgoal_flow_weight_max': jnp.max(subgoal_mse_weight),
+                'phase1/subgoal_flow_energy_weight_mean': jnp.mean(subgoal_mse_weight),
+                'phase1/subgoal_flow_energy_weight_max': jnp.max(subgoal_mse_weight),
                 'phase1/subgoal_flow_value_gap_mean': jnp.mean(subgoal_value_gap),
                 'phase1/subgoal_flow_value_gap_min': jnp.min(subgoal_value_gap),
                 'phase1/subgoal_flow_value_gap_max': jnp.max(subgoal_value_gap),
@@ -1638,7 +1662,7 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_adv_logit_min': jnp.min(subgoal_adv_logit),
                 'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
                 'phase1/subgoal_value_bonus_style': jnp.asarray(
-                    1.0 if self._is_direct_chunk_trl_mode() else 0.0, dtype=jnp.float32,
+                    1.0 if self._is_trl_mode() else 0.0, dtype=jnp.float32,
                 ),
                 'phase1/subgoal_trl_v_s_sg_mean': jnp.mean(subgoal_trl_v_s_sg),
                 'phase1/subgoal_trl_v_sg_g_mean': jnp.mean(subgoal_trl_v_sg_g),
@@ -1725,7 +1749,7 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_adv_logit_min': jnp.min(subgoal_adv_logit),
                 'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
                 'phase1/subgoal_value_bonus_style': jnp.asarray(
-                    1.0 if self._is_direct_chunk_trl_mode() else 0.0, dtype=jnp.float32,
+                    1.0 if self._is_trl_mode() else 0.0, dtype=jnp.float32,
                 ),
                 'phase1/subgoal_trl_v_s_sg_mean': jnp.mean(subgoal_trl_v_s_sg),
                 'phase1/subgoal_trl_v_sg_g_mean': jnp.mean(subgoal_trl_v_sg_g),
@@ -1784,7 +1808,7 @@ class DynamicsAgent(_DynamicsAgentCore):
                 'phase1/subgoal_adv_logit_min': jnp.min(subgoal_adv_logit),
                 'phase1/subgoal_adv_logit_max': jnp.max(subgoal_adv_logit),
                 'phase1/subgoal_value_bonus_style': jnp.asarray(
-                    1.0 if self._is_direct_chunk_trl_mode() else 0.0, dtype=jnp.float32,
+                    1.0 if self._is_trl_mode() else 0.0, dtype=jnp.float32,
                 ),
                 'phase1/subgoal_trl_v_s_sg_mean': jnp.mean(subgoal_trl_v_s_sg),
                 'phase1/subgoal_trl_v_sg_g_mean': jnp.mean(subgoal_trl_v_sg_g),
@@ -2098,15 +2122,14 @@ def _get_common_config():
             path_loss_normalized=True,
             layer_norm=True,
             subgoal_loss_weight=1.0,
-            subgoal_value_alpha=0.3,
+            subgoal_value_alpha=0.0,
             subgoal_value_style='exponential',
             subgoal_value_expectile=0.7,
-            subgoal_value_gap_scale=1.0,
-            # Optional high clip for exp(subgoal_value_gap_scale * gap). 0 disables
-            # clipping and preserves historical behavior.
-            subgoal_value_weight_max=0.0,
-            subgoal_value_bonus_type='single_value',
-            subgoal_value_ratio_eps=1e-6,
+            # N=1 TRL baseline (gap10/wmax5); tune sweeps vary these two knobs.
+            subgoal_value_gap_scale=10.0,
+            subgoal_value_weight_max=5.0,
+            subgoal_value_bonus_type='transitive_product',
+            subgoal_value_ratio_eps=1e-3,
             # Goal input to the subgoal estimator. 'full' preserves historical
             # behavior; 'phi' uses task goal-representation channels
             # (ManipSpace cube positions, else maze xy).
@@ -2120,11 +2143,11 @@ def _get_common_config():
             #                     with the prior that endpoints are small offsets
             #                     from the current state.  External APIs still
             #                     expose absolute states.
-            subgoal_target_mode='absolute',
+            subgoal_target_mode='displacement',
             # Residual/bridge conditioning frame, separate from subgoal_target_mode:
             #   - absolute: residual net uses (s_1, s_K, i/K)
             #   - displacement: residual net uses (s_1, delta, i/K), delta=s_K-s_1
-            residual_target_mode='absolute',
+            residual_target_mode='displacement',
             # NOTE: in the standard `main.py` training path, these two are
             # overwritten in `_prepare_configs` to mirror the critic's
             # `value_hidden_dims` / `layer_norm` so that the borrowed critic
@@ -2134,12 +2157,12 @@ def _get_common_config():
             subgoal_value_layer_norm=True,
             subgoal_value_goal_representation='full',
             subgoal_hidden_dims=(512, 512, 512),
-            # Distributional subgoal controls (default: deterministic point).
-            subgoal_distribution='deterministic',
+            # Distributional subgoal controls (default: TRL + diag_gaussian baseline).
+            subgoal_distribution='diag_gaussian',
             # Stochastic subgoals intentionally support either the PDF-style
             # reparameterized sample-MSE objective or a weighted Gaussian NLL
             # objective used by selected experiment configs.
-            subgoal_stochastic_loss='mse',
+            subgoal_stochastic_loss='nll',
             subgoal_num_samples=1,
             subgoal_log_std_min=-5.0,
             subgoal_log_std_max=1.0,
@@ -2151,7 +2174,9 @@ def _get_common_config():
             subgoal_flow_time_embed_dim=64,
             subgoal_flow_use_time_embedding=True,
             subgoal_flow_velocity_reg=0.0,
-            subgoal_flow_energy_weighted=True,
+            # PathBridger default: plain Flow-BC. Set True to reproduce douri's
+            # energy-weighted rectified-flow objective.
+            subgoal_flow_energy_weighted=False,
             subgoal_flow_use_value_bonus=False,
             subgoal_eval_selection='zero_noise',
             subgoal_eval_num_samples=4,
@@ -2176,13 +2201,13 @@ def _get_common_config():
             # steps 1..H (plus the exact endpoint for diagnostics).  This keeps
             # Residual path supervision aligned with the actor/IDM chunk horizon without
             # evaluating all K bridge states on every update.
-            forward_bridge_path_loss_horizon=0,
+            forward_bridge_path_loss_horizon=5,
             idm_loss_weight=1.0,
             idm_hidden_dims=(512, 512, 512),
-            value_p_curgoal=0.2,
-            value_p_trajgoal=0.5,
-            value_p_randomgoal=0.3,
-            value_geom_sample=False,
+            value_p_curgoal=0.0,
+            value_p_trajgoal=1.0,
+            value_p_randomgoal=0.0,
+            value_geom_sample=True,
             actor_p_curgoal=0.0,
             actor_p_trajgoal=1.0,
             actor_p_randomgoal=0.0,
@@ -2190,7 +2215,7 @@ def _get_common_config():
             # Optional cap for same-trajectory sampled goals. None/<=0 keeps
             # the historical behavior of sampling up to the episode terminal.
             max_goal_steps=None,
-            max_goal_steps_from_env=True,
+            max_goal_steps_from_env=False,
             gc_negative=True,
             p_aug=0.0,
             frame_stack=ml_collections.config_dict.placeholder(int),
